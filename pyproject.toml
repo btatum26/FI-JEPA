@@ -2,7 +2,7 @@
 name = "fi-jepa"
 version = "0.1.0"
 description = "Leakage-aware financial market-state dataset pipeline for FI-JEPA."
-readme = "FI_JEPA_SYSTEM_PLAN.md"
+readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "duckdb>=1.4.0",
