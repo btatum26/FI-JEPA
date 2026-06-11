@@ -14,6 +14,29 @@ from fi_jepa.model_config import FIJepaModelConfig
 from fi_jepa.model_output import FIJepaOutput
 from fi_jepa.tokenizer import MaskedPatchTokenizer, masked_mean, pack_masked_sequence
 
+ENCODER_BATCH_TENSOR_NAMES = frozenset(
+    {
+        "asset_patches",
+        "market_patches",
+        "macro_patches",
+        "asset_feature_mask_patched",
+        "market_feature_mask_patched",
+        "macro_feature_mask_patched",
+        "valid_asset_mask_patched",
+        "valid_market_date_mask_patched",
+        "valid_macro_date_mask_patched",
+        "patch_asset_mask",
+        "patch_context_mask",
+    }
+)
+JEPA_BATCH_TENSOR_NAMES = frozenset(
+    {
+        "target_patch_ids",
+        "target_patch_id_mask",
+        "jepa_context_mask",
+    }
+)
+
 
 # ============================================================================
 # FI-JEPA MODEL
@@ -155,25 +178,11 @@ class FIJepaModel(nn.Module):
         """
         # First establish the complete interface. Optional or silently ignored
         # tensors at this boundary would allow loader/model contracts to drift.
-        encoder_required = {
-            "asset_patches",
-            "market_patches",
-            "macro_patches",
-            "asset_feature_mask_patched",
-            "market_feature_mask_patched",
-            "macro_feature_mask_patched",
-            "valid_asset_mask_patched",
-            "valid_market_date_mask_patched",
-            "valid_macro_date_mask_patched",
-            "patch_asset_mask",
-            "patch_context_mask",
-        }
-        jepa_required = {
-            "target_patch_ids",
-            "target_patch_id_mask",
-            "jepa_context_mask",
-        }
-        required = encoder_required | jepa_required if require_jepa_targets else encoder_required
+        required = (
+            ENCODER_BATCH_TENSOR_NAMES | JEPA_BATCH_TENSOR_NAMES
+            if require_jepa_targets
+            else ENCODER_BATCH_TENSOR_NAMES
+        )
         missing = sorted(required - set(batch))
         if missing:
             raise ValueError(f"FI-JEPA batch is missing required keys: {missing}")

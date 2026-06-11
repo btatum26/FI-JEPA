@@ -39,6 +39,7 @@ class FIJepaTrainingConfig:
     ema_momentum_end: float = 0.999
     validation_every_epochs: int = 1
     representation_evaluation_enabled: bool = True
+    representation_evaluation_every_epochs: int = 1
     representation_views_per_date: int = 3
     representation_pca_components: int = 8
     representation_export_embeddings: bool = False
@@ -65,6 +66,7 @@ class FIJepaTrainingConfig:
             raise ValueError("EMA momentum must satisfy 0 <= start <= end <= 1.")
         for name, value in (
             ("validation_every_epochs", self.validation_every_epochs),
+            ("representation_evaluation_every_epochs", self.representation_evaluation_every_epochs),
             ("representation_views_per_date", self.representation_views_per_date),
             ("representation_pca_components", self.representation_pca_components),
             ("checkpoint_every_steps", self.checkpoint_every_steps),
@@ -106,6 +108,7 @@ class FIJepaTrainingConfig:
             ema_momentum_end=float(values["ema"]["momentum_end"]),
             validation_every_epochs=int(values["validation"]["every_epochs"]),
             representation_evaluation_enabled=bool(representation.get("enabled", True)),
+            representation_evaluation_every_epochs=int(representation.get("every_epochs", 1)),
             representation_views_per_date=int(representation.get("views_per_date", 3)),
             representation_pca_components=int(representation.get("pca_components", 8)),
             representation_export_embeddings=bool(

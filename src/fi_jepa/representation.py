@@ -10,13 +10,14 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import torch
+from tqdm.auto import tqdm
 
 from fi_jepa.dataloader import (
     FIJepaDataConfig,
     FrozenPanelStore,
     build_fi_jepa_embedding_dataloader,
 )
-from fi_jepa.model import FIJepaModel
+from fi_jepa.model import ENCODER_BATCH_TENSOR_NAMES, FIJepaModel
 from fi_jepa.model_config import FIJepaModelConfig
 
 EMBEDDING_SCHEMA_VERSION = 1
@@ -262,10 +263,11 @@ def _cosine_stability(reference: np.ndarray, view: np.ndarray) -> dict[str, obje
 
 
 def _move_batch(batch: dict[str, object], device: torch.device) -> dict[str, object]:
-    """Move tensor values while retaining string metadata on CPU."""
+    """Move only encoder-required tensors, leaving aliases and metadata on CPU."""
     return {
-        name: value.to(device, non_blocking=True) if isinstance(value, torch.Tensor) else value
-        for name, value in batch.items()
+        name: batch[name].to(device, non_blocking=True)
+        for name in ENCODER_BATCH_TENSOR_NAMES
+        if isinstance(batch[name], torch.Tensor)
     }
 
 
@@ -274,6 +276,8 @@ def collect_pooled_states(
     loader: torch.utils.data.DataLoader,
     device: torch.device,
     amp_dtype: torch.dtype | None,
+    *,
+    description: str = "Representations",
 ) -> tuple[pd.DataFrame, np.ndarray]:
     """Encode one deterministic loader into metadata and raw pooled states."""
     was_training = model.training
@@ -281,7 +285,14 @@ def collect_pooled_states(
     metadata: list[dict[str, object]] = []
     states: list[np.ndarray] = []
     with torch.inference_mode():
-        for cpu_batch in loader:
+        for cpu_batch in tqdm(
+            loader,
+            desc=description,
+            total=len(loader),
+            unit="batch",
+            dynamic_ncols=True,
+            leave=False,
+        ):
             batch = _move_batch(cpu_batch, device)
             autocast = (
                 torch.amp.autocast(device.type, dtype=amp_dtype)
@@ -374,9 +385,19 @@ def run_representation_evaluation(
     validation_loader = build_fi_jepa_embedding_dataloader(
         data_config, "validation", asset_view="all_valid", store=store
     )
-    train_metadata, train_raw = collect_pooled_states(model, train_loader, device, amp_dtype)
+    train_metadata, train_raw = collect_pooled_states(
+        model,
+        train_loader,
+        device,
+        amp_dtype,
+        description="Representations: train all-valid",
+    )
     validation_metadata, validation_raw = collect_pooled_states(
-        model, validation_loader, device, amp_dtype
+        model,
+        validation_loader,
+        device,
+        amp_dtype,
+        description="Representations: validation all-valid",
     )
     pca = fit_pca_exporter(train_raw, n_components)
     train_z = pca.transform(train_raw)
@@ -395,7 +416,13 @@ def run_representation_evaluation(
             store=store,
             view_index=view_index,
         )
-        metadata, raw = collect_pooled_states(model, loader, device, amp_dtype)
+        metadata, raw = collect_pooled_states(
+            model,
+            loader,
+            device,
+            amp_dtype,
+            description=f"Representations: validation fixed-k {view_index + 1}/{views_per_date}",
+        )
         if metadata["date"].tolist() != validation_metadata["date"].tolist():
             raise AssertionError("Fixed-K and all-valid validation dates do not align.")
         z = pca.transform(raw)

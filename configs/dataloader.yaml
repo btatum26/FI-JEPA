@@ -14,9 +14,9 @@ min_valid_dates_in_patch: 10
 min_valid_asset_fraction: 0.25
 
 batch_size: 32
-validation_batch_size: 8
+validation_batch_size: 16
 num_workers: 0
-pin_memory: false
+pin_memory: true
 drop_last: false
 
 seed: 1337

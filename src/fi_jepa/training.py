@@ -17,11 +17,13 @@ import numpy as np
 import torch
 from torch import nn
 from torch.optim import AdamW
+from tqdm.auto import tqdm
 import yaml
 
 from fi_jepa.dataloader import FIJepaDataConfig, FrozenPanelStore, build_fi_jepa_dataloader
-from fi_jepa.model import FIJepaModel
+from fi_jepa.model import ENCODER_BATCH_TENSOR_NAMES, JEPA_BATCH_TENSOR_NAMES, FIJepaModel
 from fi_jepa.model_config import FIJepaModelConfig
+from fi_jepa.model_output import FIJepaOutput
 from fi_jepa.representation import (
     canonical_version_hash,
     model_state_hash,
@@ -265,10 +267,12 @@ def build_adamw(model: FIJepaModel, config: FIJepaTrainingConfig) -> AdamW:
 
 
 def _move_batch(batch: dict[str, object], device: torch.device) -> dict[str, object]:
-    """Move every tensor in a collated FI-JEPA batch to the training device."""
+    """Move only model-required tensors, leaving duplicate views and metrics on CPU."""
+    required = ENCODER_BATCH_TENSOR_NAMES | JEPA_BATCH_TENSOR_NAMES
     return {
-        name: value.to(device, non_blocking=True) if isinstance(value, torch.Tensor) else value
-        for name, value in batch.items()
+        name: batch[name].to(device, non_blocking=True)
+        for name in required
+        if isinstance(batch[name], torch.Tensor)
     }
 
 
@@ -284,6 +288,45 @@ def _batch_mask_metrics(batch: dict[str, object]) -> dict[str, float]:
         "target_patch_eligibility_rate": float(eligible.sum().item()) / context_count,
         "masked_patch_rate": float(target.sum().item()) / context_count,
         "masked_patch_count_mean": float(target.sum(dim=1).float().mean().item()),
+    }
+
+
+@torch.no_grad()
+def _effective_rank(values: torch.Tensor) -> float:
+    """Return covariance-spectrum effective rank for one representation matrix."""
+    if values.ndim != 2:
+        raise ValueError(f"Effective-rank values must have shape [N, D]; got {values.shape}.")
+    if values.shape[0] < 2:
+        return 0.0
+
+    # Center valid target rows so rank measures represented variation rather
+    # than a large shared mean direction.
+    centered = values.detach().float()
+    centered = centered - centered.mean(dim=0, keepdim=True)
+    spectrum = torch.linalg.svdvals(centered).square()
+    spectrum_sum = spectrum.sum()
+    if float(spectrum_sum.item()) <= 0.0:
+        return 0.0
+    probabilities = spectrum[spectrum > 0.0] / spectrum_sum
+    return float(torch.exp(-(probabilities * probabilities.log()).sum()).item())
+
+
+@torch.no_grad()
+def _batch_representation_metrics(output: FIJepaOutput) -> dict[str, float]:
+    """Measure matched cosine and valid-target rank for one logged training batch."""
+    target_mask = output.target_patch_mask
+    predicted = output.predicted_targets[target_mask]
+    targets = output.target_representations[target_mask]
+    if predicted.shape[0] == 0:
+        raise RuntimeError("A logged training batch produced no valid JEPA targets.")
+
+    normalized_prediction = nn.functional.normalize(predicted.float(), dim=-1)
+    normalized_target = nn.functional.normalize(targets.float(), dim=-1)
+    matched_cosine = (normalized_prediction * normalized_target).sum(dim=-1).mean()
+    return {
+        "matched_target_cosine": float(matched_cosine.item()),
+        "predictor_effective_rank": _effective_rank(predicted),
+        "target_effective_rank": _effective_rank(targets),
     }
 
 
@@ -303,8 +346,16 @@ def validate_jepa(
     masked_count_weighted = 0.0
     sample_count = 0
 
+    print(f"Starting JEPA validation over {len(loader)} batches.")
     with torch.inference_mode():
-        for cpu_batch in loader:
+        for cpu_batch in tqdm(
+            loader,
+            desc="Validation",
+            total=len(loader),
+            unit="batch",
+            dynamic_ncols=True,
+            leave=False,
+        ):
             batch = _move_batch(cpu_batch, device)
             autocast = (
                 torch.amp.autocast(device.type, dtype=amp_dtype)
@@ -315,7 +366,7 @@ def validate_jepa(
                 output = model(batch)
             batch_targets = int(output.target_patch_mask.sum().item())
             batch_samples = int(output.target_patch_mask.shape[0])
-            metrics = _batch_mask_metrics(batch)
+            metrics = _batch_mask_metrics(cpu_batch)
             weighted_loss += float(output.loss.item()) * batch_targets
             target_count += batch_targets
             eligibility_weighted += metrics["target_patch_eligibility_rate"] * batch_samples
@@ -323,6 +374,7 @@ def validate_jepa(
             masked_count_weighted += metrics["masked_patch_count_mean"] * batch_samples
             sample_count += batch_samples
 
+    print("validation_jepa_loss=%.4f | target_patch_eligibility_rate=%.4f | masked_patch_rate=%.4f | masked_patch_count_mean=%.4f", weighted_loss / target_count, eligibility_weighted / sample_count, masked_rate_weighted / sample_count, masked_count_weighted / sample_count)
     if was_training:
         model.train()
     if target_count == 0 or sample_count == 0:
@@ -434,17 +486,22 @@ def train_fi_jepa(
     """
     checkpoint: dict[str, Any] | None = None
     if resume is not None:
+        # Resume training from an existing checkpoint, ignoring any provided config. The
         checkpoint_path, run_dir = _resolve_resume_checkpoint(Path(resume))
         checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+
         resolved_config = checkpoint["resolved_config"]
         training_config = FIJepaTrainingConfig.from_dict(resolved_config["training"])
         if device_override is not None:
             training_config = replace(training_config, device=device_override)
         model_config = FIJepaModelConfig(**resolved_config["model"])
+
         data_values = dict(resolved_config["dataloader"])
         data_values["artifact_path"] = Path(data_values["artifact_path"])
         data_config = FIJepaDataConfig(**data_values)
+
     else:
+        # start a new training run with the provided config or its default path.
         if config is None:
             config = Path("configs/pretraining.yaml")
         training_config = (
@@ -455,10 +512,12 @@ def train_fi_jepa(
         model_config = FIJepaModelConfig.from_yaml(training_config.model_config_path)
         data_config = FIJepaDataConfig.from_yaml(training_config.dataloader_config_path)
         data_config = replace(data_config, artifact_path=data_config.artifact_path.resolve())
+
         run_stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
         run_dir = training_config.output_root / f"{run_stamp}_{training_config.run_name}"
         run_dir.mkdir(parents=True, exist_ok=False)
 
+    # check configs make sense
     if model_config.patch_len != data_config.patch_len:
         raise ValueError("Model and dataloader patch_len values must match.")
     if model_config.num_patches != data_config.num_patches:
@@ -468,11 +527,10 @@ def train_fi_jepa(
     amp_dtype = _resolve_amp_dtype(device, training_config.mixed_precision)
     _seed_everything(data_config.seed)
 
+    # build datastore and dataloaders
     store = FrozenPanelStore(data_config.artifact_path)
     train_loader = build_fi_jepa_dataloader(data_config, "train", store=store)
-    validation_loader = build_fi_jepa_dataloader(
-        data_config, "validation", store=store, shuffle=False
-    )
+    validation_loader = build_fi_jepa_dataloader(data_config, "validation", store=store, shuffle=False)
     if len(train_loader) == 0 or len(validation_loader) == 0:
         raise RuntimeError("Training and validation loaders must both contain at least one batch.")
 
@@ -529,6 +587,7 @@ def train_fi_jepa(
             raise ValueError("Current training sample count differs from the resumed run.")
         if int(runtime["validation_sample_count"]) != len(validation_loader.dataset):
             raise ValueError("Current validation sample count differs from the resumed run.")
+        
         # Device is the only supported resume-time override. Persist the actual
         # resumed runtime so later checkpoints do not claim a stale device.
         resolved_config["training"] = training_config.to_dict()
@@ -561,6 +620,14 @@ def train_fi_jepa(
     checkpoints_dir.mkdir(exist_ok=True)
     log_path = run_dir / "train_log.jsonl"
     print(f"FI-JEPA run: {run_dir}")
+    print(
+        "Training plan: "
+        f"device={device} | train_samples={len(train_loader.dataset)} | "
+        f"batch_size={data_config.batch_size} | steps_per_epoch={len(train_loader)} | "
+        f"epochs={training_config.epochs} | total_steps={total_steps} | "
+        f"validation_samples={len(validation_loader.dataset)} | "
+        f"validation_batches={len(validation_loader)}"
+    )
 
     for epoch in range(start_epoch, training_config.epochs):
         dataset = train_loader.dataset
@@ -580,8 +647,14 @@ def train_fi_jepa(
             "masked_patch_rate": 0.0,
             "masked_patch_count_mean": 0.0,
         }
-
-        for batch_index, cpu_batch in enumerate(train_loader):
+        progress = tqdm(
+            train_loader,
+            desc=f"Epoch {epoch + 1}/{training_config.epochs} [{device}]",
+            total=len(train_loader),
+            unit="step",
+            dynamic_ncols=True,
+        )
+        for batch_index, cpu_batch in enumerate(progress):
             batch = _move_batch(cpu_batch, device)
             step_index = global_step
             learning_rate = lr_schedule.apply(step_index, commit=False)
@@ -633,7 +706,7 @@ def train_fi_jepa(
 
             batch_targets = int(output.target_patch_mask.sum().item())
             batch_samples = int(output.target_patch_mask.shape[0])
-            mask_metrics = _batch_mask_metrics(batch)
+            mask_metrics = _batch_mask_metrics(cpu_batch)
             interval_samples += batch_samples
             interval_targets += batch_targets
             interval_weighted_loss += float(output.loss.item()) * batch_targets
@@ -647,6 +720,18 @@ def train_fi_jepa(
                 or batch_index == len(train_loader) - 1
             ):
                 elapsed = max(time.perf_counter() - interval_start, 1e-12)
+                log_metrics = {
+                    "train_jepa_loss": interval_weighted_loss / interval_targets,
+                    "learning_rate": learning_rate,
+                    "ema_momentum": ema_momentum,
+                    "gradient_norm": interval_gradient_norm / interval_successful_steps,
+                    **_batch_representation_metrics(output),
+                    **{
+                        name: value / interval_samples
+                        for name, value in interval_metrics.items()
+                    },
+                    "samples_per_second": interval_samples / elapsed,
+                }
                 _append_jsonl(
                     log_path,
                     {
@@ -654,16 +739,20 @@ def train_fi_jepa(
                         "timestamp": _utc_timestamp(),
                         "epoch": epoch,
                         "step": global_step,
-                        "train_jepa_loss": interval_weighted_loss / interval_targets,
-                        "learning_rate": learning_rate,
-                        "ema_momentum": ema_momentum,
-                        "gradient_norm": interval_gradient_norm / interval_successful_steps,
-                        **{
-                            name: value / interval_samples
-                            for name, value in interval_metrics.items()
-                        },
-                        "samples_per_second": interval_samples / elapsed,
+                        **log_metrics,
                     },
+                )
+                progress.set_postfix(
+                    loss=f"{log_metrics['train_jepa_loss']:.4f}",
+                    cos=f"{log_metrics['matched_target_cosine']:.4f}",
+                    rank=(
+                        f"{log_metrics['predictor_effective_rank']:.1f}"
+                        f"/{log_metrics['target_effective_rank']:.1f}"
+                    ),
+                    global_step=f"{global_step}/{total_steps}",
+                    lr=f"{log_metrics['learning_rate']:.2e}",
+                    samples_per_second=f"{log_metrics['samples_per_second']:.1f}",
+                    refresh=False,
                 )
                 interval_start = time.perf_counter()
                 interval_samples = 0
@@ -672,7 +761,6 @@ def train_fi_jepa(
                 interval_gradient_norm = 0.0
                 interval_successful_steps = 0
                 interval_metrics = {name: 0.0 for name in interval_metrics}
-
             if global_step % training_config.checkpoint_every_steps == 0:
                 state = _checkpoint_state(
                     kind="periodic",
@@ -687,9 +775,9 @@ def train_fi_jepa(
                     resolved_config=resolved_config,
                 )
                 periodic_path = checkpoints_dir / f"step_{global_step:09d}.pt"
-                # Resuming an older periodic checkpoint can replay global step
-                # numbers already present in the run. Preserve those immutable
-                # recovery points while still advancing latest.pt.
+                
+                # Resuming an older periodic checkpoint can replay global step numbers already present in the run. 
+                # Preserve those immutable recovery points while still advancing latest.pt.
                 if not periodic_path.exists():
                     _write_checkpoint(periodic_path, state)
                 _write_checkpoint(checkpoints_dir / "latest.pt", state)
@@ -698,7 +786,14 @@ def train_fi_jepa(
         if should_validate:
             validation_metrics = validate_jepa(model, validation_loader, device, amp_dtype)
             representation_result: dict[str, object] | None = None
-            if training_config.representation_evaluation_enabled:
+            should_evaluate_representations = (
+                training_config.representation_evaluation_enabled
+                and (
+                    (epoch + 1) % training_config.representation_evaluation_every_epochs == 0
+                    or epoch + 1 == training_config.epochs
+                )
+            )
+            if should_evaluate_representations:
                 checkpoint_id = (
                     f"step_{global_step:09d}_{model_state_hash(model)[:12]}"
                 )

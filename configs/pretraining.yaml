@@ -26,6 +26,7 @@ validation:
 
 representation_evaluation:
   enabled: true
+  every_epochs: 5
   views_per_date: 3
   pca_components: 8
   export_embeddings_every_validation: false

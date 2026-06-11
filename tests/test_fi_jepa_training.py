@@ -245,7 +245,7 @@ def test_validation_is_deterministic(tmp_path: Path) -> None:
     assert first == second
 
 
-def test_smoke_training_and_basic_epoch_resume(tmp_path: Path) -> None:
+def test_smoke_training_and_basic_epoch_resume(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     config = _write_run_configs(tmp_path)
     run_dir = train_fi_jepa(config)
     checkpoints = run_dir / "checkpoints"
@@ -294,5 +294,19 @@ def test_smoke_training_and_basic_epoch_resume(tmp_path: Path) -> None:
     assert resumed["lr_scheduler"]["min_lr"] == pytest.approx(
         resumed["optimizer"]["param_groups"][0]["lr"]
     )
+    train_records = [record for record in records if record["event"] == "train"]
+    assert all(
+        {
+            "matched_target_cosine",
+            "predictor_effective_rank",
+            "target_effective_rank",
+        }
+        <= set(record)
+        for record in train_records
+    )
     assert sum(record["event"] == "resume" for record in records) == 2
     assert (checkpoints / "step_000000006.pt").is_file()
+
+    terminal_output = capsys.readouterr()
+    assert "Training plan:" in terminal_output.out
+    assert "rank=" in terminal_output.err
