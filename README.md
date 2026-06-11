@@ -178,13 +178,13 @@ uv run build-market-database
 
 This creates `data/processed/market_data.duckdb`. Its main contracts are:
 
-| Table | Grain | Purpose |
-|---|---|---|
-| `features` | One row per date | Past-only market and macro inputs |
-| `ticker_features` | One row per date and symbol | Past-only asset inputs |
-| `targets` | One row per date | Physically separate future outcomes |
-| `symbol_manifest` | One row per symbol | Identity, coverage, and bias metadata |
-| `trading_calendar` | One row per observed date | Full selected-symbol date spine |
+| Table              | Grain                       | Purpose                               |
+| ------------------ | --------------------------- | ------------------------------------- |
+| `features`         | One row per date            | Past-only market and macro inputs     |
+| `ticker_features`  | One row per date and symbol | Past-only asset inputs                |
+| `targets`          | One row per date            | Physically separate future outcomes   |
+| `symbol_manifest`  | One row per symbol          | Identity, coverage, and bias metadata |
+| `trading_calendar` | One row per observed date   | Full selected-symbol date spine       |
 
 See [data/DATABASE_SCHEMA.md](data/DATABASE_SCHEMA.md) for the full live schema.
 
@@ -249,17 +249,19 @@ uv run run-fi-jepa-probes \
   --targets data/probe_targets/<target_artifact>
 ```
 
-Embedding and target artifacts remain separate until probe evaluation.
+Embedding and target artifacts remain separate until probe evaluation. See
+[docs/probes.md](docs/probes.md) for the artifact and walk-forward probe
+contracts.
 
 ## Configuration
 
-| File | Controls |
-|---|---|
-| `configs/features.yaml` | Past-only feature definitions and FRED series |
-| `configs/model_dataset.yaml` | Frozen dataset dates, splits, features, and normalization |
-| `configs/dataloader.yaml` | Artifact path, windowing, asset sampling, and JEPA masking |
-| `configs/model.yaml` | Tokenizers, encoders, predictor, and latent dimensions |
-| `configs/pretraining.yaml` | Optimization, EMA, validation, checkpoints, and run outputs |
+| File                         | Controls                                                    |
+| ---------------------------- | ----------------------------------------------------------- |
+| `configs/features.yaml`      | Enabled FRED series and release-lag assumptions             |
+| `configs/model_dataset.yaml` | Frozen dataset dates, splits, features, and normalization   |
+| `configs/dataloader.yaml`    | Artifact path, windowing, asset sampling, and JEPA masking  |
+| `configs/model.yaml`         | Tokenizers, encoders, predictor, and latent dimensions      |
+| `configs/pretraining.yaml`   | Optimization, EMA, validation, checkpoints, and run outputs |
 
 ## Repository Layout
 
@@ -268,8 +270,8 @@ configs/                 Runtime and dataset configuration
 data/
   community_universes/   Versioned source CSVs
   DATABASE_SCHEMA.md     Canonical and frozen artifact contracts
-  DATASET_PLAN.md        Broader data design and source plan
-docs/                    Focused implementation documentation
+  DATASET_PLAN.md        Source research, current contract, and roadmap
+docs/                    Focused builder and probe documentation
 src/
   dataset_pipeline/      Canonical database and frozen dataset builders
   fi_jepa/               Dataloader, model, training, evaluation, and probes
@@ -299,4 +301,3 @@ uv run ruff check .
 The tests cover canonical-data leakage checks, split-aware frozen exports,
 dataloader masks and duplicate detection, model contracts, checkpoint/resume
 behavior, representation evaluation, and frozen probes.
-

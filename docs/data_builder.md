@@ -1,15 +1,25 @@
-# Sparse Frozen Dataset Builder
+# Sparse Model-Ready Dataset
 
-## Summary
+## Purpose
 
-Build immutable, non-partitioned sparse Parquet datasets from DuckDB.
+`build-model-dataset` freezes selected canonical DuckDB features into an
+immutable sparse Parquet artifact for model runtime.
 
-The builder freezes daily normalized facts, split permissions, validity masks, asset eligibility, and feature metadata. It does not store lookback windows, complete date-by-asset grids, `k_assets`, patches, or JEPA temporal masks.
+```bash
+uv run build-model-dataset --config configs/model_dataset.yaml
+```
+
+The builder is implemented under `src/dataset_pipeline/dataset_builder/`. It is
+separate from:
+
+- `build-market-database`, which constructs the canonical DuckDB.
+- `fi_jepa.dataloader`, which reconstructs windows and samples model views.
+- Probe-target export, which handles future outcomes separately.
 
 ## Output Layout
 
 ```text
-data/model_ready/<dataset_name>/<build_id>/
+data/model_ready/<dataset_name>/<timestamp>_<build_id>/
     manifest.json
     config_resolved.yaml
     dates.parquet
@@ -28,14 +38,37 @@ data/model_ready/<dataset_name>/<build_id>/
     quality_report.json
 ```
 
-- Asset facts contain one row per real valid `(date, asset_id)` observation.
-- Date-level facts contain one row per available date.
-- Train and validation fact files are date-disjoint.
-- No windows, full grids, targets, raw FRED JSON, or repeated daily facts are stored.
+The timestamp makes builds sortable by creation time. The deterministic build
+ID identifies the resolved config and source database version. Existing build
+directories are never overwritten.
+
+## Stored And Runtime Data
+
+The artifact stores:
+
+- Sparse normalized facts.
+- Per-feature validity masks.
+- Date and asset manifests.
+- Feature order, family, source, transform, and normalization metadata.
+- Train-only normalization statistics.
+- Explicit split permissions and protection flags.
+
+The artifact does **not** store:
+
+- Dense lookback windows.
+- Complete date-by-asset grids.
+- Runtime asset samples.
+- Temporal patches or JEPA masks.
+- Canonical future targets.
+- Raw FRED responses or other raw source files.
+
+Asset facts contain one row per real valid `(date, asset_id)` observation.
+Market and macro facts contain one row per available date. Train and validation
+fact files are date-disjoint.
 
 ## Date And Split Contract
 
-`dates.parquet` contains the continuous configured date spine and these explicit flags:
+`dates.parquet` contains the configured continuous date spine:
 
 ```text
 date_idx
@@ -50,26 +83,17 @@ validation_fact_allowed
 validation_window_name
 ```
 
-Definitions:
+| Field | Meaning |
+|---|---|
+| `validation_sample` | Date is inside a named validation window |
+| `protected_input_lookback` | Date is reserved for validation input reconstruction |
+| `protected_forward_target` | Date is reserved against future-target leakage |
+| `protected_holdout` | Union of the three protected regions |
+| `train_fact_allowed` | Date may be written to train fact files |
+| `validation_fact_allowed` | Date may be written to validation fact files |
 
-- `validation_sample`: date is inside an anchor validation window.
-- `protected_input_lookback`: date is before a validation window and reserved for reconstructing validation inputs.
-- `protected_forward_target`: date is after a validation window and reserved against future-target leakage.
-- `protected_holdout`: union of the three protection flags.
-- `train_fact_allowed`: date may be written to train fact files; equivalent to `not protected_holdout`.
-- `validation_fact_allowed`: date may be written to validation fact files; equivalent to `protected_holdout`.
-
-The three component protection flags describe disjoint regions around each validation window. Overlapping anchor protections are merged deterministically.
-
-Initial defaults:
-
-```yaml
-context_start: "2000-01-01"
-sample_start: "2005-02-25"
-lookback_days: 252
-max_forward_horizon: 126
-minimum_train_observations: 63
-```
+Overlapping validation protections are merged deterministically. Train and
+validation fact permissions never overlap.
 
 ## Feature And Asset Contract
 
@@ -86,9 +110,10 @@ trainable
 exclusion_reason
 ```
 
-An asset is trainable when it has at least the configured number of valid observations on dates where `train_fact_allowed = true`.
+An asset is trainable when it has the configured minimum number of valid
+observations on `train_fact_allowed` dates.
 
-`feature_manifest.parquet` explicitly records:
+`feature_manifest.parquet` contains:
 
 ```text
 feature_name
@@ -99,102 +124,97 @@ series_source
 dtype
 normalized
 normalization_method
+transform
 ```
 
-Supported `input_group` values:
+Input groups are `asset`, `market`, and `macro`. Feature indices are contiguous
+within each group. The manifest, not model code or documentation, is
+authoritative for feature dimensions and order.
 
-```text
-asset
-market
-macro
-```
+The current export rejects:
 
-Initial feature families include:
-
-```text
-returns
-volatility
-trend
-drawdown
-liquidity
-breadth
-dispersion
-coverage
-rates
-macro
-```
-
-Feature indices are contiguous within each input group. Exact resolved feature dimensions and order are stored in the manifest.
-
-The first pass excludes all OAS-derived features:
-
-```text
-high_yield_oas_*
-corporate_oas_*
-hy_minus_corporate_oas
-```
+- Names matching `future_`, `target`, or `label`.
+- OAS-derived columns.
+- Configured features missing from the canonical source table.
 
 ## Normalization And Masks
 
-Apply normalization using this strict sequence:
+The builder:
 
-1. Fit normalization only on train facts from dates where `train_fact_allowed = true`.
-2. Create feature, asset, and date masks before normalization.
-3. Normalize only real finite values.
-4. After normalization, fill invalid, missing, or protected values with `0.0`.
-5. Always pass masks to the model.
+1. Fits robust z-score normalization only on finite train facts.
+2. Applies configured transforms before fitting.
+3. Creates validity masks before normalization.
+4. Normalizes real finite values only.
+5. Fills invalid normalized values with `0.0`.
+6. Publishes masks with every fact row.
 
 Zero-filled values are never considered valid observations.
 
-Macro files use the future-proof `macro` name. `series_source` in the feature manifest records whether each feature originated from FRED, market-derived data, French factors, or another future source.
+## Runtime Dataloader
 
-## Dataloader Contract
+`FrozenPanelStore` streams the sparse files into shared dense NumPy arrays.
+Window slicing reapplies split permissions, then `FIJepaWindowDataset`:
 
-The model-side loader is implemented under `fi_jepa.dataloader` and configured by
-`configs/dataloader.yaml`. It:
+- Reconstructs 252-day windows.
+- Selects training, validation, or diagnostic asset views.
+- Pads variable asset panels during collation.
+- Patches time.
+- Builds feature, date, asset, context, and target-eligibility masks.
+- Samples temporal JEPA targets.
 
-- Reindex sparse facts against `dates.parquet` and `assets.parquet`.
-- Construct 252-day windows.
-- Reconstruct protected training sections as zero-filled values with false masks.
-- Select `k_assets`.
-- Patch time.
-- Generate temporal JEPA masks.
+Target eligibility is split-relative:
 
-It must enforce configurable target eligibility:
+| Runtime use | Holdout patches allowed as JEPA targets |
+|---|---:|
+| Training JEPA batches | No |
+| Validation JEPA batches | Yes |
+| Embedding batches | Unmasked sequence; target sampling is not used |
 
-```yaml
-jepa_target_rules:
-  min_valid_dates_in_patch: 10
-  min_valid_asset_fraction: 0.25
-  allow_holdout_patches_as_targets: false
-  allow_padded_patches_as_targets: false
+Padded patches are never target-eligible. Targets must also satisfy configured
+valid-date and valid-asset coverage. Validation holdout permission allows
+validation JEPA loss to evaluate validation-relative patches; it does not expose
+those facts to training.
+
+## Config Ownership
+
+`configs/model_dataset.yaml` controls:
+
+- Source database and output root.
+- Date range and split protections.
+- Included asset types.
+- Exported feature families and order.
+- Train-only normalization.
+- Recorded JEPA target-policy metadata.
+
+`configs/dataloader.yaml` controls runtime reconstruction, asset sampling, patch
+validity thresholds, and temporal masking. Runtime settings are not baked into
+dense windows because no dense windows are stored.
+
+## Implementation
+
+| Responsibility | Module |
+|---|---|
+| Config validation and feature manifest | `dataset_pipeline.dataset_builder.config` |
+| Date and asset manifests | `dataset_pipeline.dataset_builder.manifests` |
+| Train-only normalization | `dataset_pipeline.dataset_builder.normalization` |
+| Sparse Parquet export and quality checks | `dataset_pipeline.dataset_builder.export` |
+| Atomic immutable build orchestration | `dataset_pipeline.dataset_builder.builder` |
+| Runtime sparse-artifact loading | `fi_jepa.dataloader.panel_store` |
+| Runtime windows and asset views | `fi_jepa.dataloader.dataset` |
+| Runtime patch and JEPA masks | `fi_jepa.dataloader.masking` |
+
+## Tests
+
+The implemented builder and runtime contracts are covered by:
+
+- `tests/test_model_dataset_builder.py`
+- `tests/test_fi_jepa_dataloader.py`
+- `tests/test_dataset_pipeline.py`
+
+They verify split protection, train-only normalization, sparse fact layout,
+target exclusion, OAS exclusion, duplicate rejection, runtime reconstruction,
+asset views, and target eligibility.
+
+```bash
+uv run pytest -q tests/test_model_dataset_builder.py tests/test_fi_jepa_dataloader.py
 ```
-
-A patch may be used as context while remaining ineligible as a JEPA prediction target.
-
-`FrozenPanelStore` streams the sparse fact files once into dense NumPy arrays.
-`FIJepaWindowDataset` reconstructs split-safe windows and supports random
-training views, all-asset validation views, and deterministic diagnostic views.
-`build_fi_jepa_dataloader(...)` pads variable validation panels within each
-batch and exposes raw tensors, patched tensor views, feature masks, patch masks,
-and temporal JEPA masks.
-
-## Implementation And Tests
-
-- Add `configs/frozen_dataset.yaml`.
-- Add `src/data_retrieval/pipelines/build_frozen_dataset.py`.
-- Register `uv run build-frozen-dataset --config configs/frozen_dataset.yaml`.
-- Publish builds atomically under a deterministic immutable build ID.
-
-Tests must verify:
-
-- No stored windows, complete asset grids, or duplicated facts.
-- Train and validation fact dates are disjoint.
-- Protection flags and fact permissions have correct semantics.
-- Normalization uses only `train_fact_allowed` dates.
-- Masks exist before normalization and zero filling.
-- Feature groups, families, sources, indices, and normalization metadata are complete.
-- Pre-2005 context is exported from the configured `2000-01-01` start.
-- OAS-derived features and targets are absent.
-- Representative train and validation windows reconstruct correctly.
-- JEPA target eligibility rejects protected, padded, and insufficiently valid patches.

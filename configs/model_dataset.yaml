@@ -107,8 +107,11 @@ normalization:
   transforms:
     log1p: [dollar_volume, "realized_vol_*", vix_level]
 
+# Recorded in the immutable artifact for policy review. Runtime patch thresholds
+# live in configs/dataloader.yaml. Holdout target permission is split-relative.
 jepa_target_rules:
   min_valid_dates_in_patch: 10
   min_valid_asset_fraction: 0.25
-  allow_holdout_patches_as_targets: false
+  training_allow_holdout_patches_as_targets: false
+  validation_allow_holdout_patches_as_targets: true
   allow_padded_patches_as_targets: false

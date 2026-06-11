@@ -568,15 +568,26 @@ features, and the three yield-curve spreads. They do not contain OAS features.
 
 ### JEPA Target Eligibility
 
-The artifact does not contain future targets. Its manifest records downstream
-JEPA patch-eligibility rules:
+The artifact does not contain future targets. Current model-dataset configs
+record downstream JEPA patch-eligibility policy metadata:
 
 | Rule | Current value |
 |---|---:|
 | Minimum valid dates in patch | 10 |
 | Minimum valid asset fraction | 0.25 |
-| Holdout patches allowed as prediction targets | `false` |
+| Training holdout patches allowed as prediction targets | `false` |
+| Validation holdout patches allowed as prediction targets | `true` |
 | Padded patches allowed as prediction targets | `false` |
+
+Holdout permission is split-relative. Training batches cannot target protected
+validation facts. Validation JEPA batches may target validation-relative
+holdout patches so validation loss measures those patches. Embedding batches
+use the complete unmasked context-valid sequence and do not sample JEPA targets.
+
+The latest verified artifact named at the top of this document predates the
+split-relative metadata fields and stores the legacy global
+`allow_holdout_patches_as_targets: false` training-protection rule. Runtime
+behavior is defined by the split-relative dataloader policy above.
 
 ## Review Notes
 
