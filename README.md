@@ -33,28 +33,6 @@ This is a research prototype, not a trading system.
 
 ## Pipeline
 
-```mermaid
-flowchart LR
-    S[Stooq bulk ZIP archives] --> C[Canonical market database build]
-    F[FRED JSON snapshots] --> C
-    U[Community universe CSVs] --> C
-
-    C --> D[(market_data.duckdb)]
-    D --> I[Immutable sparse dataset build]
-    D --> T[Separate future probe targets]
-
-    I --> P[Model-ready Parquet artifact]
-    P --> L[FrozenPanelStore and dataloader]
-    L --> W[252-day masked windows]
-    W --> J[FI-JEPA pretraining]
-
-    J --> K[Checkpoints]
-    K --> E[Representation evaluation]
-    E --> Z[Frozen embedding artifact]
-    Z --> R[Walk-forward linear probes]
-    T --> R
-```
-
 The repository keeps three data layers distinct:
 
 1. **Canonical database:** `data/processed/market_data.duckdb`
