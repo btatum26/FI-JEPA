@@ -1,0 +1,26 @@
+stooq:
+  enabled: true
+  interval: d
+  raw_dir: data/raw/stooq/single_symbol
+  adjusted_flag: false
+  request_sleep_seconds: 0.5
+  retry_count: 3
+
+fred:
+  enabled: true
+  raw_dir: data/raw/fred
+  api_key_env: FRED_API_KEY
+  use_alfred_vintages: false
+
+french:
+  enabled: true
+  raw_dir: data/raw/french
+
+cboe:
+  enabled: true
+  raw_dir: data/raw/cboe
+
+local_csv:
+  enabled: true
+  raw_dir: data/raw/metadata
+

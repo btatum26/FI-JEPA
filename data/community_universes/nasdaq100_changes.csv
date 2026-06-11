@@ -1,0 +1,220 @@
+effective_date,added_symbol,added_name,removed_symbol,removed_name
+"April 20, 2026",SNDK,Sandisk,TEAM,Atlassian
+"January 20, 2026",WMT,Walmart,AZN,AstraZeneca
+"January 9, 2026",,,VSNT,Versant
+"January 5, 2026",VSNT,Versant,,
+"December 22, 2025",ALNY,Alnylam Pharmaceuticals,BIIB,Biogen
+"December 22, 2025",FER,Ferrovial SE,CDW,CDW Corporation
+"December 22, 2025",INSM,Insmed Incorporated,GFS,GlobalFoundries
+"December 22, 2025",MPWR,Monolithic Power Systems,LULU,Lululemon Athletica
+"December 22, 2025",STX,Seagate Technology Holdings,ON,ON Semiconductor
+"December 22, 2025",WDC,Western Digital,TTD,Trade Desk (The)
+"November 6, 2025",,,SOLS,Solstice Advanced Materials
+"October 30, 2025",SOLS,Solstice Advanced Materials,,
+"July 28, 2025",TRI,Thomson Reuters,,
+"July 17, 2025",,,ANSS,Ansys
+"May 19, 2025",SHOP,Shopify,MDB,MongoDB
+"December 23, 2024",PLTR,Palantir Technologies,ILMN,Ilumina
+"December 23, 2024",MSTR,MicroStrategy,MRNA,Moderna
+"December 23, 2024",AXON,Axon Enterprise,SMCI,Supermicro
+"November 18, 2024",APP,AppLovin,DLTR,Dollar Tree
+"July 22, 2024",SMCI,Supermicro,WBA,Walgreens Boots Alliance
+"June 24, 2024",ARM,Arm Holdings,SIRI,Sirius XM
+"March 18, 2024",LIN,Linde,SPLK,Splunk
+"December 18, 2023",CDW,CDW,ALGN,Align Technology
+"December 18, 2023",CCEP,Coca-Cola Europacific Partners,EBAY,EBay
+"December 18, 2023",DASH,DoorDash,ENPH,Enphase Energy
+"December 18, 2023",MDB,MongoDB,JD,JD.com
+"December 18, 2023",ROP,Roper Technologies,LCID,Lucid Group
+"December 18, 2023",SPLK,Splunk,ZM,Zoom Video Communications
+"December 14, 2023",TTWO,Take-Two Interactive,SGEN,Seagen Inc.
+"July 17, 2023",TTD,The Trade Desk,ATVI,Activision Blizzard
+"June 20, 2023",ON,Onsemi,RIVN,Rivian Automotive
+"June 7, 2023",GEHC,GE HealthCare,FI,Fiserv
+"December 19, 2022",CSGP,CoStar Group,VRSN,VeriSign
+"December 19, 2022",RIVN,Rivian Automotive,SWKS,Skyworks
+"December 19, 2022",,,NTES,NetEase
+"December 19, 2022",WBD,Warner Bros. Discovery,SPLK,Splunk
+"December 19, 2022",GFS,GlobalFoundries,BIDU,Baidu
+"December 19, 2022",BKR,Baker Hughes,MTCH,Match Group
+"December 19, 2022",FANG,Diamondback Energy,DOCU,DocuSign
+"November 21, 2022",ENPH,Enphase Energy,OKTA,Okta
+"February 22, 2022",AZN,AstraZeneca,XLNX,Xilinx
+"February 2, 2022",CEG,Constellation Energy,,
+"January 24, 2022",ODFL,Old Dominion Freight Line,PTON,Peloton
+"December 20, 2021",ABNB,Airbnb,CDW,CDW
+"December 20, 2021",FTNT,Fortinet,FOXA,Fox Corporation
+"December 20, 2021",,,FOX,Fox Corporation
+"December 20, 2021",PANW,Palo Alto Networks,CERN,Cerner
+"December 20, 2021",LCID,Lucid Group,CHKP,Check Point
+"December 20, 2021",ZS,Zscaler,TCOM,Trip.com
+"December 20, 2021",DDOG,Datadog,INCY,Incyte
+"August 26, 2021",CRWD,Crowdstrike,MXIM,Maxim Integrated Products
+"July 21, 2021",HON,Honeywell,ALXN,Alexion Pharmaceuticals
+"December 21, 2020",AEP,American Electric Power,BMRN,BioMarin Pharmaceutical
+"December 21, 2020",MRVL,Marvell Technology,CTXS,Citrix Systems
+"December 21, 2020",MTCH,Match Group,EXPE,Expedia
+"December 21, 2020",OKTA,Okta,LBTYA,Liberty Global
+"December 21, 2020",,,LBTYK,Liberty Global
+"December 21, 2020",PTON,Peloton,TTWO,Take-Two Interactive
+"December 21, 2020",TEAM,Atlassian,ULTA,Ulta Beauty
+"October 19, 2020",KDP,Keurig Dr Pepper,WDC,Western Digital
+"August 24, 2020",PDD,Pinduoduo,NTAP,NetApp
+"July 20, 2020",MRNA,Moderna,CSGP,CoStar Group
+"June 22, 2020",DOCU,DocuSign,UAL,United Airlines Holdings
+"April 30, 2020",ZM,Zoom Video Communications,WTW,Willis Towers Watson
+"April 20, 2020",DXCM,Dexcom,AAL,American Airlines
+"December 23, 2019",ANSS,Ansys,HAS,Hasbro
+"December 23, 2019",CDW,CDW,HSIC,Henry Schein
+"December 23, 2019",CPRT,Copart,JBHT,J.B. Hunt
+"December 23, 2019",CSGP,CoStar Group,MYL,Mylan
+"December 23, 2019",SGEN,Seattle Genetics,NLOK,NortonLifeLock
+"December 23, 2019",SPLK,Splunk,WYNN,Wynn Resorts
+"November 21, 2019",EXC,Exelon,CELG,Celgene
+"March 19, 2019",FOXA,Fox Corporation Class A,TCFCA,21st Century Fox Class A
+"March 19, 2019",FOX,Fox Corporation Class B,TCFCB,21st Century Fox Class B
+"December 24, 2018",AMD,Advanced Micro Devices,ESRX,Express Scripts
+"December 24, 2018",LULU,lululemon Athletica,HOLX,Hologic
+"December 24, 2018",NTAP,NetApp,QRTEA,Qurate Retail
+"December 24, 2018",UAL,United Continental Holdings,SHPG,Shire PLC
+"December 24, 2018",VRSN,Verisign,STX,Seagate Technology
+"December 24, 2018",WLTW,Willis Towers Watson,VOD,Vodafone
+"November 19, 2018",XEL,Xcel Energy,XRAY,Dentsply Sirona
+"November 5, 2018",NXPI,NXP Semiconductors,CA,CA Inc.
+"July 23, 2018",PEP,PepsiCo,DISH,Dish Network
+"December 18, 2017",ASML,ASML Holding,AKAM,Akamai Technologies
+"December 18, 2017",CDNS,Cadence Design Systems,DISCA,Discovery Communications Series A
+"December 18, 2017",,,DISCK,Discovery Communications Series C
+"December 18, 2017",SNPS,Synopsys,NCLH,Norwegian Cruise Line Holdings
+"December 18, 2017",TTWO,Take-Two Interactive,TSCO,Tractor Supply
+"December 18, 2017",WDAY,Workday,VIAB,Viacom
+"October 23, 2017",ALGN,Align Technology,MAT,Mattel
+"June 19, 2017",MELI,MercadoLibre,YHOO,Yahoo! Inc.
+"April 24, 2017",WYNN,Wynn Resorts,TRIP,TripAdvisor
+"March 20, 2017",IDXX,Idexx Laboratories,SBAC,SBA Communications
+"February 7, 2017",JBHT,J.B. Hunt,NXPI,NXP Semiconductors
+"December 19, 2016",CTAS,Cintas,BBBY,Bed Bath & Beyond
+"December 19, 2016",HAS,Hasbro,NTAP,NetApp
+"December 19, 2016",HOLX,Hologic,SRCL,Stericycle
+"December 19, 2016",KLAC,KLA-Tencor,WFM,Whole Foods Market
+"October 19, 2016",SHPG,Shire PLC,LLTC,Linear Technology
+"July 18, 2016",MCHP,Microchip Technology,NDOI,Endo International
+"June 20, 2016",XRAY,Dentsply Sirona,LMCA,Liberty Media
+"June 20, 2016",,,LMCK,Liberty Media
+"June 20, 2016",,,BATRA,Liberty Media
+"June 20, 2016",,,BATRK,Liberty Media
+"April 18, 2016",BATRA,Liberty Media,,
+"April 18, 2016",BATRK,Liberty Media,,
+"March 16, 2016",NTES,NetEase,SNDK,SanDisk
+"February 16, 2016",CSX,CSX Corporation,KLAC,KLA-Tencor
+"February 1, 2016",AVGO,Broadcom,,
+"December 21, 2015",CTRP,Ctrip,CHRW,C. H. Robinson Worldwide
+"December 21, 2015",ENDP,Endo International,EXPD,Expeditors International
+"December 21, 2015",EXPE,Expedia Group,GMCR,Keurig Green Mountain
+"December 21, 2015",MXIM,Maxim Integrated Products,GRMN,Garmin
+"December 21, 2015",NCLH,Norwegian Cruise Line,SPLS,Staples
+"December 21, 2015",TMUS,T-Mobile US,VIP,VimpelCom
+"December 21, 2015",ULTA,Ulta Beauty,WYNN,Wynn Resorts
+"December 21, 2015",,,LILA,Liberty Latin America Class A
+"December 21, 2015",,,LILAK,Liberty Latin America Class C
+"November 11, 2015",PYPL,PayPal,BRCM,Broadcom Corporation
+"October 7, 2015",INCY,Incyte,ALTR,Altera
+"August 3, 2015",SWKS,Skyworks Solutions,,
+"July 31, 2015",,,SIAL,Sigma-Aldrich
+"July 29, 2015",JD,JD.com,,
+"July 27, 2015",BMRN,BioMarin Pharmaceutical,,
+"July 24, 2015",,,DTV,DirecTV
+"July 24, 2015",,,CTRX,Catamaran Corporation
+"July 2, 2015",KHC,Kraft Heinz,KRFT,Kraft Foods
+"July 2, 2015",LILA,Liberty Latin America Class A,,
+"July 2, 2015",LILAK,Liberty Latin America Class C,,
+"March 23, 2015",WBA,Walgreens Boots Alliance,EQIX,Equinix
+"December 22, 2014",AAL,American Airlines Group,EXPE,Expedia Group
+"December 22, 2014",EA,Electronic Arts,FFIV,F5 Networks
+"December 22, 2014",LRCX,Lam Research,MXIM,Maxim Integrated Products
+"December 22, 2014",CMCSK,Comcast Corporation Class A,,
+"December 22, 2014",FOX,"Twenty-First Century Fox, Inc. Class B",,
+"December 22, 2014",LBTYK,Liberty Global PLC Class C,,
+"April 3, 2014",GOOG,Google Class C,,
+"December 23, 2013",DISH,DISH Network Corporation,FOSL,Fossil Group
+"December 23, 2013",ILMN,Illumina,MCHP,Microchip Technology
+"December 23, 2013",NXPI,NXP Semiconductors,NUAN,Nuance Communications
+"December 23, 2013",TRIP,TripAdvisor,SHLD,Sears Holdings
+"December 23, 2013",TSCO,Tractor Supply Company,XRAY,Dentsply
+"November 18, 2013",MAR,Marriott International,GOLD,Randgold Resources
+"October 29, 2013",VIP,VimpelCom,DELL,Dell
+"August 22, 2013",GMCR,Green Mountain Coffee Roasters,LIFE,Life Technologies
+"July 25, 2013",CHTR,Charter Communications,BMC,BMC Software
+"July 15, 2013",TSLA,Tesla Motors,ORCL,Oracle
+"June 6, 2013",NFLX,Netflix,PRGO,Perrigo
+"June 5, 2013",LMCA,Liberty Media,VMED,Virgin Media
+"March 18, 2013",KRFT,Kraft Foods,STRZA,Starz
+"January 15, 2013",STRZA,Starz,LMCA,Liberty Media
+"December 24, 2012",ADI,Analog Devices,APOL,Apollo Group
+"December 24, 2012",CTRX,Catamaran Corporation,EA,Electronic Arts
+"December 24, 2012",DISCA,Discovery Communications,FLEX,Flextronics
+"December 24, 2012",EQIX,Equinix,GMCR,Green Mountain Coffee Roasters
+"December 24, 2012",LBTYA,Liberty Global,LRCX,Lam Research
+"December 24, 2012",LMCA,Liberty Media,MRVL,Marvell Technology Group
+"December 24, 2012",REGN,Regeneron Pharmaceuticals,NFLX,Netflix
+"December 24, 2012",SBAC,SBA Communications,RIMM,Research in Motion
+"December 24, 2012",VRSK,Verisk Analytics,VRSN,VeriSign
+"December 24, 2012",WDC,Western Digital,WCRX,Warner Chilcott
+"December 12, 2012",FB,"Facebook, Inc.",INFY,Infosys
+"July 23, 2012",KFT,Kraft Foods,CTRP,Ctrip
+"May 30, 2012",VIAB,Viacom,TEVA,Teva Pharmaceutical Industries
+"April 23, 2012",TXN,Texas Instruments,FSLR,First Solar
+"December 19, 2011",AVGO,Avago Technologies,FLIR,FLIR Systems
+"December 19, 2011",FOSL,Fossil Group,ILMN,Illumina
+"December 19, 2011",HANS,Hansen Natural,NIHD,NII Holdings
+"December 19, 2011",NUAN,Nuance Communications,QGEN,Qiagen
+"December 19, 2011",GOLD,Randgold Resources,URBN,Urban Outfitters
+"December 6, 2011",PRGO,Perrigo,JOYG,Joy Global
+"July 15, 2011",SIRI,Sirius XM Radio,CEPH,Cephalon
+"May 27, 2011",GMCR,Green Mountain Coffee Roasters,MICC,Millicom International Cellular
+"April 4, 2011",ALXN,Alexion Pharmaceuticals,GENZ,Genzyme
+"December 20, 2010",AKAM,Akamai Technologies,CTAS,Cintas
+"December 20, 2010",CTRP,Ctrip,DISH,Dish Network
+"December 20, 2010",DLTR,Dollar Tree,FWLT,Foster Wheeler
+"December 20, 2010",FFIV,F5 Networks,HOLX,Hologic
+"December 20, 2010",MU,Micron Technology,JBHT,J. B. Hunt
+"December 20, 2010",NFLX,Netflix,LOGI,Logitech
+"December 20, 2010",WFMI,Whole Foods Market,PDCO,Patterson Companies
+"December 21, 2009",VOD,Vodafone,AKAM,Akamai Technologies
+"December 21, 2009",MAT,Mattel,HANS,Hansen Natural
+"December 21, 2009",BMC,BMC Software,IACI,IAC/InterActiveCorp
+"December 21, 2009",MYL,Mylan,LBTYA,Liberty Global Class A
+"December 21, 2009",QGEN,Qiagen,PPDI,Pharmaceutical Product Development
+"December 21, 2009",SNDK,SanDisk,RYAAY,Ryanair
+"December 21, 2009",VMED,Virgin Media,STLD,Steel Dynamics
+"October 29, 2009",PCLN,Priceline.com,JNPR,Juniper Networks
+"July 17, 2009",CERN,Cerner,JAVA,Sun Microsystems
+"January 20, 2009",NWSA,News Corporation Class A,FMCN,Focus Media Holding
+"December 22, 2008",ADP,Automatic Data Processing,AMLN,Amylin Pharmaceuticals
+"December 22, 2008",FSLR,First Solar,CDNS,Cadence Design Systems
+"December 22, 2008",LIFE,Life Technologies,DISCA,Discovery Communications Class A
+"December 22, 2008",ROST,Ross Stores,LAMR,Lamar Advertising Company
+"December 22, 2008",MXIM,Maxim Integrated Products,LEAP,Leap Wireless International
+"December 22, 2008",ILMN,Illumina,LVLT,Level 3 Communications
+"December 22, 2008",PPDI,Pharmaceutical Product Development,PETM,PetSmart
+"December 22, 2008",ORLY,O'Reilly Auto Parts,SIRI,Sirius XM Radio
+"December 22, 2008",URBN,Urban Outfitters,SNDK,SanDisk
+"December 22, 2008",JBHT,J. B. Hunt,VMED,Virgin Media
+"December 22, 2008",WCRX,Warner Chilcott,WFMI,Whole Foods Market
+"November 10, 2008",STX,Seagate Technology,MNST,Monster Worldwide
+"July 21, 2008",FLIR,FLIR Systems,UAUA,UAL Corporation
+"May 19, 2008",CA,CA Technologies,TLAB,Tellabs
+"April 30, 2008",DTV,DirecTV,BEAS,BEA Systems
+"December 24, 2007",HOLX,Hologic,ERIC,LM Ericsson
+"December 24, 2007",FMCN,Focus Media,PTEN,Patterson-UTI Energy
+"December 24, 2007",HANS,Hansen Natural,ROST,Ross Stores
+"December 24, 2007",STLD,Steel Dynamics,SEPR,Sepracor
+"December 24, 2007",SRCL,Stericycle,XMSR,XM Satellite Radio
+"December 4, 2007",BIDU,"Baidu.com, Inc.",CKFR,CheckFree Corporation
+"October 8, 2007",LEAP,Leap Wireless International,CDWC,CDW Corporation
+"August 27, 2007",VMED,Virgin Media,NLTI,NTL Incorporated
+"July 12, 2007",FWLT,Foster Wheeler,BMET,Biomet
+"June 1, 2007",CEPH,Cephalon,MEDI,MedImmune
+"March 8, 2007",UAUA,UAL Corporation,AEOS,American Eagle Outfitters
+"February 14, 2007",RYAAY,Ryanair,APCC,American Power Conversion
+"February 1, 2007",LOGI,Logitech,CMVT,Comverse Technology

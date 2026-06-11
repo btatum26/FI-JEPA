@@ -1,0 +1,114 @@
+dataset_name: fi_jepa_sparse_v1
+source_database: data/processed/market_data.duckdb
+output_root: data/model_ready
+
+dates:
+  context_start: "2000-01-01"
+  sample_start: "2005-02-25"
+  sample_end: null
+  sample_reference_symbol: ETF_SPY
+  lookback_days: 252
+  max_forward_horizon: 126
+
+splits:
+  validation_windows:
+    - name: post_crisis_rebound
+      start: "2009-06-01"
+      end: "2010-12-31"
+    - name: mid_cycle_chop
+      start: "2015-06-01"
+      end: "2016-12-30"
+    - name: inflation_rates_regime
+      start: "2022-06-01"
+      end: "2023-12-29"
+
+assets:
+  include_asset_types: [stock, etf, index]
+  include_symbols: null
+  exclude_symbols: []
+  minimum_train_observations: 63
+
+features:
+  asset:
+    - feature_family: returns
+      series_source: stooq_derived
+      names: [return_1d, return_5d, return_21d, return_63d, return_126d]
+    - feature_family: volatility
+      series_source: stooq_derived
+      names: [realized_vol_5d, realized_vol_21d, realized_vol_63d, realized_vol_126d]
+    - feature_family: drawdown
+      series_source: stooq_derived
+      names: [drawdown_5d, drawdown_21d, drawdown_63d, drawdown_126d]
+    - feature_family: trend
+      series_source: stooq_derived
+      names:
+        - ma_distance_5d
+        - ma_distance_21d
+        - ma_distance_63d
+        - ma_distance_126d
+        - path_efficiency_5d
+        - path_efficiency_21d
+        - path_efficiency_63d
+        - path_efficiency_126d
+    - feature_family: liquidity
+      series_source: stooq_derived
+      names: [dollar_volume]
+
+  market:
+    - feature_family: dispersion
+      series_source: market_derived
+      names: [xs_dispersion_1d, xs_iqr_1d]
+    - feature_family: breadth
+      series_source: market_derived
+      names: [breadth_1d, pct_above_ma_63d]
+    - feature_family: coverage
+      series_source: market_derived
+      names: [n_assets]
+
+  macro:
+    - feature_family: macro
+      series_source: fred
+      names: [vix_level, vix_change_1d, vix_change_5d, vix_change_21d, vix_change_63d]
+    - feature_family: rates
+      series_source: fred
+      names:
+        - treasury_3m_level
+        - treasury_3m_change_1d
+        - treasury_3m_change_5d
+        - treasury_3m_change_21d
+        - treasury_3m_change_63d
+        - treasury_2y_level
+        - treasury_2y_change_1d
+        - treasury_2y_change_5d
+        - treasury_2y_change_21d
+        - treasury_2y_change_63d
+        - treasury_10y_level
+        - treasury_10y_change_1d
+        - treasury_10y_change_5d
+        - treasury_10y_change_21d
+        - treasury_10y_change_63d
+        - treasury_30y_level
+        - treasury_30y_change_1d
+        - treasury_30y_change_5d
+        - treasury_30y_change_21d
+        - treasury_30y_change_63d
+        - fed_funds_level
+        - fed_funds_change_1d
+        - fed_funds_change_5d
+        - fed_funds_change_21d
+        - fed_funds_change_63d
+        - yield_curve_10y_2y
+        - yield_curve_10y_3m
+        - yield_curve_30y_10y
+
+normalization:
+  method: train_fold_robust_zscore
+  winsorize_quantiles: [0.005, 0.995]
+  transforms:
+    log1p: [dollar_volume, "realized_vol_*", vix_level]
+
+jepa_target_rules:
+  min_valid_dates_in_patch: 10
+  min_valid_asset_fraction: 0.25
+  allow_holdout_patches_as_targets: false
+  allow_padded_patches_as_targets: false

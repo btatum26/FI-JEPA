@@ -1,0 +1,37 @@
+run:
+  name: fi_jepa_v1
+  output_root: runs/pretraining
+  device: auto
+
+configs:
+  model: configs/model.yaml
+  dataloader: configs/dataloader.yaml
+
+optimization:
+  optimizer: adamw
+  lr: 0.0001
+  min_lr: 0.0
+  weight_decay: 0.01
+  epochs: 100
+  warmup_epochs: 5
+  grad_clip_norm: 1.0
+  mixed_precision: true
+
+ema:
+  momentum_start: 0.99
+  momentum_end: 0.999
+
+validation:
+  every_epochs: 1
+
+representation_evaluation:
+  enabled: true
+  views_per_date: 3
+  pca_components: 8
+  export_embeddings_every_validation: false
+
+checkpointing:
+  every_steps: 1000
+
+logging:
+  every_steps: 10

@@ -1,0 +1,512 @@
+# features.yaml
+# Feature configuration for the FI-JEPA / market-state dataset.
+#
+# Convention:
+# - Each encoder row represents the information state after market close on date t.
+# - Encoder features may use observations through t only.
+# - Targets/probes use t+1 onward and must be stored separately.
+# - Missingness is information, not zero. Export masks with model-ready windows.
+
+schema_version: "0.1.0"
+
+metadata:
+  dataset_name: "jepa_market_state_v1"
+  decision_time_convention: "after_close_t"
+  earliest_execution_convention: "next_trading_session"
+  frequency: "daily"
+  default_calendar: "inferred_from_all_symbols"
+  uses_future_data: false
+
+global_settings:
+  price_field: "close"
+  return_type: "log"
+  annualization_factor: 252
+  epsilon: 1.0e-12
+  lookback_windows: [5, 21, 63, 126, 252]
+  price_forward_fill: false
+  macro_forward_fill: true
+  require_feature_lineage: true
+  required_lineage_fields:
+    - "max_source_date_used"
+    - "available_asof"
+    - "uses_future_data"
+    - "source_columns"
+    - "normalization_scope"
+
+feature_groups:
+  market_core:
+    enabled: true
+    level: "symbol"
+    description: "Past-only OHLCV-derived features for core market instruments."
+    symbols:
+      include_asset_types: ["index", "etf"]
+      include_universe_tags:
+        - "core_equity"
+        - "sector_etf"
+        - "rates_bond_proxy"
+        - "credit_proxy"
+        - "commodity_proxy"
+        - "fx_proxy"
+        - "international_proxy"
+    features:
+      returns:
+        enabled: true
+        windows: [1, 5, 21, 63, 126]
+        names: ["return_{window}d"]
+      realized_volatility:
+        enabled: true
+        windows: [21, 63, 126]
+        annualize: true
+        min_periods_fraction: 0.5
+        names: ["realized_vol_{window}d"]
+      rolling_drawdown:
+        enabled: true
+        windows: [63, 126, 252]
+        names: ["drawdown_{window}d"]
+      trend_strength:
+        enabled: true
+        windows: [21, 63, 126]
+        formula: "return_{window}d / (realized_vol_{window}d + epsilon)"
+        names: ["trend_strength_{window}d"]
+      path_efficiency:
+        enabled: true
+        windows: [21, 63, 126]
+        formula: "abs(log(P_t / P_{t-window})) / sum(abs(return_1d))"
+        names: ["path_efficiency_{window}d"]
+      moving_average_distance:
+        enabled: true
+        windows: [21, 63, 126, 252]
+        formula: "close / rolling_mean(close, window) - 1"
+        names: ["ma_distance_{window}d"]
+      volatility_of_volatility:
+        enabled: true
+        base_vol_window: 21
+        windows: [21, 63, 126]
+        formula: "rolling_std(realized_vol_21d, window)"
+        names: ["vov_{window}d"]
+      volume_shock:
+        enabled: true
+        windows: [21, 63]
+        formula: "log(volume / rolling_median(volume, window))"
+        require_volume: true
+        names: ["volume_shock_{window}d"]
+      dollar_volume:
+        enabled: true
+        formula: "close * volume"
+        require_volume: true
+        names: ["dollar_volume"]
+
+  cross_asset:
+    enabled: true
+    level: "date"
+    description: "Features computed across ETFs, sectors, rates proxies, credit proxies, commodities, and international proxies."
+    asset_sets:
+      core_equity:
+        symbols: ["ETF_SPY", "ETF_QQQ", "ETF_IWM", "ETF_DIA"]
+      sector_etfs:
+        symbols:
+          - "ETF_XLB"
+          - "ETF_XLC"
+          - "ETF_XLE"
+          - "ETF_XLF"
+          - "ETF_XLI"
+          - "ETF_XLK"
+          - "ETF_XLP"
+          - "ETF_XLRE"
+          - "ETF_XLU"
+          - "ETF_XLV"
+          - "ETF_XLY"
+      rates_bonds:
+        symbols: ["ETF_TLT", "ETF_IEF", "ETF_SHY", "ETF_AGG"]
+      credit:
+        symbols: ["ETF_HYG", "ETF_LQD"]
+      macro_proxies:
+        symbols: ["ETF_GLD", "ETF_USO", "ETF_UUP", "ETF_EFA", "ETF_EEM"]
+    features:
+      average_pairwise_correlation:
+        enabled: true
+        windows: [21, 63, 126]
+        asset_sets: ["core_equity", "sector_etfs", "rates_bonds", "credit", "macro_proxies"]
+        min_assets: 3
+        names: ["avg_corr_{asset_set}_{window}d"]
+      correlation_change:
+        enabled: true
+        base_feature: "average_pairwise_correlation"
+        short_window: 21
+        long_window: 126
+        names: ["avg_corr_change_{asset_set}_21v126d"]
+      sector_dispersion:
+        enabled: true
+        asset_set: "sector_etfs"
+        return_windows: [1, 5, 21]
+        names: ["sector_dispersion_{window}d"]
+      sector_breadth:
+        enabled: true
+        asset_set: "sector_etfs"
+        return_windows: [1, 5, 21]
+        formula: "mean(return_{window}d > 0)"
+        names: ["sector_breadth_{window}d"]
+      sector_concentration:
+        enabled: true
+        asset_set: "sector_etfs"
+        return_windows: [1, 5, 21]
+        formula: "sum(abs(sector_return)) / sum(abs(component_return))"
+        names: ["sector_return_concentration_{window}d"]
+      cross_asset_return_spreads:
+        enabled: true
+        pairs:
+          - {name: "qqq_minus_spy", long_symbol: "ETF_QQQ", short_symbol: "ETF_SPY"}
+          - {name: "iwm_minus_spy", long_symbol: "ETF_IWM", short_symbol: "ETF_SPY"}
+          - {name: "hyg_minus_lqd", long_symbol: "ETF_HYG", short_symbol: "ETF_LQD"}
+          - {name: "tlt_minus_shy", long_symbol: "ETF_TLT", short_symbol: "ETF_SHY"}
+          - {name: "eem_minus_efa", long_symbol: "ETF_EEM", short_symbol: "ETF_EFA"}
+        windows: [5, 21, 63]
+        names: ["{pair_name}_return_spread_{window}d"]
+
+  equity_cross_section:
+    enabled: false
+    level: "date"
+    description: "Survivorship-biased current-S&P-500 stress-test features. Disabled by default."
+    universe_name: "current_sp500_backfilled"
+    survivorship_bias: "high"
+    point_in_time_valid: false
+    min_assets_per_date: 100
+    features:
+      dispersion:
+        enabled: true
+        return_windows: [1, 5, 21]
+        metrics: ["std", "iqr", "mad"]
+        names: ["xs_dispersion_{metric}_{window}d"]
+      breadth:
+        enabled: true
+        return_windows: [1, 5, 21]
+        names: ["xs_breadth_positive_{window}d"]
+      percent_above_moving_average:
+        enabled: true
+        ma_windows: [63, 126, 252]
+        names: ["xs_pct_above_ma_{window}d"]
+      average_pairwise_correlation:
+        enabled: true
+        windows: [21, 63, 126]
+        max_assets_for_exact_corr: 500
+        names: ["xs_avg_pairwise_corr_{window}d"]
+      sector_dispersion:
+        enabled: true
+        require_sector: true
+        return_windows: [1, 5, 21]
+        names: ["xs_sector_dispersion_{window}d"]
+      equal_weight_proxy:
+        enabled: true
+        return_windows: [1, 5, 21, 63]
+        label_as_survivorship_biased: true
+        names: ["xs_equal_weight_return_{window}d"]
+
+  macro_daily:
+    enabled: true
+    level: "date"
+    description: "Daily or market-like macro/state features with simpler availability assumptions."
+    series:
+      vix: {series_id: "VIXCLS", source: "fred", lag_policy: "same_day_after_close", revised_data_flag: false}
+      treasury_3m: {series_id: "DGS3MO", source: "fred", lag_policy: "same_day_after_close", revised_data_flag: false}
+      treasury_2y: {series_id: "DGS2", source: "fred", lag_policy: "same_day_after_close", revised_data_flag: false}
+      treasury_10y: {series_id: "DGS10", source: "fred", lag_policy: "same_day_after_close", revised_data_flag: false}
+      treasury_30y: {series_id: "DGS30", source: "fred", lag_policy: "same_day_after_close", revised_data_flag: false}
+      high_yield_oas: {series_id: "BAMLH0A0HYM2", source: "fred", lag_policy: "same_day_after_close", revised_data_flag: false}
+      corporate_oas: {series_id: "BAMLC0A0CM", source: "fred", lag_policy: "same_day_after_close", revised_data_flag: false}
+      fed_funds: {series_id: "DFF", source: "fred", lag_policy: "same_day_after_close", revised_data_flag: false}
+    features:
+      levels:
+        enabled: true
+        names: ["{series_name}_level"]
+      changes:
+        enabled: true
+        windows: [1, 5, 21, 63]
+        names: ["{series_name}_change_{window}d"]
+      percent_changes:
+        enabled: false
+        windows: [21, 63]
+        names: ["{series_name}_pct_change_{window}d"]
+      yield_curve_slopes:
+        enabled: true
+        pairs:
+          - {name: "10y_2y", long_series: "treasury_10y", short_series: "treasury_2y"}
+          - {name: "10y_3m", long_series: "treasury_10y", short_series: "treasury_3m"}
+          - {name: "30y_10y", long_series: "treasury_30y", short_series: "treasury_10y"}
+        names: ["yield_curve_{pair_name}"]
+      credit_spreads:
+        enabled: true
+        names:
+          - "high_yield_oas_level"
+          - "corporate_oas_level"
+          - "hy_minus_corporate_oas"
+
+  macro_slow:
+    enabled: false
+    level: "date"
+    description: "Monthly/weekly revised macro series. Disabled for the first JEPA build unless lag/vintage handling is validated."
+    default_lag_policy: "conservative_release_lag"
+    require_asof_date: true
+    series:
+      unemployment: {series_id: "UNRATE", source: "fred", lag_business_days: 5, revised_data_flag: true}
+      cpi: {series_id: "CPIAUCSL", source: "fred", lag_business_days: 15, revised_data_flag: true}
+      industrial_production: {series_id: "INDPRO", source: "fred", lag_business_days: 15, revised_data_flag: true}
+      chicago_fed_nfci: {series_id: "NFCI", source: "fred", lag_business_days: 7, revised_data_flag: true}
+    features:
+      levels:
+        enabled: true
+      changes:
+        enabled: true
+        windows: [1, 3, 6, 12]
+        unit: "months"
+
+  french_factors:
+    enabled: true
+    level: "date"
+    description: "Fama-French factor returns as factor/state inputs and benchmarks."
+    datasets:
+      daily_factors:
+        dataset: "F-F_Research_Data_Factors_daily"
+        frequency: "daily"
+        lag_policy: "available_after_publication_assumption"
+    features:
+      factor_returns:
+        enabled: true
+        columns: ["Mkt-RF", "SMB", "HML", "RF"]
+      rolling_factor_returns:
+        enabled: true
+        windows: [5, 21, 63, 126]
+      rolling_factor_volatility:
+        enabled: true
+        windows: [21, 63, 126]
+
+  calendar:
+    enabled: false
+    level: "date"
+    description: "Calendar features are ablation-only because they can encourage date/seasonality shortcuts."
+    ablation_modes: ["none", "cyclical", "cyclical_with_dropout"]
+    default_mode: "none"
+    cyclical_features:
+      month:
+        enabled: true
+        period: 12
+        names: ["sin_month", "cos_month"]
+      day_of_week:
+        enabled: true
+        period: 5
+        names: ["sin_day_of_week", "cos_day_of_week"]
+    forbidden_features:
+      - "raw_date"
+      - "year"
+      - "days_since_epoch"
+      - "days_since_1900"
+      - "crisis_dummy"
+    dropout:
+      enabled: true
+      probability: 0.5
+  
+  macro_extra:
+    enabled: true
+    level: "date"
+    description: "Additional market-implied macro and liquidity features."
+
+    series:
+      broad_dollar:
+        series_id: "DTWEXBGS"
+        source: "fred"
+        lag_policy: "same_day_after_close"
+        revised_data_flag: false
+
+      real_yield_10y:
+        series_id: "DFII10"
+        source: "fred"
+        lag_policy: "same_day_after_close"
+        revised_data_flag: false
+
+      breakeven_5y:
+        series_id: "T5YIE"
+        source: "fred"
+        lag_policy: "same_day_after_close"
+        revised_data_flag: false
+
+      breakeven_10y:
+        series_id: "T10YIE"
+        source: "fred"
+        lag_policy: "same_day_after_close"
+        revised_data_flag: false
+
+      st_louis_financial_stress:
+        series_id: "STLFSI4"
+        source: "fred"
+        lag_policy: "conservative_5bd"
+        revised_data_flag: true
+
+    features:
+      levels:
+        enabled: true
+
+      changes:
+        enabled: true
+        windows: [1, 5, 21, 63]
+
+      yield_curve_curvature:
+        enabled: true
+        formula: "2 * DGS10 - DGS2 - DGS30"
+
+      real_rate_vs_nominal_rate:
+        enabled: true
+        formula: "DGS10 - DFII10"
+
+  macro_liquidity:
+    enabled: false
+    level: "date"
+    description: "Optional liquidity/funding plumbing features for ablation."
+
+    series:
+      sofr:
+        series_id: "SOFR"
+        source: "fred"
+        lag_policy: "same_day_after_close"
+        revised_data_flag: false
+
+      reverse_repo:
+        series_id: "RRPONTSYD"
+        source: "fred"
+        lag_policy: "same_day_after_close"
+        revised_data_flag: false
+
+      fed_balance_sheet:
+        series_id: "WALCL"
+        source: "fred"
+        lag_policy: "conservative_2bd"
+        revised_data_flag: false
+
+    features:
+      levels:
+        enabled: true
+
+      changes:
+        enabled: true
+        windows: [5, 21, 63]
+
+      funding_spreads:
+        enabled: true
+        formulas:
+          sofr_minus_fed_funds: "SOFR - DFF"
+
+normalization:
+  enabled: true
+  default_method: "train_fold_robust_zscore"
+  fit_scope: "train_fold_only"
+  store_artifacts: true
+  artifact_table: "normalization_artifacts"
+  methods:
+    train_fold_zscore:
+      center: "mean"
+      scale: "std"
+      winsorize: false
+    train_fold_robust_zscore:
+      center: "median"
+      scale: "iqr"
+      winsorize: true
+      winsorize_quantiles: [0.005, 0.995]
+    rolling_zscore:
+      center: "rolling_mean"
+      scale: "rolling_std"
+      window: 756
+      min_periods: 252
+  per_feature_overrides:
+    "realized_vol_*": {transform: "log1p", method: "train_fold_robust_zscore"}
+    "vix_level": {transform: "log1p", method: "train_fold_robust_zscore"}
+    "*_oas_level": {transform: "none", method: "train_fold_robust_zscore"}
+    "dollar_volume": {transform: "log1p", method: "train_fold_robust_zscore"}
+
+missingness:
+  export_masks: true
+  mask_table: "feature_availability_masks"
+  missing_value_fill_for_model: 0.0
+  fill_only_after_mask_creation: true
+  statuses:
+    allowed:
+      - "ok"
+      - "not_listed_yet"
+      - "after_last_observed"
+      - "confirmed_delisted"
+      - "missing_expected"
+      - "bad_download"
+      - "holiday_or_market_closed"
+      - "suspended_or_no_trade_unknown"
+      - "stale_price"
+      - "feature_not_available_yet"
+  feature_group_availability_report:
+    enabled: true
+    min_coverage_by_group:
+      market_core: 0.95
+      cross_asset: 0.90
+      macro_daily: 0.90
+      french_factors: 0.90
+      equity_cross_section: 0.70
+
+validation:
+  hard_checks:
+    no_future_data:
+      enabled: true
+      rule: "max_source_date_used <= date and available_asof <= date"
+    no_encoder_targets:
+      enabled: true
+      forbidden_patterns:
+        - "future_*"
+        - "*target*"
+        - "*label*"
+    no_infinite_values:
+      enabled: true
+    duplicate_feature_rows:
+      enabled: true
+      keys: ["date", "feature_name"]
+    min_non_null_coverage:
+      enabled: true
+      default_min_coverage: 0.80
+    price_quality_rows_excluded:
+      enabled: true
+      allowed_quality_flags_for_features: ["ok"]
+  sanity_baselines:
+    enabled: true
+    checks:
+      - name: "spy_calendar_reasonable"
+        description: "Inferred SPY calendar should not have large unexplained date gaps."
+      - name: "spy_return_independent_source_comparison"
+        description: "Stooq SPY returns should approximately match an independent source over overlapping dates."
+      - name: "vix_fred_cboe_comparison"
+        description: "FRED VIXCLS should approximately match CBOE VIX over overlapping dates."
+      - name: "sector_basket_vs_spy"
+        description: "Equal-weight sector ETF basket should broadly co-move with SPY."
+      - name: "known_crisis_feature_review"
+        description: "Volatility/drawdown features should behave sensibly around 2008, 2020, and 2022."
+
+model_ready_exports:
+  enabled: true
+  output_root: "data/model_ready"
+  source_view: "features"
+  include_targets: false
+  include_masks: true
+  include_feature_names: true
+  include_feature_group_names: true
+  window_lengths: [126, 252, 504]
+  stride: 1
+  export_types:
+    encoder_windows:
+      include_targets: false
+      allowed_feature_groups:
+        - "market_core"
+        - "cross_asset"
+        - "macro_daily"
+        - "french_factors"
+        - "calendar"
+    probe_dataset:
+      include_targets: true
+      include_targets_from_table: "targets"
+      target_join_type: "left"
+      warning: "For probing only. Never use this export for JEPA pretraining."
+    alignment_dataset:
+      include_targets: true
+      include_targets_from_table: "targets"
+      warning: "For later supervised/alignment experiments only."

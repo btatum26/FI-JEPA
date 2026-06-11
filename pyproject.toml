@@ -1,0 +1,46 @@
+[project]
+name = "fi-jepa"
+version = "0.1.0"
+description = "Leakage-aware financial market-state dataset pipeline for FI-JEPA."
+readme = "FI_JEPA_SYSTEM_PLAN.md"
+requires-python = ">=3.11"
+dependencies = [
+    "duckdb>=1.4.0",
+    "numpy>=2.0",
+    "pandas>=2.2",
+    "pandas-datareader>=0.10",
+    "pyarrow>=18.0",
+    "pydantic>=2.10",
+    "pyyaml>=6.0",
+    "requests>=2.32",
+    "torch>=2.5",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "ruff>=0.9",
+]
+
+[project.scripts]
+build-market-database = "dataset_pipeline.build_market_database:main"
+build-model-dataset = "dataset_pipeline.dataset_builder.builder:main"
+import-fred-data = "dataset_pipeline.import_fred_data:main"
+import-stooq-archives = "dataset_pipeline.import_stooq_archives:main"
+train-fi-jepa = "fi_jepa.training:main"
+evaluate-fi-jepa = "fi_jepa.representation:main"
+export-probe-targets = "fi_jepa.probes:export_targets_main"
+run-fi-jepa-probes = "fi_jepa.probes:run_probes_main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/dataset_pipeline", "src/fi_jepa"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100

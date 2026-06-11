@@ -1,0 +1,33 @@
+input:
+  patch_len: 21
+  num_patches: 12
+
+tokenizers:
+  asset:
+    hidden_dim: 64
+    output_dim: 128
+  market:
+    hidden_dim: 32
+    output_dim: 64
+  macro:
+    hidden_dim: 64
+    output_dim: 64
+
+fusion:
+  output_dim: 128
+  dropout: 0.0
+
+context_encoder:
+  layers: 2
+  heads: 4
+  mlp_ratio: 4
+  dropout: 0.1
+
+predictor:
+  layers: 2
+  heads: 4
+  mlp_ratio: 4
+  dropout: 0.1
+
+state_exporter:
+  latent_dim: 8
