@@ -47,10 +47,11 @@ class FIJepaModel(nn.Module):
     """Mean-pooled variable-asset temporal FI-JEPA core model.
 
     The model consumes the patched batch dictionary emitted by
-    ``collate_fi_jepa_batch``. Shared tokenizers and fusion are deterministic;
-    the online temporal encoder and predictor may use dropout. The target
-    temporal encoder is a frozen EMA copy that always evaluates the full valid
-    patch sequence before target positions are gathered.
+    ``FIJepaBatchAssembler`` or its compatibility collator. Shared tokenizers
+    and fusion are deterministic; the online temporal encoder and predictor may
+    use dropout. The target temporal encoder is a frozen EMA copy that always
+    evaluates the full valid patch sequence before target positions are
+    gathered.
 
     Shape symbols used throughout this module:
         ``B``: batch size.

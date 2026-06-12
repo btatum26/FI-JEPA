@@ -4,29 +4,44 @@ import hashlib
 from typing import Literal
 
 import numpy as np
-import torch
 from torch.utils.data import Dataset
 
 from fi_jepa.dataloader.config import FIJepaDataConfig
-from fi_jepa.dataloader.masking import compute_patch_masks, sample_jepa_target_mask
+from fi_jepa.dataloader.masking import compute_patch_masks
 from fi_jepa.dataloader.panel_store import FrozenPanelStore, Split
+from fi_jepa.dataloader.request import ViewKind, WindowRequest
 
 EmbeddingSplit = Literal["train", "validation"]
 AssetView = Literal["all_valid", "fixed_k"]
 
 
 # ============================================================================
-# WINDOW DATASET AND LOADER
+# SHARED DATASET VALIDATION
 # ============================================================================
 
 
-class FIJepaWindowDataset(Dataset[dict[str, object]]):
-    """Reconstruct split-safe windows and sample reproducible JEPA views.
+def _validate_artifact_lookback(store: FrozenPanelStore, config: FIJepaDataConfig) -> None:
+    """Require runtime and artifact lookback lengths to describe the same windows."""
+    artifact_lookback = (store.resolved_config.get("dates") or {}).get("lookback_days")
+    if artifact_lookback is not None and int(artifact_lookback) != config.lookback_days:
+        raise ValueError(
+            f"Configured lookback_days={config.lookback_days} does not match "
+            f"artifact lookback_days={artifact_lookback}."
+        )
 
-    Initialization removes sample dates that can never satisfy the configured
-    minimum target count. Each item then chooses a split-appropriate asset
-    panel, reconstructs values and validity masks from the shared store, and
-    samples a temporal JEPA target/context partition.
+
+# ============================================================================
+# JEPA WINDOW REQUEST DATASET
+# ============================================================================
+
+
+class FIJepaWindowDataset(Dataset[WindowRequest]):
+    """Expose structurally valid JEPA endpoints as lightweight window requests.
+
+    Initialization still removes sample dates that can never satisfy the
+    configured minimum target count. Item access performs no asset selection,
+    dense gathering, patching, or JEPA masking; those batch-dependent concerns
+    are owned by ``FIJepaBatchAssembler``.
     """
 
     def __init__(
@@ -39,25 +54,17 @@ class FIJepaWindowDataset(Dataset[dict[str, object]]):
     ):
         if split not in {"train", "validation", "diagnostic"}:
             raise ValueError(f"Unsupported split: {split}")
+        if view_index < 0:
+            raise ValueError("view_index cannot be negative.")
 
-        self.store = store
+        _validate_artifact_lookback(store, config)
         self.config = config
         self.split = split
         self.view_index = view_index
         self.epoch = 0
 
-        # The artifact and runtime must agree on window length because all
-        # reconstructed masks and patch boundaries depend on it.
-        artifact_lookback = (store.resolved_config.get("dates") or {}).get("lookback_days")
-        if artifact_lookback is not None and int(artifact_lookback) != config.lookback_days:
-            raise ValueError(
-                f"Configured lookback_days={config.lookback_days} does not match "
-                f"artifact lookback_days={artifact_lookback}."
-            )
-
         nominal = store.sample_indices_for(split)
         retained: list[int] = []
-
         # Filter once using every endpoint-valid asset. Removed dates are
         # structurally unable to produce enough target patches under any view.
         for sample_date_idx in nominal:
@@ -73,6 +80,10 @@ class FIJepaWindowDataset(Dataset[dict[str, object]]):
                 retained.append(int(sample_date_idx))
 
         self.sample_date_indices = np.asarray(retained, dtype=np.int64)
+        self.sample_dates = tuple(
+            store.date_values[sample_date_idx].isoformat()
+            for sample_date_idx in self.sample_date_indices
+        )
         self.nominal_sample_count = int(len(nominal))
         self.dropped_sample_count = self.nominal_sample_count - len(retained)
 
@@ -81,23 +92,10 @@ class FIJepaWindowDataset(Dataset[dict[str, object]]):
         return len(self.sample_date_indices)
 
     def set_epoch(self, epoch: int) -> None:
-        """Set the epoch used for reproducible epoch-varying training views."""
+        """Set the epoch encoded into reproducible training request seeds."""
         if epoch < 0:
             raise ValueError("epoch cannot be negative.")
         self.epoch = epoch
-
-    def _rng(self, sample_date_idx: int, stream: int, *, attempt: int = 0) -> np.random.Generator:
-        """Create an independent deterministic RNG for one sampling decision.
-
-        Training views vary by epoch. Validation and diagnostic views ignore
-        epoch so repeated evaluation is stable. ``stream`` separates asset
-        sampling from temporal masking, while ``attempt`` makes retries stable.
-        """
-        epoch = self.epoch if self.split == "train" else 0
-        seed = np.random.SeedSequence(
-            [self.config.seed, sample_date_idx, epoch, self.view_index, stream, attempt]
-        )
-        return np.random.default_rng(seed)
 
     def _patch_masks(self, masks: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
         """Convert daily store masks into split-aware patch-level masks."""
@@ -114,114 +112,31 @@ class FIJepaWindowDataset(Dataset[dict[str, object]]):
             allow_holdout_targets=self.split != "train",
         )
 
-    def _pad_asset_ids(self, asset_ids: np.ndarray, target_size: int) -> np.ndarray:
-        """Right-pad an asset view with the ``-1`` missing-slot sentinel."""
-        if len(asset_ids) >= target_size:
-            return asset_ids
-        return np.pad(asset_ids, (0, target_size - len(asset_ids)), constant_values=-1)
+    def _seed_for(self, sample_date_idx: int) -> int:
+        """Return one deterministic seed for all assembler decisions for a request."""
+        epoch = self.epoch if self.split == "train" else 0
+        seed = np.random.SeedSequence(
+            [self.config.seed, sample_date_idx, epoch, self.view_index]
+        ).generate_state(1, dtype=np.uint64)[0]
+        return int(seed)
 
-    def _choose_asset_view(self, sample_date_idx: int) -> tuple[np.ndarray, dict[str, np.ndarray]]:
-        """Choose assets and return the patch masks induced by that panel.
-
-        Validation always uses the complete endpoint-valid panel. Training and
-        diagnostic views sample a fixed-width panel, retry historically sparse
-        selections, then fall back to the highest-coverage assets.
-        """
-        candidates = self.store.endpoint_asset_ids(sample_date_idx, self.split)
-        if self.split == "validation":
-            # Stable full-panel validation measures the same view every run;
-            # collation handles different asset counts across sample dates.
-            selected = candidates
-            masks = self.store.window_masks(
-                sample_date_idx, selected, self.split, self.config.lookback_days
-            )
-            return selected, self._patch_masks(masks)
-
-        target_size = (
-            self.config.train_k_assets if self.split == "train" else self.config.diagnostic_k_assets
-        )
-
-        # An endpoint-valid asset can still be sparse earlier in the lookback.
-        # Retry deterministic views until enough target patches remain.
-        for attempt in range(self.config.max_asset_sampling_attempts):
-            rng = self._rng(sample_date_idx, 1, attempt=attempt)
-            selected = rng.choice(
-                candidates, size=min(target_size, len(candidates)), replace=False
-            ).astype(np.int64)
-            selected = self._pad_asset_ids(selected, target_size)
-            masks = self.store.window_masks(
-                sample_date_idx, selected, self.split, self.config.lookback_days
-            )
-            patch_masks = self._patch_masks(masks)
-            if (
-                int(patch_masks["patch_target_eligible"].sum()) >= self.config.min_masked_patches
-                and int(patch_masks["patch_context_mask"].sum()) > self.config.min_masked_patches
-            ):
-                return selected, patch_masks
-
-        # If random views fail, rank the full candidate panel by historical
-        # coverage so a viable sparse sample is not rejected due to bad draws.
-        all_masks = self.store.window_masks(
-            sample_date_idx, candidates, self.split, self.config.lookback_days
-        )
-        coverage = all_masks["valid_asset_mask"].sum(axis=0)
-        selected = candidates[np.argsort(-coverage, kind="stable")[:target_size]]
-        selected = self._pad_asset_ids(selected, target_size)
-        masks = self.store.window_masks(
-            sample_date_idx, selected, self.split, self.config.lookback_days
-        )
-        patch_masks = self._patch_masks(masks)
-        if (
-            int(patch_masks["patch_target_eligible"].sum()) < self.config.min_masked_patches
-            or int(patch_masks["patch_context_mask"].sum()) <= self.config.min_masked_patches
-        ):
-            raise RuntimeError(
-                f"Sample date_idx={sample_date_idx} cannot produce "
-                f"{self.config.min_masked_patches} target patches with visible context."
-            )
-        return selected, patch_masks
-
-    def __getitem__(self, index: int) -> dict[str, object]:
-        """Build one dense model sample with daily, patch, and JEPA masks."""
+    def __getitem__(self, index: int) -> WindowRequest:
+        """Return one small JEPA request without materializing its window."""
         sample_date_idx = int(self.sample_date_indices[index])
-        asset_ids, patch_masks = self._choose_asset_view(sample_date_idx)
-        window = self.store.window(
-            sample_date_idx, asset_ids, self.split, self.config.lookback_days
+        view_kind: ViewKind = "all_valid" if self.split == "validation" else "random_k"
+        return WindowRequest(
+            sample_date_idx=sample_date_idx,
+            sample_date=self.sample_dates[index],
+            split=self.split,
+            request_kind="jepa",
+            view_kind=view_kind,
+            view_index=self.view_index,
+            seed=self._seed_for(sample_date_idx),
         )
-
-        # Temporal targets use a separate RNG stream from asset selection, so
-        # changing one sampling policy does not silently perturb the other.
-        target_mask, context_mask, target_ids = sample_jepa_target_mask(
-            patch_masks["patch_target_eligible"],
-            patch_masks["patch_context_mask"],
-            self._rng(sample_date_idx, 2),
-            mask_ratio=self.config.mask_ratio,
-            min_masked_patches=self.config.min_masked_patches,
-            max_masked_patches=self.config.max_masked_patches,
-        )
-
-        # NumPy arrays are contiguous CPU buffers, so torch.from_numpy avoids
-        # copying each reconstructed sample before collation.
-        tensors = {
-            name: torch.from_numpy(np.asarray(value))
-            for name, value in {**window, **patch_masks}.items()
-            if name != "date_indices"
-        }
-        return {
-            **tensors,
-            "date_indices": torch.from_numpy(window["date_indices"]),
-            "asset_ids": torch.from_numpy(asset_ids),
-            "sample_date": self.store.date_values[sample_date_idx].isoformat(),
-            "sample_date_idx": torch.tensor(sample_date_idx, dtype=torch.int64),
-            "split_label": self.split,
-            "jepa_target_mask": torch.from_numpy(target_mask),
-            "jepa_context_mask": torch.from_numpy(context_mask),
-            "target_patch_ids": torch.from_numpy(target_ids),
-        }
 
 
 # ============================================================================
-# UNMASKED EMBEDDING DATASET
+# DETERMINISTIC FIXED-K ASSET VIEWS
 # ============================================================================
 
 
@@ -256,8 +171,13 @@ def fixed_k_asset_ids(
     return selected
 
 
-class FIJepaEmbeddingDataset(Dataset[dict[str, object]]):
-    """Reconstruct deterministic full-context windows without JEPA target masks."""
+# ============================================================================
+# UNMASKED EMBEDDING REQUEST DATASET
+# ============================================================================
+
+
+class FIJepaEmbeddingDataset(Dataset[WindowRequest]):
+    """Expose deterministic embedding endpoints as lightweight window requests."""
 
     def __init__(
         self,
@@ -275,85 +195,41 @@ class FIJepaEmbeddingDataset(Dataset[dict[str, object]]):
         if view_index < 0:
             raise ValueError("view_index cannot be negative.")
 
-        self.store = store
+        _validate_artifact_lookback(store, config)
         self.config = config
         self.split = split
         self.asset_view = asset_view
         self.view_index = view_index
 
-        artifact_lookback = (store.resolved_config.get("dates") or {}).get("lookback_days")
-        if artifact_lookback is not None and int(artifact_lookback) != config.lookback_days:
-            raise ValueError(
-                f"Configured lookback_days={config.lookback_days} does not match "
-                f"artifact lookback_days={artifact_lookback}."
-            )
-
         # Endpoint-valid candidates and split permission guarantee that the
-        # final patch has context. Avoid reconstructing every all-asset window
-        # during initialization; each item still enforces the endpoint rule.
+        # final patch has context. The assembler enforces that invariant again.
         retained = [
             int(sample_date_idx)
             for sample_date_idx in store.sample_indices_for(split)
             if store.endpoint_asset_ids(int(sample_date_idx), split).size > 0
         ]
         self.sample_date_indices = np.asarray(retained, dtype=np.int64)
+        self.sample_dates = tuple(
+            store.date_values[sample_date_idx].isoformat()
+            for sample_date_idx in self.sample_date_indices
+        )
 
     def __len__(self) -> int:
         """Return the number of endpoint-valid embedding dates."""
         return len(self.sample_date_indices)
 
-    def _patch_masks(self, masks: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
-        """Convert daily masks into the full-context embedding patch contract."""
-        return compute_patch_masks(
-            masks["valid_asset_mask"],
-            masks["valid_date_mask"],
-            masks["holdout_date_mask"],
-            masks["padded_date_mask"],
-            masks["asset_slot_mask"],
-            patch_len=self.config.patch_len,
-            min_valid_days_per_asset_patch=self.config.min_valid_days_per_asset_patch,
-            min_valid_dates_in_patch=self.config.min_valid_dates_in_patch,
-            min_valid_asset_fraction=self.config.min_valid_asset_fraction,
-            allow_holdout_targets=self.split == "validation",
-        )
-
-    def __getitem__(self, index: int) -> dict[str, object]:
-        """Build one deterministic unmasked encoder window."""
+    def __getitem__(self, index: int) -> WindowRequest:
+        """Return one small embedding request without materializing its window."""
         sample_date_idx = int(self.sample_date_indices[index])
-        sample_date = self.store.date_values[sample_date_idx].isoformat()
-        candidates = self.store.endpoint_asset_ids(sample_date_idx, self.split)
-        asset_ids = candidates
-        if self.asset_view == "fixed_k":
-            asset_ids = fixed_k_asset_ids(
-                candidates,
-                dataset_version=self.store.dataset_version,
-                sample_date=sample_date,
-                view_index=self.view_index,
-                k=self.config.diagnostic_k_assets,
-            )
-
-        window = self.store.window(
-            sample_date_idx, asset_ids, self.split, self.config.lookback_days
+        seed = np.random.SeedSequence(
+            [self.config.seed, sample_date_idx, 0, self.view_index]
+        ).generate_state(1, dtype=np.uint64)[0]
+        return WindowRequest(
+            sample_date_idx=sample_date_idx,
+            sample_date=self.sample_dates[index],
+            split=self.split,
+            request_kind="embedding",
+            view_kind=self.asset_view,
+            view_index=self.view_index,
+            seed=int(seed),
         )
-        patch_masks = self._patch_masks(window)
-        if not bool(patch_masks["patch_context_mask"][-1]):
-            raise RuntimeError(
-                f"Embedding sample date_idx={sample_date_idx} has no context-valid endpoint patch."
-            )
-        tensors = {
-            name: torch.from_numpy(np.asarray(value))
-            for name, value in {**window, **patch_masks}.items()
-            if name not in {"date_indices", "patch_target_eligible"}
-        }
-        window_name = self.store.dates.iloc[sample_date_idx].get("validation_window_name", None)
-        return {
-            **tensors,
-            "date_indices": torch.from_numpy(window["date_indices"]),
-            "asset_ids": torch.from_numpy(asset_ids),
-            "sample_date": sample_date,
-            "sample_date_idx": torch.tensor(sample_date_idx, dtype=torch.int64),
-            "split_label": self.split,
-            "validation_window_name": "" if window_name is None or str(window_name) == "<NA>" else str(window_name),
-            "asset_view": self.asset_view,
-            "view_index": torch.tensor(self.view_index, dtype=torch.int64),
-        }

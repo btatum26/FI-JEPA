@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -10,10 +11,12 @@ import torch
 import yaml
 
 from fi_jepa.dataloader import (
+    FIJepaBatchAssembler,
     FIJepaDataConfig,
     FIJepaEmbeddingDataset,
     FIJepaWindowDataset,
     FrozenPanelStore,
+    WindowRequest,
     build_fi_jepa_embedding_dataloader,
     build_fi_jepa_dataloader,
     fixed_k_asset_ids,
@@ -190,6 +193,19 @@ def _write_model_artifact(root: Path) -> FIJepaDataConfig:
 # ============================================================================
 
 
+def _assert_batches_equal(first: dict[str, object], second: dict[str, object]) -> None:
+    """Require exact key, metadata, dtype, shape, and tensor-value parity."""
+    assert first.keys() == second.keys()
+    for name in first:
+        if isinstance(first[name], torch.Tensor):
+            assert isinstance(second[name], torch.Tensor)
+            assert first[name].dtype == second[name].dtype
+            assert first[name].shape == second[name].shape
+            assert torch.equal(first[name], second[name]), name
+        else:
+            assert first[name] == second[name], name
+
+
 def test_store_reconstructs_sparse_masks_and_blocks_protected_train_facts(
     tmp_path: Path,
 ) -> None:
@@ -213,7 +229,7 @@ def test_store_reconstructs_sparse_masks_and_blocks_protected_train_facts(
     assert np.count_nonzero(protected["asset_x"][:-1]) == 0
 
 
-def test_dataset_filters_invalid_samples_and_builds_split_relative_masks(
+def test_dataset_filters_invalid_samples_and_returns_lightweight_requests(
     tmp_path: Path,
 ) -> None:
     config = _write_model_artifact(tmp_path / "artifact")
@@ -228,16 +244,41 @@ def test_dataset_filters_invalid_samples_and_builds_split_relative_masks(
     assert validation.dropped_sample_count == 0
     assert len(validation) == 3
 
-    train_sample = train[0]
-    assert train_sample["asset_ids"].shape == (2,)
-    assert train_sample["asset_slot_mask"].all()
-    assert train_sample["patch_target_eligible"].all()
-    assert int(train_sample["jepa_target_mask"].sum()) == 3
+    train_request = train[0]
+    assert isinstance(train_request, WindowRequest)
+    assert train_request.request_kind == "jepa"
+    assert train_request.view_kind == "random_k"
 
-    validation_sample = validation[0]
-    assert validation_sample["holdout_date_mask"].all()
-    assert validation_sample["patch_target_eligible"].all()
-    assert validation_sample["asset_ids"].tolist() == [0, 1, 2]
+    validation_request = validation[0]
+    assert isinstance(validation_request, WindowRequest)
+    assert validation_request.request_kind == "jepa"
+    assert validation_request.view_kind == "all_valid"
+
+    assembler = FIJepaBatchAssembler(store, config)
+    train_batch = assembler([train_request])
+    assert train_batch["asset_ids"].shape == (1, 2)
+    assert train_batch["asset_slot_mask"].all()
+    assert train_batch["patch_target_eligible"].all()
+    assert int(train_batch["jepa_target_mask"].sum()) == 3
+
+    validation_batch = assembler([validation_request])
+    assert validation_batch["holdout_date_mask"].all()
+    assert validation_batch["patch_target_eligible"].all()
+    assert validation_batch["asset_ids"][0].tolist() == [0, 1, 2]
+
+
+def test_dataset_item_does_not_materialize_store_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _write_model_artifact(tmp_path / "artifact")
+    store = FrozenPanelStore(config.artifact_path)
+    dataset = FIJepaWindowDataset(store, config, "train")
+
+    def fail_window(*args: object, **kwargs: object) -> None:
+        raise AssertionError("Dataset.__getitem__ must not materialize a dense window.")
+
+    monkeypatch.setattr(store, "window", fail_window)
+    assert isinstance(dataset[0], WindowRequest)
 
 
 def test_training_views_change_by_epoch_and_validation_views_are_frozen(
@@ -250,20 +291,27 @@ def test_training_views_change_by_epoch_and_validation_views_are_frozen(
     diagnostic = FIJepaWindowDataset(store, config, "diagnostic", view_index=2)
 
     training_views = []
+    assembler = FIJepaBatchAssembler(store, config)
     for epoch in range(5):
         train.set_epoch(epoch)
-        sample = train[0]
+        sample = assembler([train[0]])
         training_views.append(
-            (tuple(sample["asset_ids"].tolist()), tuple(sample["jepa_target_mask"].tolist()))
+            (
+                tuple(sample["asset_ids"][0].tolist()),
+                tuple(sample["jepa_target_mask"][0].tolist()),
+            )
         )
     assert len(set(training_views)) > 1
 
-    first_validation = validation[0]
+    first_validation = assembler([validation[0]])
     validation.set_epoch(9)
-    second_validation = validation[0]
+    second_validation = assembler([validation[0]])
     assert torch.equal(first_validation["asset_ids"], second_validation["asset_ids"])
     assert torch.equal(first_validation["jepa_target_mask"], second_validation["jepa_target_mask"])
-    assert torch.equal(diagnostic[0]["asset_ids"], diagnostic[0]["asset_ids"])
+    assert torch.equal(
+        assembler([diagnostic[0]])["asset_ids"],
+        assembler([diagnostic[0]])["asset_ids"],
+    )
 
 
 def test_dataloader_pads_variable_assets_and_exposes_patched_views(tmp_path: Path) -> None:
@@ -300,10 +348,15 @@ def test_embedding_views_are_unmasked_all_valid_and_deterministic_fixed_k(
         store, config, "validation", asset_view="fixed_k", view_index=1
     )
 
-    assert all_valid[1]["asset_ids"].tolist() == [0, 1, 2, 3]
-    assert len(fixed_first[1]["asset_ids"]) == config.diagnostic_k_assets
-    assert torch.equal(fixed_first[1]["asset_ids"], fixed_first[1]["asset_ids"])
-    assert not torch.equal(fixed_first[1]["asset_ids"], fixed_second[1]["asset_ids"])
+    assembler = FIJepaBatchAssembler(store, config)
+    all_valid_batch = assembler([all_valid[1]])
+    fixed_first_batch = assembler([fixed_first[1]])
+    fixed_first_repeat = assembler([fixed_first[1]])
+    fixed_second_batch = assembler([fixed_second[1]])
+    assert all_valid_batch["asset_ids"][0].tolist() == [0, 1, 2, 3]
+    assert fixed_first_batch["asset_ids"].shape[1] == config.diagnostic_k_assets
+    assert torch.equal(fixed_first_batch["asset_ids"], fixed_first_repeat["asset_ids"])
+    assert not torch.equal(fixed_first_batch["asset_ids"], fixed_second_batch["asset_ids"])
 
     loader = build_fi_jepa_embedding_dataloader(
         config, "validation", asset_view="all_valid", store=store
@@ -313,6 +366,43 @@ def test_embedding_views_are_unmasked_all_valid_and_deterministic_fixed_k(
     assert "jepa_context_mask" not in batch
     assert "target_patch_ids" not in batch
     assert batch["patch_context_mask"][:, -1].all()
+
+
+@pytest.mark.parametrize(
+    ("request_kind", "asset_view"),
+    [
+        ("train", None),
+        ("validation", None),
+        ("embedding", "all_valid"),
+        ("embedding", "fixed_k"),
+    ],
+)
+def test_batched_gather_matches_per_sample_assembly(
+    tmp_path: Path,
+    request_kind: str,
+    asset_view: str | None,
+) -> None:
+    config = _write_model_artifact(tmp_path / f"{request_kind}_{asset_view}")
+    store = FrozenPanelStore(config.artifact_path)
+    if request_kind == "embedding":
+        dataset = FIJepaEmbeddingDataset(
+            store,
+            config,
+            "validation",
+            asset_view=asset_view,
+            view_index=2,
+        )
+    else:
+        dataset = FIJepaWindowDataset(store, config, request_kind)
+    requests = [dataset[index] for index in range(min(2, len(dataset)))]
+
+    batched = FIJepaBatchAssembler(
+        store, replace(config, assembly_mode="batched_gather")
+    )(requests)
+    per_sample = FIJepaBatchAssembler(
+        store, replace(config, assembly_mode="per_sample")
+    )(requests)
+    _assert_batches_equal(batched, per_sample)
 
 
 def test_fixed_k_asset_hash_selection_ignores_candidate_order() -> None:

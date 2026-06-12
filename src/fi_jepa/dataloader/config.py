@@ -2,8 +2,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 import yaml
+
+AssemblyMode = Literal["batched_gather", "per_sample"]
 
 
 # ============================================================================
@@ -39,6 +42,7 @@ class FIJepaDataConfig:
     drop_last: bool = False
     seed: int = 1337
     max_asset_sampling_attempts: int = 16
+    assembly_mode: AssemblyMode = "batched_gather"
 
     def __post_init__(self) -> None:
         """Reject invalid dimensions, sampling bounds, and loader settings."""
@@ -66,6 +70,8 @@ class FIJepaDataConfig:
             raise ValueError("num_workers cannot be negative.")
         if self.max_asset_sampling_attempts <= 0:
             raise ValueError("max_asset_sampling_attempts must be positive.")
+        if self.assembly_mode not in {"batched_gather", "per_sample"}:
+            raise ValueError(f"Unsupported assembly_mode: {self.assembly_mode}")
 
     @property
     def num_patches(self) -> int:

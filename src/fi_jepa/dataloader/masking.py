@@ -8,7 +8,7 @@ import numpy as np
 # ============================================================================
 
 
-def compute_patch_masks(
+def compute_batched_patch_masks(
     valid_asset_mask: np.ndarray,
     valid_date_mask: np.ndarray,
     holdout_date_mask: np.ndarray,
@@ -21,7 +21,7 @@ def compute_patch_masks(
     min_valid_asset_fraction: float,
     allow_holdout_targets: bool,
 ) -> dict[str, np.ndarray]:
-    """Build context and target-eligibility masks for one reconstructed window.
+    """Build context and target-eligibility masks for a batch of windows.
 
     Daily masks are reshaped into chronological patches. Assets qualify for
     panel pooling only after meeting the per-patch valid-day threshold, and
@@ -30,8 +30,8 @@ def compute_patch_masks(
     and asset coverage, no padded dates, and split-relative holdout permission.
 
     Returns:
-        Per-patch asset validity ``[P, A]`` plus context, holdout, target
-        eligibility, and asset-coverage arrays shaped ``[P]``.
+        Per-patch asset validity ``[B, P, A]`` plus context, holdout, target
+        eligibility, and asset-coverage arrays shaped ``[B, P]``.
     """
     # Normalize caller-provided array-likes once so later boolean operations
     # cannot inherit integer or object semantics.
@@ -41,42 +41,42 @@ def compute_patch_masks(
     padded_dates = np.asarray(padded_date_mask, dtype=bool)
     asset_slots = np.asarray(asset_slot_mask, dtype=bool)
 
-    if valid_assets.ndim != 2:
-        raise ValueError("valid_asset_mask must have shape [dates, assets].")
-    n_dates, n_assets = valid_assets.shape
+    if valid_assets.ndim != 3:
+        raise ValueError("valid_asset_mask must have shape [batch, dates, assets].")
+    batch_size, n_dates, n_assets = valid_assets.shape
     if n_dates % patch_len:
         raise ValueError("Window length must be divisible by patch_len.")
-    if asset_slots.shape != (n_assets,):
-        raise ValueError("asset_slot_mask must have shape [assets].")
+    if asset_slots.shape != (batch_size, n_assets):
+        raise ValueError("asset_slot_mask must have shape [batch, assets].")
     for name, mask in (
         ("valid_date_mask", valid_dates),
         ("holdout_date_mask", holdout_dates),
         ("padded_date_mask", padded_dates),
     ):
-        if mask.shape != (n_dates,):
-            raise ValueError(f"{name} must have shape [dates].")
+        if mask.shape != (batch_size, n_dates):
+            raise ValueError(f"{name} must have shape [batch, dates].")
 
-    # [W, A] -> [P, L, A] and [W] -> [P, L]. Reshaping preserves
+    # [B, W, A] -> [B, P, L, A] and [B, W] -> [B, P, L]. Reshaping preserves
     # chronological order because windows are contiguous oldest-to-newest arrays.
     n_patches = n_dates // patch_len
-    valid_assets_patched = valid_assets.reshape(n_patches, patch_len, n_assets)
-    valid_dates_patched = valid_dates.reshape(n_patches, patch_len)
-    holdout_patched = holdout_dates.reshape(n_patches, patch_len)
-    padded_patched = padded_dates.reshape(n_patches, patch_len)
+    valid_assets_patched = valid_assets.reshape(batch_size, n_patches, patch_len, n_assets)
+    valid_dates_patched = valid_dates.reshape(batch_size, n_patches, patch_len)
+    holdout_patched = holdout_dates.reshape(batch_size, n_patches, patch_len)
+    padded_patched = padded_dates.reshape(batch_size, n_patches, patch_len)
 
     # An asset contributes to panel pooling only when it has enough valid days
     # inside the patch. Padded asset slots never enter the coverage denominator.
-    patch_asset_mask = valid_assets_patched.sum(axis=1) >= min_valid_days_per_asset_patch
-    patch_asset_mask &= asset_slots[None, :]
+    patch_asset_mask = valid_assets_patched.sum(axis=2) >= min_valid_days_per_asset_patch
+    patch_asset_mask &= asset_slots[:, None, :]
 
     # Use one as the empty-panel denominator so a fully padded panel produces
     # zero coverage rather than a divide-by-zero result.
-    valid_slot_count = max(int(asset_slots.sum()), 1)
-    valid_asset_fraction = patch_asset_mask.sum(axis=1) / valid_slot_count
-    valid_date_count = valid_dates_patched.sum(axis=1)
-    patch_has_holdout = holdout_patched.any(axis=1)
-    patch_has_padding = padded_patched.any(axis=1)
-    patch_context_mask = valid_dates_patched.any(axis=1)
+    valid_slot_count = np.maximum(asset_slots.sum(axis=1, keepdims=True), 1)
+    valid_asset_fraction = patch_asset_mask.sum(axis=2) / valid_slot_count
+    valid_date_count = valid_dates_patched.sum(axis=2)
+    patch_has_holdout = holdout_patched.any(axis=2)
+    patch_has_padding = padded_patched.any(axis=2)
+    patch_context_mask = valid_dates_patched.any(axis=2)
 
     # Context can be incomplete. JEPA targets must satisfy stricter coverage
     # rules and cannot cross an early-history padding boundary.
@@ -95,6 +95,35 @@ def compute_patch_masks(
         "patch_target_eligible": patch_target_eligible,
         "valid_asset_fraction": valid_asset_fraction.astype(np.float32),
     }
+
+
+def compute_patch_masks(
+    valid_asset_mask: np.ndarray,
+    valid_date_mask: np.ndarray,
+    holdout_date_mask: np.ndarray,
+    padded_date_mask: np.ndarray,
+    asset_slot_mask: np.ndarray,
+    *,
+    patch_len: int,
+    min_valid_days_per_asset_patch: int,
+    min_valid_dates_in_patch: int,
+    min_valid_asset_fraction: float,
+    allow_holdout_targets: bool,
+) -> dict[str, np.ndarray]:
+    """Build patch masks for one window through the batch-first implementation."""
+    batched = compute_batched_patch_masks(
+        np.asarray(valid_asset_mask)[None, ...],
+        np.asarray(valid_date_mask)[None, ...],
+        np.asarray(holdout_date_mask)[None, ...],
+        np.asarray(padded_date_mask)[None, ...],
+        np.asarray(asset_slot_mask)[None, ...],
+        patch_len=patch_len,
+        min_valid_days_per_asset_patch=min_valid_days_per_asset_patch,
+        min_valid_dates_in_patch=min_valid_dates_in_patch,
+        min_valid_asset_fraction=min_valid_asset_fraction,
+        allow_holdout_targets=allow_holdout_targets,
+    )
+    return {name: value[0] for name, value in batched.items()}
 
 
 # ============================================================================

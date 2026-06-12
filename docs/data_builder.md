@@ -153,14 +153,23 @@ Zero-filled values are never considered valid observations.
 ## Runtime Dataloader
 
 `FrozenPanelStore` streams the sparse files into shared dense NumPy arrays.
-Window slicing reapplies split permissions, then `FIJepaWindowDataset`:
+`FIJepaWindowDataset` and `FIJepaEmbeddingDataset` return lightweight
+`WindowRequest` values containing only endpoint, split, view, and deterministic
+seed metadata. `FIJepaBatchAssembler` then:
 
-- Reconstructs 252-day windows.
-- Selects training, validation, or diagnostic asset views.
-- Pads variable asset panels during collation.
-- Patches time.
+- Builds the batch date and asset index matrices.
+- Gathers 252-day asset, market, and macro windows once per batch.
+- Reapplies split permissions and pads variable asset panels.
+- Exposes patched tensors as views over the daily batch tensors.
 - Builds feature, date, asset, context, and target-eligibility masks.
-- Samples temporal JEPA targets.
+- Samples temporal JEPA targets for JEPA requests.
+
+`dataloader.assembly_mode: batched_gather` is the normal runtime path.
+`per_sample` retains the original per-window reconstruction path as a slow
+correctness reference while emitting the same model-facing batch contract.
+The default runtime also leaves `pin_memory` disabled because recursively
+pinning both retained daily tensors and their patched aliases costs more CPU
+time than it saves in this batch contract.
 
 Target eligibility is split-relative:
 
@@ -186,9 +195,9 @@ those facts to training.
 - Train-only normalization.
 - Recorded JEPA target-policy metadata.
 
-`configs/dataloader.yaml` controls runtime reconstruction, asset sampling, patch
-validity thresholds, and temporal masking. Runtime settings are not baked into
-dense windows because no dense windows are stored.
+`configs/dataloader.yaml` controls runtime assembly mode, reconstruction, asset
+sampling, patch validity thresholds, and temporal masking. Runtime settings are
+not baked into dense windows because no dense windows are stored.
 
 ## Implementation
 
