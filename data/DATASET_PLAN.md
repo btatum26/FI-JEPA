@@ -236,13 +236,17 @@ The default model-ready contract uses:
 
 ### Asset Features
 
-Asset features are calculated per `(date, symbol)` and include:
+The current model-ready asset inputs contain only raw daily OHLCV observations:
 
-- Log returns over 1, 5, 21, 63, and 126 days.
-- Realized volatility over 5, 21, 63, and 126 days.
-- Drawdown over 5, 21, 63, and 126 days.
-- Moving-average distance and path efficiency over 5, 21, 63, and 126 days.
-- Dollar volume.
+- Open, high, low, and close prices.
+- Volume.
+
+OHLC prices receive a log transform and volume receives `log1p` before
+train-fold robust normalization. The canonical
+`ticker_features` table still calculates returns, realized volatility,
+drawdown, moving-average distance, path efficiency, and dollar volume for
+analysis and target construction, but those engineered columns are not
+exported to pretraining.
 
 ### Market Features
 
@@ -348,6 +352,8 @@ Required implemented checks include:
   modeled.
 - The model-ready feature list is deliberately narrower than the canonical
   database.
+- The current patch tokenizer mean-pools daily embeddings, so it does not
+  preserve within-patch temporal order after tokenization.
 
 ## Planned Dataset Expansion
 

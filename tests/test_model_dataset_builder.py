@@ -44,7 +44,7 @@ def _write_source_database(path: Path, dates: list[date]) -> None:
                 "symbol": "CALENDAR",
                 "asset_type": "index",
                 "valid_observation": True,
-                "return_1d": float(index),
+                "close": float(index + 1),
             }
         )
         ticker_rows.append(
@@ -53,7 +53,7 @@ def _write_source_database(path: Path, dates: list[date]) -> None:
                 "symbol": "ASSET_A",
                 "asset_type": "stock",
                 "valid_observation": index != 1,
-                "return_1d": float(index),
+                "close": float(index + 1),
             }
         )
         ticker_rows.append(
@@ -62,7 +62,7 @@ def _write_source_database(path: Path, dates: list[date]) -> None:
                 "symbol": "ASSET_B",
                 "asset_type": "stock",
                 "valid_observation": index == 0,
-                "return_1d": float(index),
+                "close": float(index + 1),
             }
         )
     ticker_features = pd.DataFrame(ticker_rows)
@@ -115,9 +115,9 @@ def _write_config(path: Path, database_path: Path, output_root: Path, dates: lis
         "features": {
             "asset": [
                 {
-                    "feature_family": "returns",
-                    "series_source": "stooq_derived",
-                    "names": ["return_1d"],
+                    "feature_family": "price",
+                    "series_source": "stooq",
+                    "names": ["close"],
                 }
             ],
             "market": [
@@ -138,7 +138,7 @@ def _write_config(path: Path, database_path: Path, output_root: Path, dates: lis
         "normalization": {
             "method": "train_fold_robust_zscore",
             "winsorize_quantiles": [0.0, 1.0],
-            "transforms": {},
+            "transforms": {"log": ["close"]},
         },
         "jepa_target_rules": {
             "min_valid_dates_in_patch": 2,
@@ -214,13 +214,14 @@ def test_build_model_dataset_exports_sparse_disjoint_normalized_facts(tmp_path) 
     allowed_dates = int(exported_dates["train_fact_allowed"].sum())
     assert len(train_assets) < trainable_assets * allowed_dates
     assert train_assets["valid_asset"].all()
-    assert train_assets["return_1d__valid"].all()
+    assert train_assets["close__valid"].all()
 
     assert train_macro["date"].min().year == 2004
     assert train_macro["date"].min() < date(2005, 1, 1)
     assert set(features["input_group"]) == {"asset", "market", "macro"}
-    assert set(features["feature_family"]) == {"returns", "breadth", "macro"}
-    assert set(features["series_source"]) == {"stooq_derived", "market_derived", "fred"}
+    assert set(features["feature_family"]) == {"price", "breadth", "macro"}
+    assert set(features["series_source"]) == {"stooq", "market_derived", "fred"}
+    assert features.loc[features["feature_name"].eq("close"), "transform"].item() == "log"
     assert not features["feature_name"].str.contains("oas|future|target", case=False).any()
     assert (
         features.groupby("input_group")["feature_index"]

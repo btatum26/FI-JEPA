@@ -1,7 +1,7 @@
-artifact_path: data/model_ready/fi_jepa_sparse_v1/20260610T173759Z_fa611756af2c4816
+artifact_path: data/model_ready/fi_jepa_sparse_v1/OCHLV_ONLY
 
-lookback_days: 252
-patch_len: 21
+lookback_days: 250
+patch_len: 5
 
 train_k_assets: 256
 diagnostic_k_assets: 256
@@ -9,8 +9,8 @@ diagnostic_k_assets: 256
 mask_ratio: 0.35
 min_masked_patches: 3
 max_masked_patches: 5
-min_valid_days_per_asset_patch: 10
-min_valid_dates_in_patch: 10
+min_valid_days_per_asset_patch: 4
+min_valid_dates_in_patch: 4
 min_valid_asset_fraction: 0.25
 
 batch_size: 32

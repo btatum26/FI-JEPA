@@ -1,8 +1,13 @@
 input:
-  patch_len: 21
-  num_patches: 12
+  patch_len: 5
+  num_patches: 50
 
 tokenizers:
+  type: attention
+  attention:
+    layers: 2
+    heads: 4
+    mlp_ratio: 4
   asset:
     hidden_dim: 64
     output_dim: 128

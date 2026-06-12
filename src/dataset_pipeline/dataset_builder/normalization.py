@@ -16,6 +16,8 @@ def source_expression(feature_name: str, transform: str, alias: str) -> str:
     column = f"{alias}.{quote_identifier(feature_name)}"
     if transform == "none":
         return column
+    if transform == "log":
+        return f"ln({column})"
     if transform == "log1p":
         return f"ln(1.0 + {column})"
     raise ValueError(f"Unsupported feature transform: {transform}")
@@ -24,6 +26,8 @@ def source_expression(feature_name: str, transform: str, alias: str) -> str:
 def valid_expression(feature_name: str, transform: str, alias: str) -> str:
     column = f"{alias}.{quote_identifier(feature_name)}"
     valid = f"{column} IS NOT NULL AND isfinite(CAST({column} AS DOUBLE))"
+    if transform == "log":
+        valid += f" AND {column} > 0.0"
     if transform == "log1p":
         valid += f" AND {column} > -1.0"
     return f"({valid})"

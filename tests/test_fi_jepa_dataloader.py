@@ -456,14 +456,18 @@ def test_store_rejects_noncontiguous_features_and_target_columns(tmp_path: Path)
         FrozenPanelStore(config.artifact_path)
 
 
-def test_dataset_rejects_lookback_that_disagrees_with_artifact(tmp_path: Path) -> None:
+def test_dataset_allows_lookback_within_artifact_limit_and_rejects_larger(
+    tmp_path: Path,
+) -> None:
     config = _write_model_artifact(tmp_path / "artifact")
     resolved = {"dates": {"lookback_days": 10}}
     (config.artifact_path / "config_resolved.yaml").write_text(yaml.safe_dump(resolved))
     store = FrozenPanelStore(config.artifact_path)
 
-    with pytest.raises(ValueError, match="does not match artifact"):
-        FIJepaWindowDataset(store, config, "train")
+    FIJepaWindowDataset(store, config, "train")
+
+    with pytest.raises(ValueError, match="exceeds artifact lookback_days=10"):
+        FIJepaWindowDataset(store, replace(config, lookback_days=12), "train")
 
 
 @pytest.mark.parametrize(

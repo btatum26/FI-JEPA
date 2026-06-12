@@ -21,11 +21,11 @@ AssetView = Literal["all_valid", "fixed_k"]
 
 
 def _validate_artifact_lookback(store: FrozenPanelStore, config: FIJepaDataConfig) -> None:
-    """Require runtime and artifact lookback lengths to describe the same windows."""
+    """Require runtime windows to fit within the artifact's protected lookback."""
     artifact_lookback = (store.resolved_config.get("dates") or {}).get("lookback_days")
-    if artifact_lookback is not None and int(artifact_lookback) != config.lookback_days:
+    if artifact_lookback is not None and config.lookback_days > int(artifact_lookback):
         raise ValueError(
-            f"Configured lookback_days={config.lookback_days} does not match "
+            f"Configured lookback_days={config.lookback_days} exceeds "
             f"artifact lookback_days={artifact_lookback}."
         )
 

@@ -11,10 +11,10 @@ Canonical build timestamp: `2026-06-10 17:19:03.744982 UTC`
 Latest verified model-ready artifact:
 
 ```text
-data/model_ready/fi_jepa_sparse_v1/20260610T173759Z_fa611756af2c4816/
+data/model_ready/fi_jepa_sparse_v1/OCHLV_ONLY/
 ```
 
-Model-ready build timestamp: `2026-06-10 17:37:59.282024 UTC`
+Model-ready build timestamp: `2026-06-12 01:23:45.630377 UTC`
 
 The DuckDB database is the canonical source of truth. Model-ready Parquet
 artifacts are immutable, normalized, split-aware build products derived from
@@ -361,8 +361,8 @@ observation.
 |---|---:|---|
 | `dates.parquet` | 6,647 | Date index, sample eligibility, and split-protection flags |
 | `assets.parquet` | 531 | Stable asset IDs and trainability metadata |
-| `feature_manifest.parquet` | 60 | Ordered exported-feature definitions |
-| `normalization.parquet` | 60 | Train-only normalization parameters |
+| `feature_manifest.parquet` | 43 | Ordered exported-feature definitions |
+| `normalization.parquet` | 43 | Train-only normalization parameters |
 | `train_asset_features.parquet` | 1,732,951 | Sparse valid asset facts on train-allowed dates |
 | `validation_asset_features.parquet` | 1,125,147 | Sparse valid asset facts on protected dates |
 | `train_market_features.parquet` | 4,314 | Date-grain market facts on train-allowed dates |
@@ -451,7 +451,7 @@ Current exported feature groups:
 
 | Input group | Features | Source canonical table |
 |---|---:|---|
-| `asset` | 22 | `ticker_features` |
+| `asset` | 5 | `ticker_features` |
 | `market` | 5 | `features` |
 | `macro` | 33 | `features` |
 
@@ -478,8 +478,8 @@ upper_bound DOUBLE
 
 Normalization uses finite real facts from train-allowed dates only:
 
-1. Apply configured `log1p` transforms to `dollar_volume`,
-   `realized_vol_*`, and `vix_level`.
+1. Apply configured `log` transforms to `open`, `high`, `low`, and `close`,
+   and `log1p` transforms to `volume` and `vix_level`.
 2. Winsorize to the train-fold `0.005` and `0.995` quantiles.
 3. Center on the train-fold median.
 4. Scale by the train-fold interquartile range; use `1.0` if the IQR is not
@@ -521,12 +521,8 @@ Current asset feature families:
 
 | Family | Columns |
 |---|---|
-| Returns | `return_1d`, `return_5d`, `return_21d`, `return_63d`, `return_126d` |
-| Realized volatility | `realized_vol_5d`, `realized_vol_21d`, `realized_vol_63d`, `realized_vol_126d` |
-| Drawdown | `drawdown_5d`, `drawdown_21d`, `drawdown_63d`, `drawdown_126d` |
-| Moving-average distance | `ma_distance_5d`, `ma_distance_21d`, `ma_distance_63d`, `ma_distance_126d` |
-| Path efficiency | `path_efficiency_5d`, `path_efficiency_21d`, `path_efficiency_63d`, `path_efficiency_126d` |
-| Liquidity | `dollar_volume` |
+| Price | `open`, `high`, `low`, `close` |
+| Volume | `volume` |
 
 ### Market and Macro Fact Files
 
@@ -583,11 +579,6 @@ Holdout permission is split-relative. Training batches cannot target protected
 validation facts. Validation JEPA batches may target validation-relative
 holdout patches so validation loss measures those patches. Embedding batches
 use the complete unmasked context-valid sequence and do not sample JEPA targets.
-
-The latest verified artifact named at the top of this document predates the
-split-relative metadata fields and stores the legacy global
-`allow_holdout_patches_as_targets: false` training-protection rule. Runtime
-behavior is defined by the split-relative dataloader policy above.
 
 ## Review Notes
 

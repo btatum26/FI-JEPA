@@ -12,7 +12,12 @@ if TYPE_CHECKING:
 
 from fi_jepa.model_config import FIJepaModelConfig
 from fi_jepa.model_output import FIJepaOutput
-from fi_jepa.tokenizer import MaskedPatchTokenizer, masked_mean, pack_masked_sequence
+from fi_jepa.tokenizer import (
+    MaskedAttentionPatchTokenizer,
+    MaskedPatchTokenizer,
+    masked_mean,
+    pack_masked_sequence,
+)
 
 ENCODER_BATCH_TENSOR_NAMES = frozenset(
     {
@@ -44,7 +49,7 @@ JEPA_BATCH_TENSOR_NAMES = frozenset(
 
 
 class FIJepaModel(nn.Module):
-    """Mean-pooled variable-asset temporal FI-JEPA core model.
+    """Configurable patch-tokenized variable-asset temporal FI-JEPA core model.
 
     The model consumes the patched batch dictionary emitted by
     ``FIJepaBatchAssembler`` or its compatibility collator. Shared tokenizers
@@ -86,15 +91,43 @@ class FIJepaModel(nn.Module):
 
         # Each tokenizer maps one stream-specific patch to its configured token
         # width before the three streams are combined.
-        self.asset_tokenizer = MaskedPatchTokenizer(
-            asset_feature_dim, config.asset_hidden_dim, config.asset_token_dim
-        )
-        self.market_tokenizer = MaskedPatchTokenizer(
-            market_feature_dim, config.market_hidden_dim, config.market_token_dim
-        )
-        self.macro_tokenizer = MaskedPatchTokenizer(
-            macro_feature_dim, config.macro_hidden_dim, config.macro_token_dim
-        )
+        if config.tokenizer_type == "mean":
+            self.asset_tokenizer = MaskedPatchTokenizer(
+                asset_feature_dim, config.asset_hidden_dim, config.asset_token_dim
+            )
+            self.market_tokenizer = MaskedPatchTokenizer(
+                market_feature_dim, config.market_hidden_dim, config.market_token_dim
+            )
+            self.macro_tokenizer = MaskedPatchTokenizer(
+                macro_feature_dim, config.macro_hidden_dim, config.macro_token_dim
+            )
+        else:
+            attention_kwargs = {
+                "layers": config.tokenizer_layers,
+                "heads": config.tokenizer_heads,
+                "mlp_ratio": config.tokenizer_mlp_ratio,
+            }
+            self.asset_tokenizer = MaskedAttentionPatchTokenizer(
+                asset_feature_dim,
+                config.patch_len,
+                config.asset_hidden_dim,
+                config.asset_token_dim,
+                **attention_kwargs,
+            )
+            self.market_tokenizer = MaskedAttentionPatchTokenizer(
+                market_feature_dim,
+                config.patch_len,
+                config.market_hidden_dim,
+                config.market_token_dim,
+                **attention_kwargs,
+            )
+            self.macro_tokenizer = MaskedAttentionPatchTokenizer(
+                macro_feature_dim,
+                config.patch_len,
+                config.macro_hidden_dim,
+                config.macro_token_dim,
+                **attention_kwargs,
+            )
         fusion_input_dim = config.asset_token_dim + config.market_token_dim + config.macro_token_dim
         # [asset token | market token | macro token] -> shared D-dimensional token.
         self.fusion = nn.Sequential(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -11,6 +12,7 @@ from torch.nn import functional as F
 
 from fi_jepa.model import FIJepaModel
 from fi_jepa.model_config import FIJepaModelConfig
+from fi_jepa.tokenizer import MaskedAttentionPatchTokenizer, MaskedPatchTokenizer
 
 
 # ============================================================================
@@ -22,6 +24,10 @@ def _small_config() -> FIJepaModelConfig:
     return FIJepaModelConfig(
         patch_len=2,
         num_patches=4,
+        tokenizer_type="attention",
+        tokenizer_layers=1,
+        tokenizer_heads=1,
+        tokenizer_mlp_ratio=2,
         asset_hidden_dim=6,
         asset_token_dim=8,
         market_hidden_dim=4,
@@ -100,17 +106,24 @@ def test_model_config_loads_and_model_derives_feature_dimensions_from_store() ->
     config = FIJepaModelConfig.from_yaml(Path("configs/model.yaml"))
     store = SimpleNamespace(
         feature_names={
-            "asset": [f"a{index}" for index in range(22)],
+            "asset": [f"a{index}" for index in range(5)],
             "market": [f"m{index}" for index in range(5)],
             "macro": [f"x{index}" for index in range(33)],
         }
     )
     model = FIJepaModel.from_store(config, store)
 
-    assert config.num_patches == 12
-    assert model.asset_feature_dim == 22
+    assert model.patch_position_embedding.shape == (config.num_patches, config.d_model)
+    assert model.asset_feature_dim == 5
     assert model.market_feature_dim == 5
     assert model.macro_feature_dim == 33
+
+
+def test_model_keeps_mean_tokenizer_available_beside_attention_tokenizer() -> None:
+    mean_config = replace(_small_config(), tokenizer_type="mean")
+
+    assert isinstance(FIJepaModel(mean_config, 2, 2, 3).asset_tokenizer, MaskedPatchTokenizer)
+    assert isinstance(_model().asset_tokenizer, MaskedAttentionPatchTokenizer)
 
 
 def test_model_config_rejects_shared_fusion_dropout(tmp_path: Path) -> None:
@@ -221,6 +234,30 @@ def test_invalid_feature_and_padded_asset_values_cannot_change_fused_tokens() ->
     original_tokens = model._tokenize_and_fuse(model._validate_batch(batch))
     changed_tokens = model._tokenize_and_fuse(model._validate_batch(changed))
     assert torch.equal(original_tokens, changed_tokens)
+
+
+def test_patch_tokenizer_uses_ordered_attention_and_ignores_invalid_days() -> None:
+    model = _model()
+    model.eval()
+    values = torch.tensor([[[1.0, 2.0], [3.0, 4.0]]])
+    feature_mask = torch.ones_like(values, dtype=torch.bool)
+    day_mask = torch.ones(1, 2, dtype=torch.bool)
+
+    original = model.market_tokenizer(values, feature_mask, day_mask)
+    reversed_days = model.market_tokenizer(
+        values.flip(1),
+        feature_mask.flip(1),
+        day_mask.flip(1),
+    )
+    assert not torch.allclose(original, reversed_days)
+
+    day_mask[:, 0] = False
+    changed_invalid_day = values.clone()
+    changed_invalid_day[:, 0] = 1_000_000.0
+    assert torch.equal(
+        model.market_tokenizer(values, feature_mask, day_mask),
+        model.market_tokenizer(changed_invalid_day, feature_mask, day_mask),
+    )
 
 
 def test_target_representation_uses_full_context_sequence() -> None:

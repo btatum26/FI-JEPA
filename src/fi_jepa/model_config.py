@@ -22,6 +22,10 @@ class FIJepaModelConfig:
 
     patch_len: int = 21
     num_patches: int = 12
+    tokenizer_type: str = "mean"
+    tokenizer_layers: int = 2
+    tokenizer_heads: int = 4
+    tokenizer_mlp_ratio: int = 4
     asset_hidden_dim: int = 64
     asset_token_dim: int = 128
     market_hidden_dim: int = 32
@@ -44,6 +48,9 @@ class FIJepaModelConfig:
         integer_fields = {
             "patch_len": self.patch_len,
             "num_patches": self.num_patches,
+            "tokenizer_layers": self.tokenizer_layers,
+            "tokenizer_heads": self.tokenizer_heads,
+            "tokenizer_mlp_ratio": self.tokenizer_mlp_ratio,
             "asset_hidden_dim": self.asset_hidden_dim,
             "asset_token_dim": self.asset_token_dim,
             "market_hidden_dim": self.market_hidden_dim,
@@ -62,10 +69,27 @@ class FIJepaModelConfig:
         invalid = [name for name, value in integer_fields.items() if value <= 0]
         if invalid:
             raise ValueError(f"Model dimensions and counts must be positive: {invalid}")
+        if self.tokenizer_type not in {"mean", "attention"}:
+            raise ValueError("tokenizer_type must be 'mean' or 'attention'.")
         if self.d_model % self.context_heads:
             raise ValueError("d_model must be divisible by context_heads.")
         if self.d_model % self.predictor_heads:
             raise ValueError("d_model must be divisible by predictor_heads.")
+        if self.tokenizer_type == "attention":
+            incompatible_tokenizers = [
+                name
+                for name, hidden_dim in (
+                    ("asset_hidden_dim", self.asset_hidden_dim),
+                    ("market_hidden_dim", self.market_hidden_dim),
+                    ("macro_hidden_dim", self.macro_hidden_dim),
+                )
+                if hidden_dim % self.tokenizer_heads
+            ]
+            if incompatible_tokenizers:
+                raise ValueError(
+                    "Tokenizer hidden dimensions must be divisible by tokenizer_heads: "
+                    f"{incompatible_tokenizers}"
+                )
         if not 0.0 <= self.context_dropout < 1.0:
             raise ValueError("context_dropout must be in [0, 1).")
         if not 0.0 <= self.predictor_dropout < 1.0:
@@ -95,6 +119,10 @@ class FIJepaModelConfig:
             raise ValueError(f"Model configuration is missing sections: {missing}")
 
         tokenizers = values["tokenizers"]
+        tokenizer_type = str(tokenizers.get("type", "mean"))
+        tokenizer_attention = tokenizers.get("attention") or {}
+        if tokenizer_type == "attention" and not tokenizer_attention:
+            raise ValueError("Attention tokenizer configuration is missing tokenizers.attention.")
         fusion_dropout = float(values["fusion"].get("dropout", 0.0))
         if fusion_dropout != 0.0:
             raise ValueError(
@@ -103,6 +131,10 @@ class FIJepaModelConfig:
         return cls(
             patch_len=int(values["input"]["patch_len"]),
             num_patches=int(values["input"]["num_patches"]),
+            tokenizer_type=tokenizer_type,
+            tokenizer_layers=int(tokenizer_attention.get("layers", 2)),
+            tokenizer_heads=int(tokenizer_attention.get("heads", 4)),
+            tokenizer_mlp_ratio=int(tokenizer_attention.get("mlp_ratio", 4)),
             asset_hidden_dim=int(tokenizers["asset"]["hidden_dim"]),
             asset_token_dim=int(tokenizers["asset"]["output_dim"]),
             market_hidden_dim=int(tokenizers["market"]["hidden_dim"]),

@@ -30,29 +30,12 @@ assets:
 
 features:
   asset:
-    - feature_family: returns
-      series_source: stooq_derived
-      names: [return_1d, return_5d, return_21d, return_63d, return_126d]
-    - feature_family: volatility
-      series_source: stooq_derived
-      names: [realized_vol_5d, realized_vol_21d, realized_vol_63d, realized_vol_126d]
-    - feature_family: drawdown
-      series_source: stooq_derived
-      names: [drawdown_5d, drawdown_21d, drawdown_63d, drawdown_126d]
-    - feature_family: trend
-      series_source: stooq_derived
-      names:
-        - ma_distance_5d
-        - ma_distance_21d
-        - ma_distance_63d
-        - ma_distance_126d
-        - path_efficiency_5d
-        - path_efficiency_21d
-        - path_efficiency_63d
-        - path_efficiency_126d
-    - feature_family: liquidity
-      series_source: stooq_derived
-      names: [dollar_volume]
+    - feature_family: price
+      series_source: stooq
+      names: [open, high, low, close]
+    - feature_family: volume
+      series_source: stooq
+      names: [volume]
 
   market:
     - feature_family: dispersion
@@ -105,7 +88,8 @@ normalization:
   method: train_fold_robust_zscore
   winsorize_quantiles: [0.005, 0.995]
   transforms:
-    log1p: [dollar_volume, "realized_vol_*", vix_level]
+    log: [open, high, low, close]
+    log1p: [volume, vix_level]
 
 # Recorded in the immutable artifact for policy review. Runtime patch thresholds
 # live in configs/dataloader.yaml. Holdout target permission is split-relative.

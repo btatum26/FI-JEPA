@@ -59,14 +59,24 @@ def _write_training_artifact(root: Path) -> FIJepaDataConfig:
 
     features = pd.DataFrame(
         [
-            {"feature_name": "asset_a", "feature_index": 0, "input_group": "asset", "dtype": "float32"},
+            {
+                "feature_name": "asset_a",
+                "feature_index": 0,
+                "input_group": "asset",
+                "dtype": "float32",
+            },
             {
                 "feature_name": "market_a",
                 "feature_index": 0,
                 "input_group": "market",
                 "dtype": "float32",
             },
-            {"feature_name": "macro_a", "feature_index": 0, "input_group": "macro", "dtype": "float32"},
+            {
+                "feature_name": "macro_a",
+                "feature_index": 0,
+                "input_group": "macro",
+                "dtype": "float32",
+            },
         ]
     )
     features.to_parquet(root / "feature_manifest.parquet", index=False)
@@ -131,6 +141,10 @@ def _small_model_config() -> FIJepaModelConfig:
     return FIJepaModelConfig(
         patch_len=2,
         num_patches=2,
+        tokenizer_type="attention",
+        tokenizer_layers=1,
+        tokenizer_heads=1,
+        tokenizer_mlp_ratio=2,
         asset_hidden_dim=4,
         asset_token_dim=4,
         market_hidden_dim=4,
@@ -158,6 +172,8 @@ def _write_run_configs(root: Path) -> FIJepaTrainingConfig:
             {
                 "input": {"patch_len": 2, "num_patches": 2},
                 "tokenizers": {
+                    "type": "attention",
+                    "attention": {"layers": 1, "heads": 1, "mlp_ratio": 2},
                     "asset": {"hidden_dim": 4, "output_dim": 4},
                     "market": {"hidden_dim": 4, "output_dim": 2},
                     "macro": {"hidden_dim": 4, "output_dim": 2},
@@ -223,8 +239,12 @@ def test_adamw_excludes_frozen_target_encoder() -> None:
     optimizer = build_adamw(model, FIJepaTrainingConfig(epochs=2, warmup_epochs=0))
     optimized = {id(parameter) for group in optimizer.param_groups for parameter in group["params"]}
 
-    assert not optimized.intersection(id(parameter) for parameter in model.target_encoder.parameters())
-    assert optimized == {id(parameter) for parameter in model.parameters() if parameter.requires_grad}
+    assert not optimized.intersection(
+        id(parameter) for parameter in model.target_encoder.parameters()
+    )
+    assert optimized == {
+        id(parameter) for parameter in model.parameters() if parameter.requires_grad
+    }
 
 
 # ============================================================================
@@ -245,7 +265,9 @@ def test_validation_is_deterministic(tmp_path: Path) -> None:
     assert first == second
 
 
-def test_smoke_training_and_basic_epoch_resume(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+def test_smoke_training_and_basic_epoch_resume(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     config = _write_run_configs(tmp_path)
     run_dir = train_fi_jepa(config)
     checkpoints = run_dir / "checkpoints"
@@ -265,9 +287,15 @@ def test_smoke_training_and_basic_epoch_resume(tmp_path: Path, capsys: pytest.Ca
         run_dir / "representation_diagnostics" / "step_000000006" / "embeddings.parquet"
     )
     embeddings = pd.read_parquet(embedding_path)
-    assert {"date", "z_1", "z_2", "split", "checkpoint_id", "model_version", "dataset_version"} <= set(
-        embeddings.columns
-    )
+    assert {
+        "date",
+        "z_1",
+        "z_2",
+        "split",
+        "checkpoint_id",
+        "model_version",
+        "dataset_version",
+    } <= set(embeddings.columns)
     assert not any(name.startswith("future_") for name in embeddings.columns)
     assert latest["kind"] == "epoch_end"
     assert latest["resume_epoch"] == 2
