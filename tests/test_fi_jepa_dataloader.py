@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import replace
 from pathlib import Path
+import pickle
 
 import numpy as np
 import pandas as pd
@@ -206,6 +207,16 @@ def _assert_batches_equal(first: dict[str, object], second: dict[str, object]) -
             assert first[name] == second[name], name
 
 
+def _assert_loader_batches_equal(
+    first: list[dict[str, object]],
+    second: list[dict[str, object]],
+) -> None:
+    """Require exact parity across two complete loader iterations."""
+    assert len(first) == len(second)
+    for first_batch, second_batch in zip(first, second, strict=True):
+        _assert_batches_equal(first_batch, second_batch)
+
+
 def test_store_reconstructs_sparse_masks_and_blocks_protected_train_facts(
     tmp_path: Path,
 ) -> None:
@@ -227,6 +238,88 @@ def test_store_reconstructs_sparse_masks_and_blocks_protected_train_facts(
     assert not protected["valid_date_mask"][:-1].any()
     assert not protected["asset_feature_mask"][:-1].any()
     assert np.count_nonzero(protected["asset_x"][:-1]) == 0
+
+
+def test_store_builds_and_reuses_read_only_memmap_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _write_model_artifact(tmp_path / "artifact")
+    store = FrozenPanelStore(config.artifact_path)
+
+    assert store.cache_path.parent == (tmp_path / ".frozen_panel_store_cache").resolve()
+    assert store.cache_path.parent != store.artifact_path.resolve()
+    assert (store.cache_path / "cache_manifest.json").is_file()
+    for name in (
+        "asset_x",
+        "asset_feature_mask",
+        "valid_asset",
+        "market_x",
+        "market_feature_mask",
+        "valid_market_date",
+        "macro_x",
+        "macro_feature_mask",
+        "valid_macro_date",
+    ):
+        array = getattr(store, name)
+        assert isinstance(array, np.memmap)
+        assert not array.flags.writeable
+
+    def fail_reload(*args: object, **kwargs: object) -> None:
+        raise AssertionError("A valid dense cache must not reload sparse facts.")
+
+    monkeypatch.setattr(FrozenPanelStore, "_load_asset_facts", fail_reload)
+    monkeypatch.setattr(FrozenPanelStore, "_load_date_facts", fail_reload)
+    reused = FrozenPanelStore(config.artifact_path)
+    assert reused.cache_path == store.cache_path
+    assert np.array_equal(reused.asset_x, store.asset_x)
+
+
+def test_store_rejects_cache_root_inside_immutable_artifact(tmp_path: Path) -> None:
+    config = _write_model_artifact(tmp_path / "artifact")
+
+    with pytest.raises(ValueError, match="outside the immutable artifact"):
+        FrozenPanelStore(config.artifact_path, cache_root=config.artifact_path / "cache")
+
+
+def test_store_cache_identity_changes_and_incomplete_cache_rebuilds(tmp_path: Path) -> None:
+    config = _write_model_artifact(tmp_path / "artifact")
+    original = FrozenPanelStore(config.artifact_path)
+    original_cache_path = original.cache_path
+    original._close_cache_arrays()
+    (original_cache_path / "asset_x.npy").unlink()
+
+    rebuilt = FrozenPanelStore(config.artifact_path)
+    assert rebuilt.cache_path == original_cache_path
+    assert isinstance(rebuilt.asset_x, np.memmap)
+    assert not rebuilt.asset_x.flags.writeable
+
+    rebuilt._close_cache_arrays()
+    (original_cache_path / "cache_manifest.json").write_text("{}", encoding="utf-8")
+    repaired = FrozenPanelStore(config.artifact_path)
+    assert repaired.cache_path == original_cache_path
+    assert isinstance(repaired.asset_x, np.memmap)
+
+    quality_path = config.artifact_path / "quality_report.json"
+    quality_path.write_text(json.dumps({"stores_windows": False, "revision": 2}))
+    changed = FrozenPanelStore(config.artifact_path)
+    assert changed.cache_path != original_cache_path
+
+
+def test_store_pickle_reopens_read_only_maps_without_serializing_arrays(tmp_path: Path) -> None:
+    config = _write_model_artifact(tmp_path / "artifact")
+    store = FrozenPanelStore(config.artifact_path)
+
+    state = store.__getstate__()
+    assert "asset_x" not in state
+    assert "macro_feature_mask" not in state
+
+    restored = pickle.loads(pickle.dumps(store))
+    assert restored.cache_path == store.cache_path
+    assert isinstance(restored.asset_x, np.memmap)
+    assert not restored.asset_x.flags.writeable
+    assert np.array_equal(restored.asset_x, store.asset_x)
+    assert not restored.train_permission.flags.writeable
 
 
 def test_dataset_filters_invalid_samples_and_returns_lightweight_requests(
@@ -403,6 +496,34 @@ def test_batched_gather_matches_per_sample_assembly(
         store, replace(config, assembly_mode="per_sample")
     )(requests)
     _assert_batches_equal(batched, per_sample)
+
+
+@pytest.mark.parametrize("assembly_mode", ["batched_gather", "per_sample"])
+def test_worker_loader_matches_serial_and_reopens_across_iterators(
+    tmp_path: Path,
+    assembly_mode: str,
+) -> None:
+    config = replace(
+        _write_model_artifact(tmp_path / assembly_mode),
+        assembly_mode=assembly_mode,
+    )
+    store = FrozenPanelStore(config.artifact_path)
+    serial = build_fi_jepa_dataloader(
+        replace(config, num_workers=0),
+        "validation",
+        store=store,
+        shuffle=False,
+    )
+    worker = build_fi_jepa_dataloader(
+        replace(config, num_workers=2),
+        "validation",
+        store=store,
+        shuffle=False,
+    )
+
+    expected = list(serial)
+    _assert_loader_batches_equal(expected, list(worker))
+    _assert_loader_batches_equal(expected, list(worker))
 
 
 def test_fixed_k_asset_hash_selection_ignores_candidate_order() -> None:

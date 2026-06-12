@@ -3,7 +3,7 @@ artifact_path: data/model_ready/fi_jepa_sparse_v1/OCHLV_ONLY
 lookback_days: 250
 patch_len: 5
 
-train_k_assets: 256
+train_k_assets: 128
 diagnostic_k_assets: 256
 
 mask_ratio: 0.35
@@ -15,7 +15,7 @@ min_valid_asset_fraction: 0.25
 
 batch_size: 32
 validation_batch_size: 16
-num_workers: 0
+num_workers: 4
 pin_memory: false
 drop_last: false
 

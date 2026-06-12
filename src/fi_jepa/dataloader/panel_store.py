@@ -1,8 +1,11 @@
 from __future__ import annotations
 
-from pathlib import Path
+import hashlib
 import json
+from pathlib import Path
 import re
+import shutil
+import tempfile
 from typing import Literal
 
 import numpy as np
@@ -28,6 +31,26 @@ REQUIRED_ARTIFACT_FILES = {
     "validation_macro_features.parquet",
 }
 FORBIDDEN_FEATURE_PATTERN = re.compile(r"future_|target|label", re.IGNORECASE)
+CACHE_FORMAT_VERSION = 1
+CACHE_MANIFEST_NAME = "cache_manifest.json"
+CACHE_ARRAY_NAMES = (
+    "asset_x",
+    "asset_feature_mask",
+    "valid_asset",
+    "market_x",
+    "market_feature_mask",
+    "valid_market_date",
+    "macro_x",
+    "macro_feature_mask",
+    "valid_macro_date",
+)
+METADATA_ARRAY_NAMES = (
+    "train_permission",
+    "validation_permission",
+    "protected_holdout",
+    "sample_eligible",
+    "validation_sample",
+)
 
 
 # ============================================================================
@@ -36,16 +59,22 @@ FORBIDDEN_FEATURE_PATTERN = re.compile(r"future_|target|label", re.IGNORECASE)
 
 
 class FrozenPanelStore:
-    """Load one immutable sparse model artifact into a shared dense NumPy store.
+    """Load one immutable sparse artifact through a worker-safe dense cache.
 
-    Sparse train and validation fact files are streamed once into shared dense
-    arrays indexed by the artifact's contiguous date and asset IDs. Every
-    window slice reapplies the requested split's date permissions, so retaining
-    both fact sets in memory cannot expose protected validation facts to
-    training samples.
+    Sparse facts are streamed once into persistent ``.npy`` memmaps indexed by
+    the artifact's contiguous date and asset IDs. The completed cache is opened
+    read-only in the parent and reopened after worker-process deserialization,
+    avoiding dense-array copies under spawn. Every window slice reapplies the
+    requested split's date permissions, so retaining both fact sets in one
+    cache cannot expose protected validation facts to training samples.
     """
 
-    def __init__(self, artifact_path: Path | str):
+    def __init__(
+        self,
+        artifact_path: Path | str,
+        *,
+        cache_root: Path | str | None = None,
+    ):
         self.artifact_path = Path(artifact_path)
         self._validate_required_files()
         self.manifest = json.loads(
@@ -79,23 +108,47 @@ class FrozenPanelStore:
         }
         self.date_count = len(self.dates)
         self.asset_count = len(self.assets)
-        self._allocate_arrays()
-
-        # Train and validation facts are date-disjoint, so both can occupy one
-        # dense cache without overwriting one another.
-        for split in ("train", "validation"):
-            self._load_asset_facts(split)
-            self._load_date_facts(split, "market")
-            self._load_date_facts(split, "macro")
 
         # Permissions are reapplied when slicing windows. Holding both fact
-        # sets in memory therefore does not grant cross-split visibility.
+        # sets in one cache therefore does not grant cross-split visibility.
         self.train_permission = self.dates["train_fact_allowed"].to_numpy(dtype=bool)
         self.validation_permission = self.dates["validation_fact_allowed"].to_numpy(dtype=bool)
         self.protected_holdout = self.dates["protected_holdout"].to_numpy(dtype=bool)
         self.sample_eligible = self.dates["sample_eligible"].to_numpy(dtype=bool)
         self.validation_sample = self.dates["validation_sample"].to_numpy(dtype=bool)
         self.date_values = self.dates["date"].tolist()
+        self._mark_metadata_arrays_read_only()
+
+        default_cache_root = self.artifact_path.parent / ".frozen_panel_store_cache"
+        self.cache_root = Path(cache_root or default_cache_root).resolve()
+        if self.cache_root.is_relative_to(self.artifact_path.resolve()):
+            raise ValueError("cache_root must be outside the immutable artifact directory.")
+        self.cache_root.mkdir(parents=True, exist_ok=True)
+        self._cache_key = self._build_cache_key()
+        self.cache_path = (
+            self.cache_root / f"{self.artifact_path.name}_{self._cache_key[:20]}"
+        ).resolve()
+        self._ensure_cache()
+        self._open_cache_arrays()
+
+    def __getstate__(self) -> dict[str, object]:
+        """Serialize store metadata without copying any dense mapped arrays."""
+        state = self.__dict__.copy()
+        for name in CACHE_ARRAY_NAMES:
+            state.pop(name, None)
+        return state
+
+    def __setstate__(self, state: dict[str, object]) -> None:
+        """Restore metadata and reopen the completed cache read-only."""
+        self.__dict__.update(state)
+        self._mark_metadata_arrays_read_only()
+        self._open_cache_arrays()
+
+    def _mark_metadata_arrays_read_only(self) -> None:
+        """Prevent mutation of the small split-permission arrays held in memory."""
+        for name in METADATA_ARRAY_NAMES:
+            array = getattr(self, name)
+            array.setflags(write=False)
 
     def _validate_required_files(self) -> None:
         """Require the complete frozen-artifact contract before loading data."""
@@ -156,37 +209,198 @@ class FrozenPanelStore:
             if indices != list(range(len(indices))):
                 raise ValueError(f"{group} feature indices must be contiguous from zero.")
 
-    def _allocate_arrays(self) -> None:
-        """Allocate zero-filled dense values, validity masks, and row trackers.
+    def _cache_array_specs(self) -> dict[str, dict[str, object]]:
+        """Return the authoritative shape and dtype contract for cached arrays."""
+        asset_dim = len(self.feature_names["asset"])
+        market_dim = len(self.feature_names["market"])
+        macro_dim = len(self.feature_names["macro"])
+        return {
+            "asset_x": {
+                "shape": [self.date_count, self.asset_count, asset_dim],
+                "dtype": "float32",
+            },
+            "asset_feature_mask": {
+                "shape": [self.date_count, self.asset_count, asset_dim],
+                "dtype": "bool",
+            },
+            "valid_asset": {
+                "shape": [self.date_count, self.asset_count],
+                "dtype": "bool",
+            },
+            "market_x": {
+                "shape": [self.date_count, market_dim],
+                "dtype": "float32",
+            },
+            "market_feature_mask": {
+                "shape": [self.date_count, market_dim],
+                "dtype": "bool",
+            },
+            "valid_market_date": {"shape": [self.date_count], "dtype": "bool"},
+            "macro_x": {
+                "shape": [self.date_count, macro_dim],
+                "dtype": "float32",
+            },
+            "macro_feature_mask": {
+                "shape": [self.date_count, macro_dim],
+                "dtype": "bool",
+            },
+            "valid_macro_date": {"shape": [self.date_count], "dtype": "bool"},
+        }
+
+    def _build_cache_key(self) -> str:
+        """Hash the cache format, artifact identity, manifest, and file metadata."""
+        files = {}
+        for name in sorted(REQUIRED_ARTIFACT_FILES):
+            stat = (self.artifact_path / name).stat()
+            files[name] = {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+        identity = {
+            "cache_format_version": CACHE_FORMAT_VERSION,
+            "artifact_path": str(self.artifact_path.resolve()),
+            "artifact_manifest": self.manifest,
+            "required_files": files,
+        }
+        encoded = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def _validate_cache(self, cache_path: Path) -> bool:
+        """Return whether one published cache exactly matches the expected contract."""
+        try:
+            cache_manifest = json.loads(
+                (cache_path / CACHE_MANIFEST_NAME).read_text(encoding="utf-8")
+            )
+            if cache_manifest != {
+                "cache_format_version": CACHE_FORMAT_VERSION,
+                "cache_key": self._cache_key,
+                "arrays": self._cache_array_specs(),
+            }:
+                return False
+            for name, spec in self._cache_array_specs().items():
+                array = np.load(cache_path / f"{name}.npy", mmap_mode="r", allow_pickle=False)
+                try:
+                    if list(array.shape) != spec["shape"]:
+                        return False
+                    if array.dtype != np.dtype(str(spec["dtype"])):
+                        return False
+                finally:
+                    self._close_memmap(array)
+        except (
+            AttributeError,
+            EOFError,
+            FileNotFoundError,
+            KeyError,
+            OSError,
+            TypeError,
+            ValueError,
+            json.JSONDecodeError,
+        ):
+            return False
+        return True
+
+    def _ensure_cache(self) -> None:
+        """Build and atomically publish the dense cache when no valid cache exists."""
+        if self._validate_cache(self.cache_path):
+            return
+        if self.cache_path.exists():
+            if self.cache_path.is_dir():
+                shutil.rmtree(self.cache_path)
+            else:
+                self.cache_path.unlink()
+
+        temporary_path = Path(
+            tempfile.mkdtemp(prefix=f".{self.cache_path.name}.tmp-", dir=self.cache_root)
+        )
+        try:
+            self._build_cache(temporary_path)
+            try:
+                temporary_path.rename(self.cache_path)
+            except OSError:
+                # Another process may have published the same immutable cache
+                # while this process was building its private temporary copy.
+                if not self._validate_cache(self.cache_path):
+                    raise
+        finally:
+            if temporary_path.exists():
+                shutil.rmtree(temporary_path)
+
+        if not self._validate_cache(self.cache_path):
+            raise RuntimeError(f"Failed to publish a valid FrozenPanelStore cache: {self.cache_path}")
+
+    def _build_cache(self, cache_path: Path) -> None:
+        """Stream validated sparse facts into writable maps, then mark completion."""
+        self._allocate_cache_arrays(cache_path)
+        try:
+            # Train and validation facts are date-disjoint, so both can occupy
+            # one dense cache without overwriting one another.
+            for split in ("train", "validation"):
+                self._load_asset_facts(split)
+                self._load_date_facts(split, "market")
+                self._load_date_facts(split, "macro")
+            self._flush_cache_arrays()
+        finally:
+            self._close_cache_arrays()
+
+        cache_manifest = {
+            "cache_format_version": CACHE_FORMAT_VERSION,
+            "cache_key": self._cache_key,
+            "arrays": self._cache_array_specs(),
+        }
+        (cache_path / CACHE_MANIFEST_NAME).write_text(
+            json.dumps(cache_manifest, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+
+    def _allocate_cache_arrays(self, cache_path: Path) -> None:
+        """Allocate zero-filled writable memmaps and in-memory overlap trackers.
 
         Asset arrays use ``[date, asset, feature]``. Market and macro arrays use
         ``[date, feature]``. Zeros are storage fill values only; paired boolean
         masks preserve all missingness semantics.
         """
-        asset_dim = len(self.feature_manifest.loc[self.feature_manifest["input_group"].eq("asset")])
-        market_dim = len(
-            self.feature_manifest.loc[self.feature_manifest["input_group"].eq("market")]
-        )
-        macro_dim = len(self.feature_manifest.loc[self.feature_manifest["input_group"].eq("macro")])
-
-        # [D, A, F_asset].
-        self.asset_x = np.zeros((self.date_count, self.asset_count, asset_dim), dtype=np.float32)
-        self.asset_feature_mask = np.zeros_like(self.asset_x, dtype=bool)
-        self.valid_asset = np.zeros((self.date_count, self.asset_count), dtype=bool)
-
-        # [D, F_market].
-        self.market_x = np.zeros((self.date_count, market_dim), dtype=np.float32)
-        self.market_feature_mask = np.zeros_like(self.market_x, dtype=bool)
-        self.valid_market_date = np.zeros(self.date_count, dtype=bool)
-
-        # [D, F_macro].
-        self.macro_x = np.zeros((self.date_count, macro_dim), dtype=np.float32)
-        self.macro_feature_mask = np.zeros_like(self.macro_x, dtype=bool)
-        self.valid_macro_date = np.zeros(self.date_count, dtype=bool)
+        for name, spec in self._cache_array_specs().items():
+            array = np.lib.format.open_memmap(
+                cache_path / f"{name}.npy",
+                mode="w+",
+                dtype=np.dtype(str(spec["dtype"])),
+                shape=tuple(spec["shape"]),
+            )
+            array[...] = 0
+            setattr(self, name, array)
 
         # Separate row-presence masks detect split overlap even when valid_date is false.
         self._market_row_present = np.zeros(self.date_count, dtype=bool)
         self._macro_row_present = np.zeros(self.date_count, dtype=bool)
+
+    def _flush_cache_arrays(self) -> None:
+        """Flush every writable map before the cache directory is published."""
+        for name in CACHE_ARRAY_NAMES:
+            array = getattr(self, name)
+            if isinstance(array, np.memmap):
+                array.flush()
+
+    @staticmethod
+    def _close_memmap(array: np.ndarray) -> None:
+        """Close one NumPy memmap's underlying file mapping when present."""
+        mapping = getattr(array, "_mmap", None)
+        if mapping is not None:
+            mapping.close()
+
+    def _close_cache_arrays(self) -> None:
+        """Close and remove live mapped-array attributes."""
+        for name in CACHE_ARRAY_NAMES:
+            array = getattr(self, name, None)
+            if array is not None:
+                self._close_memmap(array)
+                delattr(self, name)
+        self.__dict__.pop("_market_row_present", None)
+        self.__dict__.pop("_macro_row_present", None)
+
+    def _open_cache_arrays(self) -> None:
+        """Open every completed dense array read-only in the current process."""
+        if not self._validate_cache(self.cache_path):
+            raise RuntimeError(f"FrozenPanelStore cache is invalid: {self.cache_path}")
+        for name in CACHE_ARRAY_NAMES:
+            array = np.load(self.cache_path / f"{name}.npy", mmap_mode="r", allow_pickle=False)
+            setattr(self, name, array)
 
     def _validate_fact_schema(self, path: Path, group: str) -> None:
         """Validate one sparse fact file against its feature-manifest group."""

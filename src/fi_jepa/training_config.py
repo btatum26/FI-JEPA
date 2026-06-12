@@ -35,7 +35,7 @@ class FIJepaTrainingConfig:
     warmup_epochs: int = 5
     grad_clip_norm: float = 1.0
     mixed_precision: bool = True
-    ema_momentum_start: float = 0.99
+    ema_momentum_start: float = 0.996
     ema_momentum_end: float = 0.999
     validation_every_epochs: int = 1
     representation_evaluation_enabled: bool = True

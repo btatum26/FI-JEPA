@@ -152,7 +152,12 @@ Zero-filled values are never considered valid observations.
 
 ## Runtime Dataloader
 
-`FrozenPanelStore` streams the sparse files into shared dense NumPy arrays.
+`FrozenPanelStore` streams the sparse files into persistent dense NumPy memmaps.
+The cache lives beside, not inside, the immutable artifact under
+`.frozen_panel_store_cache/`. Completed caches are keyed by the artifact
+manifest and required-file metadata, then reopened read-only by the parent and
+spawned dataloader workers. Dense arrays are excluded from worker pickle state,
+so Windows workers map the same cache files instead of receiving copied arrays.
 `FIJepaWindowDataset` and `FIJepaEmbeddingDataset` return lightweight
 `WindowRequest` values containing only endpoint, split, view, and deterministic
 seed metadata. `FIJepaBatchAssembler` then:
@@ -170,6 +175,8 @@ correctness reference while emitting the same model-facing batch contract.
 The default runtime also leaves `pin_memory` disabled because recursively
 pinning both retained daily tensors and their patched aliases costs more CPU
 time than it saves in this batch contract.
+`persistent_workers` remains disabled because the training dataset's epoch is
+updated in the parent process before each iterator is created.
 
 Target eligibility is split-relative:
 

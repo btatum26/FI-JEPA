@@ -3,7 +3,7 @@ input:
   num_patches: 50
 
 tokenizers:
-  type: attention
+  type: mean
   attention:
     layers: 2
     heads: 4
