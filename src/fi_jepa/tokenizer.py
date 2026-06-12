@@ -275,3 +275,125 @@ class MaskedAttentionPatchTokenizer(nn.Module):
         patch_tokens = self.output_norm(sequence[:, 0])  # [N, H].
         output = self.output_projection(patch_tokens)  # [N, D_token].
         return output.reshape(*leading_shape, self.output_dim)
+
+
+# ============================================================================
+# CROSS-ASSET POOLING
+# ============================================================================
+
+
+class MaskedAttentionPoolingBlock(nn.Module):
+    """Update one summary query by attending over a masked variable-size set."""
+
+    def __init__(self, token_dim: int, num_heads: int, mlp_ratio: int):
+        super().__init__()
+        self.query_norm = nn.LayerNorm(token_dim)
+        self.asset_norm = nn.LayerNorm(token_dim)
+        self.attention = nn.MultiheadAttention(
+            token_dim,
+            num_heads,
+            dropout=0.0,
+            batch_first=True,
+        )
+        self.mlp_norm = nn.LayerNorm(token_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(token_dim, token_dim * mlp_ratio),
+            nn.GELU(),
+            nn.Linear(token_dim * mlp_ratio, token_dim),
+        )
+
+    def forward(
+        self,
+        summary: torch.Tensor,
+        asset_tokens: torch.Tensor,
+        asset_padding_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply linear-complexity cross-attention from ``[N, 1, D]`` into assets."""
+        normalized_summary = self.query_norm(summary)
+        normalized_assets = self.asset_norm(asset_tokens)
+
+        # Including the summary as an always-valid key/value keeps empty asset
+        # sets numerically defined while valid assets remain mask-controlled.
+        key_values = torch.cat((normalized_summary, normalized_assets), dim=1)
+        summary_padding = torch.zeros(
+            (asset_padding_mask.shape[0], 1),
+            dtype=torch.bool,
+            device=asset_padding_mask.device,
+        )
+        key_padding_mask = torch.cat((summary_padding, asset_padding_mask), dim=1)
+        attended, _ = self.attention(
+            normalized_summary,
+            key_values,
+            key_values,
+            key_padding_mask=key_padding_mask,
+            need_weights=False,
+        )
+        summary = summary + attended
+        return summary + self.mlp(self.mlp_norm(summary))
+
+
+class MaskedAttentionAssetPooler(nn.Module):
+    """Pool a variable valid-asset set with permutation-invariant attention.
+
+    The pooler accepts arbitrary leading dimensions followed by ``[A, D]``.
+    A learned summary query applies masked cross-attention over asset tokens
+    with no asset positional embeddings, preserving invariance to asset
+    ordering while scaling linearly with asset count. Invalid asset slots
+    cannot contribute keys or values. No dropout is used because the pooled
+    panel token feeds both online and EMA target branches.
+    """
+
+    def __init__(self, token_dim: int, *, layers: int, heads: int, mlp_ratio: int):
+        super().__init__()
+        dimensions = {
+            "token_dim": token_dim,
+            "layers": layers,
+            "heads": heads,
+            "mlp_ratio": mlp_ratio,
+        }
+        invalid = [name for name, value in dimensions.items() if value <= 0]
+        if invalid:
+            raise ValueError(f"Asset pooler dimensions and counts must be positive: {invalid}")
+        if token_dim % heads:
+            raise ValueError("Asset pooler token_dim must be divisible by heads.")
+
+        self.token_dim = token_dim
+        self.summary_token = nn.Parameter(torch.empty(1, 1, token_dim))
+        self.blocks = nn.ModuleList(
+            [MaskedAttentionPoolingBlock(token_dim, heads, mlp_ratio) for _ in range(layers)]
+        )
+        self.output_norm = nn.LayerNorm(token_dim)
+        nn.init.normal_(self.summary_token, std=0.02)
+
+    def forward(self, asset_tokens: torch.Tensor, asset_mask: torch.Tensor) -> torch.Tensor:
+        """Pool valid assets into one panel token.
+
+        Shapes:
+            asset_tokens: ``[..., A, D]``.
+            asset_mask: ``[..., A]``.
+            return: ``[..., D]``.
+        """
+        if asset_tokens.shape[-1] != self.token_dim:
+            raise ValueError(
+                f"Asset tokens must end in token_dim={self.token_dim}; "
+                f"got shape {tuple(asset_tokens.shape)}."
+            )
+        if tuple(asset_mask.shape) != tuple(asset_tokens.shape[:-1]):
+            raise ValueError(
+                f"Asset mask must have shape {tuple(asset_tokens.shape[:-1])}; "
+                f"got {tuple(asset_mask.shape)}."
+            )
+        if asset_mask.dtype != torch.bool:
+            raise ValueError("Asset mask must have dtype bool.")
+
+        # [..., A, D] -> [N, A, D], one independent asset set per patch.
+        leading_shape = asset_tokens.shape[:-2]
+        asset_count = asset_tokens.shape[-2]
+        flat_tokens = asset_tokens.reshape(-1, asset_count, self.token_dim)
+        flat_mask = asset_mask.reshape(-1, asset_count)
+        summary = self.summary_token.expand(flat_tokens.shape[0], -1, -1)
+        for block in self.blocks:
+            summary = block(summary, flat_tokens, ~flat_mask)
+
+        pooled = self.output_norm(summary[:, 0])  # [N, D].
+        return pooled.reshape(*leading_shape, self.token_dim)

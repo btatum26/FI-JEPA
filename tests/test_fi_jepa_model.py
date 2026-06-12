@@ -12,7 +12,11 @@ from torch.nn import functional as F
 
 from fi_jepa.model import FIJepaModel
 from fi_jepa.model_config import FIJepaModelConfig
-from fi_jepa.tokenizer import MaskedAttentionPatchTokenizer, MaskedPatchTokenizer
+from fi_jepa.tokenizer import (
+    MaskedAttentionAssetPooler,
+    MaskedAttentionPatchTokenizer,
+    MaskedPatchTokenizer,
+)
 
 
 # ============================================================================
@@ -28,6 +32,10 @@ def _small_config() -> FIJepaModelConfig:
         tokenizer_layers=1,
         tokenizer_heads=1,
         tokenizer_mlp_ratio=2,
+        asset_pooling_type="attention",
+        asset_pooling_layers=1,
+        asset_pooling_heads=2,
+        asset_pooling_mlp_ratio=2,
         asset_hidden_dim=6,
         asset_token_dim=8,
         market_hidden_dim=4,
@@ -117,6 +125,7 @@ def test_model_config_loads_and_model_derives_feature_dimensions_from_store() ->
     assert model.asset_feature_dim == 5
     assert model.market_feature_dim == 5
     assert model.macro_feature_dim == 33
+    assert isinstance(model.asset_pooler, MaskedAttentionAssetPooler)
 
 
 def test_model_keeps_mean_tokenizer_available_beside_attention_tokenizer() -> None:
@@ -124,6 +133,13 @@ def test_model_keeps_mean_tokenizer_available_beside_attention_tokenizer() -> No
 
     assert isinstance(FIJepaModel(mean_config, 2, 2, 3).asset_tokenizer, MaskedPatchTokenizer)
     assert isinstance(_model().asset_tokenizer, MaskedAttentionPatchTokenizer)
+
+
+def test_model_keeps_mean_asset_pooling_available_beside_attention_pooling() -> None:
+    mean_config = replace(_small_config(), asset_pooling_type="mean")
+
+    assert FIJepaModel(mean_config, 2, 2, 3).asset_pooler is None
+    assert isinstance(_model().asset_pooler, MaskedAttentionAssetPooler)
 
 
 def test_model_config_rejects_shared_fusion_dropout(tmp_path: Path) -> None:
@@ -212,10 +228,14 @@ def test_shared_tokenizers_and_fusion_are_dropout_free_and_deterministic() -> No
         model.asset_tokenizer,
         model.market_tokenizer,
         model.macro_tokenizer,
+        model.asset_pooler,
         model.fusion,
     ]
     assert not any(
-        isinstance(module, nn.Dropout) for shared in shared_modules for module in shared.modules()
+        isinstance(module, nn.Dropout)
+        for shared in shared_modules
+        if shared is not None
+        for module in shared.modules()
     )
     first = model._tokenize_and_fuse(tensors)
     second = model._tokenize_and_fuse(tensors)
@@ -258,6 +278,27 @@ def test_patch_tokenizer_uses_ordered_attention_and_ignores_invalid_days() -> No
         model.market_tokenizer(values, feature_mask, day_mask),
         model.market_tokenizer(changed_invalid_day, feature_mask, day_mask),
     )
+
+
+def test_cross_asset_attention_is_permutation_invariant_and_ignores_invalid_assets() -> None:
+    model = _model()
+    model.eval()
+    assert model.asset_pooler is not None
+    asset_tokens = torch.randn(1, 2, 3, 8, generator=torch.Generator().manual_seed(29))
+    asset_mask = torch.tensor([[[True, True, False], [False, False, False]]])
+
+    original = model.asset_pooler(asset_tokens, asset_mask)
+    assert torch.isfinite(original).all()
+    permutation = torch.tensor([2, 0, 1])
+    permuted = model.asset_pooler(
+        asset_tokens[:, :, permutation],
+        asset_mask[:, :, permutation],
+    )
+    assert torch.allclose(original, permuted, atol=1e-6)
+
+    changed_invalid = asset_tokens.clone()
+    changed_invalid[~asset_mask] = 1_000_000.0
+    assert torch.equal(original, model.asset_pooler(changed_invalid, asset_mask))
 
 
 def test_target_representation_uses_full_context_sequence() -> None:

@@ -26,6 +26,10 @@ class FIJepaModelConfig:
     tokenizer_layers: int = 2
     tokenizer_heads: int = 4
     tokenizer_mlp_ratio: int = 4
+    asset_pooling_type: str = "mean"
+    asset_pooling_layers: int = 2
+    asset_pooling_heads: int = 4
+    asset_pooling_mlp_ratio: int = 4
     asset_hidden_dim: int = 64
     asset_token_dim: int = 128
     market_hidden_dim: int = 32
@@ -51,6 +55,9 @@ class FIJepaModelConfig:
             "tokenizer_layers": self.tokenizer_layers,
             "tokenizer_heads": self.tokenizer_heads,
             "tokenizer_mlp_ratio": self.tokenizer_mlp_ratio,
+            "asset_pooling_layers": self.asset_pooling_layers,
+            "asset_pooling_heads": self.asset_pooling_heads,
+            "asset_pooling_mlp_ratio": self.asset_pooling_mlp_ratio,
             "asset_hidden_dim": self.asset_hidden_dim,
             "asset_token_dim": self.asset_token_dim,
             "market_hidden_dim": self.market_hidden_dim,
@@ -71,6 +78,8 @@ class FIJepaModelConfig:
             raise ValueError(f"Model dimensions and counts must be positive: {invalid}")
         if self.tokenizer_type not in {"mean", "attention"}:
             raise ValueError("tokenizer_type must be 'mean' or 'attention'.")
+        if self.asset_pooling_type not in {"mean", "attention"}:
+            raise ValueError("asset_pooling_type must be 'mean' or 'attention'.")
         if self.d_model % self.context_heads:
             raise ValueError("d_model must be divisible by context_heads.")
         if self.d_model % self.predictor_heads:
@@ -90,6 +99,10 @@ class FIJepaModelConfig:
                     "Tokenizer hidden dimensions must be divisible by tokenizer_heads: "
                     f"{incompatible_tokenizers}"
                 )
+        if self.asset_pooling_type == "attention" and (
+            self.asset_token_dim % self.asset_pooling_heads
+        ):
+            raise ValueError("asset_token_dim must be divisible by asset_pooling_heads.")
         if not 0.0 <= self.context_dropout < 1.0:
             raise ValueError("context_dropout must be in [0, 1).")
         if not 0.0 <= self.predictor_dropout < 1.0:
@@ -123,6 +136,13 @@ class FIJepaModelConfig:
         tokenizer_attention = tokenizers.get("attention") or {}
         if tokenizer_type == "attention" and not tokenizer_attention:
             raise ValueError("Attention tokenizer configuration is missing tokenizers.attention.")
+        asset_pooling = values.get("asset_pooling") or {}
+        asset_pooling_type = str(asset_pooling.get("type", "mean"))
+        asset_pooling_attention = asset_pooling.get("attention") or {}
+        if asset_pooling_type == "attention" and not asset_pooling_attention:
+            raise ValueError(
+                "Attention asset pooling configuration is missing asset_pooling.attention."
+            )
         fusion_dropout = float(values["fusion"].get("dropout", 0.0))
         if fusion_dropout != 0.0:
             raise ValueError(
@@ -135,6 +155,10 @@ class FIJepaModelConfig:
             tokenizer_layers=int(tokenizer_attention.get("layers", 2)),
             tokenizer_heads=int(tokenizer_attention.get("heads", 4)),
             tokenizer_mlp_ratio=int(tokenizer_attention.get("mlp_ratio", 4)),
+            asset_pooling_type=asset_pooling_type,
+            asset_pooling_layers=int(asset_pooling_attention.get("layers", 2)),
+            asset_pooling_heads=int(asset_pooling_attention.get("heads", 4)),
+            asset_pooling_mlp_ratio=int(asset_pooling_attention.get("mlp_ratio", 4)),
             asset_hidden_dim=int(tokenizers["asset"]["hidden_dim"]),
             asset_token_dim=int(tokenizers["asset"]["output_dim"]),
             market_hidden_dim=int(tokenizers["market"]["hidden_dim"]),

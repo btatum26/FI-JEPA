@@ -18,6 +18,13 @@ tokenizers:
     hidden_dim: 64
     output_dim: 64
 
+asset_pooling:
+  type: attention
+  attention:
+    layers: 2
+    heads: 4
+    mlp_ratio: 4
+
 fusion:
   output_dim: 128
   dropout: 0.0
@@ -32,7 +39,7 @@ predictor:
   layers: 2
   heads: 4
   mlp_ratio: 4
-  dropout: 0.1
+  dropout: 0.2
 
 state_exporter:
   latent_dim: 8

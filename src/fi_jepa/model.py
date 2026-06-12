@@ -13,6 +13,7 @@ if TYPE_CHECKING:
 from fi_jepa.model_config import FIJepaModelConfig
 from fi_jepa.model_output import FIJepaOutput
 from fi_jepa.tokenizer import (
+    MaskedAttentionAssetPooler,
     MaskedAttentionPatchTokenizer,
     MaskedPatchTokenizer,
     masked_mean,
@@ -128,6 +129,16 @@ class FIJepaModel(nn.Module):
                 config.macro_token_dim,
                 **attention_kwargs,
             )
+        self.asset_pooler = (
+            MaskedAttentionAssetPooler(
+                config.asset_token_dim,
+                layers=config.asset_pooling_layers,
+                heads=config.asset_pooling_heads,
+                mlp_ratio=config.asset_pooling_mlp_ratio,
+            )
+            if config.asset_pooling_type == "attention"
+            else None
+        )
         fusion_input_dim = config.asset_token_dim + config.market_token_dim + config.macro_token_dim
         # [asset token | market token | macro token] -> shared D-dimensional token.
         self.fusion = nn.Sequential(
@@ -426,9 +437,14 @@ class FIJepaModel(nn.Module):
         asset_tokens = self.asset_tokenizer(
             asset_values, asset_features, asset_days
         )  # [B, P, A, D_asset].
-        panel_tokens = masked_mean(
-            asset_tokens, tensors["patch_asset_mask"], dimension=2
-        )  # [B, P, D_asset].
+        if self.asset_pooler is None:
+            panel_tokens = masked_mean(
+                asset_tokens, tensors["patch_asset_mask"], dimension=2
+            )  # [B, P, D_asset].
+        else:
+            panel_tokens = self.asset_pooler(
+                asset_tokens, tensors["patch_asset_mask"]
+            )  # [B, P, D_asset].
 
         market_features = tensors["market_feature_mask_patched"]
         market_days = tensors["valid_market_date_mask_patched"] & market_features.any(dim=-1)
