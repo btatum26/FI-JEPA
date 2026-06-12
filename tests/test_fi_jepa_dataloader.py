@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-from dataclasses import replace
 from pathlib import Path
 import pickle
 
@@ -12,128 +11,66 @@ import torch
 import yaml
 
 from fi_jepa.dataloader import (
-    FIJepaBatchAssembler,
+    DensePanelStore,
     FIJepaDataConfig,
-    FIJepaEmbeddingDataset,
-    FIJepaWindowDataset,
-    FrozenPanelStore,
-    WindowRequest,
-    build_fi_jepa_embedding_dataloader,
     build_fi_jepa_dataloader,
-    fixed_k_asset_ids,
+    build_fi_jepa_embedding_dataloader,
 )
+from fi_jepa.dataloader.panel_store import CACHE_FORMAT_VERSION
 
 
 # ============================================================================
-# SYNTHETIC MODEL ARTIFACT
+# SYNTHETIC SPARSE ARTIFACT
 # ============================================================================
 
 
-def _write_model_artifact(root: Path) -> FIJepaDataConfig:
+def _write_sparse_artifact(root: Path) -> FIJepaDataConfig:
+    """Write a complete sparse artifact with disjoint train/validation panels."""
     root.mkdir()
-    dates = pd.bdate_range("2020-01-01", periods=22)
-    validation_sample = np.zeros(22, dtype=bool)
-    validation_sample[16:19] = True
-    protected_input = np.zeros(22, dtype=bool)
-    protected_input[8:16] = True
-    protected_forward = np.zeros(22, dtype=bool)
-    protected_forward[19:21] = True
-    protected = validation_sample | protected_input | protected_forward
-    sample_eligible = np.zeros(22, dtype=bool)
-    sample_eligible[[7, 16, 17, 18, 21]] = True
+    dates = pd.bdate_range("2020-01-01", periods=16)
+    train_allowed = np.arange(16) < 8
+    validation_allowed = ~train_allowed
+    sample_eligible = np.zeros(16, dtype=bool)
+    sample_eligible[[3, 5, 7]] = True
+    validation_sample = np.zeros(16, dtype=bool)
+    validation_sample[[11, 13]] = True
     date_manifest = pd.DataFrame(
         {
-            "date_idx": np.arange(22, dtype=np.int32),
+            "date_idx": np.arange(16, dtype=np.int32),
             "date": dates.date,
             "sample_eligible": sample_eligible,
             "validation_sample": validation_sample,
-            "protected_input_lookback": protected_input,
-            "protected_forward_target": protected_forward,
-            "protected_holdout": protected,
-            "train_fact_allowed": ~protected,
-            "validation_fact_allowed": protected,
-            "validation_window_name": pd.Series([pd.NA] * 22, dtype="string"),
+            "protected_holdout": validation_allowed,
+            "train_fact_allowed": train_allowed,
+            "validation_fact_allowed": validation_allowed,
+            "validation_window_name": [""] * 11 + ["window_a"] * 3 + ["window_b"] * 2,
         }
     )
     date_manifest.to_parquet(root / "dates.parquet", index=False)
-
-    assets = pd.DataFrame(
+    pd.DataFrame(
         {
             "asset_id": np.arange(4, dtype=np.int32),
             "symbol": [f"ASSET_{index}" for index in range(4)],
-            "asset_type": ["stock"] * 4,
-            "first_available_date": [dates[0]] * 4,
-            "last_available_date": [dates[-1]] * 4,
-            "valid_train_observations": [9] * 4,
             "trainable": [True] * 4,
-            "exclusion_reason": pd.Series([pd.NA] * 4, dtype="string"),
         }
-    )
-    assets.to_parquet(root / "assets.parquet", index=False)
-
+    ).to_parquet(root / "assets.parquet", index=False)
     features = pd.DataFrame(
         [
-            {
-                "feature_name": "asset_a",
-                "feature_index": 0,
-                "input_group": "asset",
-                "feature_family": "returns",
-                "series_source": "synthetic",
-                "dtype": "float32",
-                "normalized": True,
-                "normalization_method": "synthetic",
-                "transform": "none",
-            },
-            {
-                "feature_name": "asset_b",
-                "feature_index": 1,
-                "input_group": "asset",
-                "feature_family": "returns",
-                "series_source": "synthetic",
-                "dtype": "float32",
-                "normalized": True,
-                "normalization_method": "synthetic",
-                "transform": "none",
-            },
-            {
-                "feature_name": "market_a",
-                "feature_index": 0,
-                "input_group": "market",
-                "feature_family": "market",
-                "series_source": "synthetic",
-                "dtype": "float32",
-                "normalized": True,
-                "normalization_method": "synthetic",
-                "transform": "none",
-            },
-            {
-                "feature_name": "macro_a",
-                "feature_index": 0,
-                "input_group": "macro",
-                "feature_family": "macro",
-                "series_source": "synthetic",
-                "dtype": "float32",
-                "normalized": True,
-                "normalization_method": "synthetic",
-                "transform": "none",
-            },
+            {"feature_name": "asset_a", "feature_index": 0, "input_group": "asset", "dtype": "float32"},
+            {"feature_name": "asset_b", "feature_index": 1, "input_group": "asset", "dtype": "float32"},
+            {"feature_name": "market_a", "feature_index": 0, "input_group": "market", "dtype": "float32"},
+            {"feature_name": "macro_a", "feature_index": 0, "input_group": "macro", "dtype": "float32"},
         ]
     )
     features.to_parquet(root / "feature_manifest.parquet", index=False)
-    pd.DataFrame({"feature_name": features["feature_name"]}).to_parquet(
-        root / "normalization.parquet", index=False
-    )
 
-    for split, allowed in (
-        ("train", date_manifest["train_fact_allowed"].to_numpy()),
-        ("validation", date_manifest["validation_fact_allowed"].to_numpy()),
-    ):
+    for split, allowed in (("train", train_allowed), ("validation", validation_allowed)):
         asset_rows = []
         for date_idx in np.flatnonzero(allowed):
             for asset_id in range(4):
-                if date_idx == 16 and asset_id == 3:
+                if split == "validation" and date_idx == 11 and asset_id == 3:
                     continue
-                second_valid = not (date_idx == 7 and asset_id == 1)
+                second_valid = not (split == "train" and date_idx == 7 and asset_id == 1)
                 asset_rows.append(
                     {
                         "date": dates[date_idx].date(),
@@ -146,468 +83,290 @@ def _write_model_artifact(root: Path) -> FIJepaDataConfig:
                         "asset_b__valid": second_valid,
                     }
                 )
-        pd.DataFrame(asset_rows).to_parquet(root / f"{split}_asset_features.parquet", index=False)
-
+        pd.DataFrame(asset_rows).to_parquet(
+            root / f"{split}_asset_features.parquet", index=False
+        )
         date_ids = np.flatnonzero(allowed)
-        pd.DataFrame(
-            {
-                "date": dates[date_ids].date,
-                "date_idx": date_ids,
-                "valid_date": True,
-                "market_a": date_ids.astype(np.float32),
-                "market_a__valid": True,
-            }
-        ).to_parquet(root / f"{split}_market_features.parquet", index=False)
-        pd.DataFrame(
-            {
-                "date": dates[date_ids].date,
-                "date_idx": date_ids,
-                "valid_date": True,
-                "macro_a": date_ids.astype(np.float32),
-                "macro_a__valid": True,
-            }
-        ).to_parquet(root / f"{split}_macro_features.parquet", index=False)
+        for group in ("market", "macro"):
+            feature = f"{group}_a"
+            pd.DataFrame(
+                {
+                    "date": dates[date_ids].date,
+                    "date_idx": date_ids,
+                    "valid_date": True,
+                    feature: date_ids.astype(np.float32),
+                    f"{feature}__valid": True,
+                }
+            ).to_parquet(root / f"{split}_{group}_features.parquet", index=False)
 
-    (root / "manifest.json").write_text(json.dumps({"sparse_asset_facts": True}))
-    (root / "quality_report.json").write_text(json.dumps({"stores_windows": False}))
-    (root / "config_resolved.yaml").write_text(yaml.safe_dump({"synthetic": True}))
+    (root / "manifest.json").write_text(
+        json.dumps({"build_id": "synthetic-build", "source_database": "synthetic.duckdb"}),
+        encoding="utf-8",
+    )
+    (root / "config_resolved.yaml").write_text(
+        yaml.safe_dump({"dates": {"lookback_days": 4}}), encoding="utf-8"
+    )
     return FIJepaDataConfig(
         artifact_path=root,
-        lookback_days=8,
+        cache_root=root.parent / "cache",
+        lookback_days=4,
         patch_len=2,
         train_k_assets=2,
-        diagnostic_k_assets=2,
+        fixed_k_assets=2,
         mask_ratio=0.5,
-        min_masked_patches=3,
-        max_masked_patches=3,
+        min_masked_patches=1,
+        max_masked_patches=1,
         min_valid_days_per_asset_patch=1,
-        min_valid_dates_in_patch=2,
+        min_valid_dates_in_patch=1,
         min_valid_asset_fraction=0.25,
-        batch_size=1,
+        batch_size=2,
         validation_batch_size=2,
         seed=17,
     )
 
 
-# ============================================================================
-# STORE AND DATASET CONTRACT
-# ============================================================================
-
-
 def _assert_batches_equal(first: dict[str, object], second: dict[str, object]) -> None:
-    """Require exact key, metadata, dtype, shape, and tensor-value parity."""
+    """Require exact tensor and metadata parity for two runtime batches."""
     assert first.keys() == second.keys()
-    for name in first:
-        if isinstance(first[name], torch.Tensor):
-            assert isinstance(second[name], torch.Tensor)
-            assert first[name].dtype == second[name].dtype
-            assert first[name].shape == second[name].shape
-            assert torch.equal(first[name], second[name]), name
+    for name, first_value in first.items():
+        second_value = second[name]
+        if isinstance(first_value, torch.Tensor):
+            assert isinstance(second_value, torch.Tensor)
+            assert torch.equal(first_value, second_value), name
         else:
-            assert first[name] == second[name], name
+            assert first_value == second_value, name
 
 
-def _assert_loader_batches_equal(
-    first: list[dict[str, object]],
-    second: list[dict[str, object]],
+# ============================================================================
+# DENSE CACHE CONTRACT
+# ============================================================================
+
+
+def test_dense_cache_layout_split_isolation_and_request_indexes(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Require exact parity across two complete loader iterations."""
-    assert len(first) == len(second)
-    for first_batch, second_batch in zip(first, second, strict=True):
-        _assert_batches_equal(first_batch, second_batch)
+    config = _write_sparse_artifact(tmp_path / "artifact")
+    store = DensePanelStore(config.artifact_path, cache_root=config.cache_root)
 
-
-def test_store_reconstructs_sparse_masks_and_blocks_protected_train_facts(
-    tmp_path: Path,
-) -> None:
-    config = _write_model_artifact(tmp_path / "artifact")
-    store = FrozenPanelStore(config.artifact_path)
-
-    assert store.feature_names == {
-        "asset": ["asset_a", "asset_b"],
-        "market": ["market_a"],
-        "macro": ["macro_a"],
+    assert store.cache_path == (
+        config.cache_root / f"synthetic-build_v{CACHE_FORMAT_VERSION}"
+    ).resolve()
+    expected = {
+        "manifest.json",
+        "config_resolved.yaml",
+        "dates.npy",
+        "assets.npy",
+        "feature_manifest.parquet",
+        "train_request_index.parquet",
+        "validation_request_index.parquet",
+        "train_target_date_mask.npy",
     }
-    partial = store.window(7, np.array([1]), "train", config.lookback_days)
-    assert partial["valid_asset_mask"].all()
-    assert partial["asset_feature_mask"][-1, 0].tolist() == [True, False]
-    assert partial["asset_x"][-1, 0, 1] == 0.0
+    expected.update(
+        f"{split}_{name}.npy"
+        for split in ("train", "validation")
+        for name in (
+            "asset_x",
+            "asset_feature_mask",
+            "valid_asset_mask",
+            "market_x",
+            "market_feature_mask",
+            "valid_market_date",
+            "macro_x",
+            "macro_feature_mask",
+            "valid_macro_date",
+        )
+    )
+    assert {path.name for path in store.cache_path.iterdir()} == expected
+    assert not store.train_valid_asset_mask[8:].any()
+    assert not store.validation_valid_asset_mask[:8].any()
+    assert np.count_nonzero(store.train_asset_x[8:]) == 0
+    assert np.count_nonzero(store.validation_asset_x[:8]) == 0
+    assert store.train_asset_feature_mask[7, 1].tolist() == [True, False]
+    assert store.train_asset_x[7, 1, 1] == 0.0
+    assert store.train_request_index["sample_date_idx"].tolist() == [3, 5, 7]
+    assert store.validation_request_index["sample_date_idx"].tolist() == [11, 13]
+    assert store.validation_request_index["n_endpoint_valid_assets"].tolist() == [3, 4]
+    assert "checking" in capsys.readouterr().out
 
-    protected = store.window(21, np.array([0]), "train", config.lookback_days)
-    assert protected["holdout_date_mask"][:-1].all()
-    assert not protected["valid_date_mask"][:-1].any()
-    assert not protected["asset_feature_mask"][:-1].any()
-    assert np.count_nonzero(protected["asset_x"][:-1]) == 0
 
-
-def test_store_builds_and_reuses_read_only_memmap_cache(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+def test_cache_reuse_strict_invalidation_and_status_output(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    config = _write_model_artifact(tmp_path / "artifact")
-    store = FrozenPanelStore(config.artifact_path)
+    config = _write_sparse_artifact(tmp_path / "artifact")
+    first = DensePanelStore(config.artifact_path, cache_root=config.cache_root)
+    first_output = capsys.readouterr().out
+    first.close()
+    second = DensePanelStore(config.artifact_path, cache_root=config.cache_root)
+    second_output = capsys.readouterr().out
+    second.close()
 
-    assert store.cache_path.parent == (tmp_path / ".frozen_panel_store_cache").resolve()
-    assert store.cache_path.parent != store.artifact_path.resolve()
-    assert (store.cache_path / "cache_manifest.json").is_file()
-    for name in (
-        "asset_x",
-        "asset_feature_mask",
-        "valid_asset",
-        "market_x",
-        "market_feature_mask",
-        "valid_market_date",
-        "macro_x",
-        "macro_feature_mask",
-        "valid_macro_date",
-    ):
-        array = getattr(store, name)
-        assert isinstance(array, np.memmap)
-        assert not array.flags.writeable
+    config_path = config.artifact_path / "config_resolved.yaml"
+    config_path.write_text(
+        yaml.safe_dump({"dates": {"lookback_days": 4}, "revision": 2}),
+        encoding="utf-8",
+    )
+    rebuilt = DensePanelStore(config.artifact_path, cache_root=config.cache_root)
+    rebuilt_output = capsys.readouterr().out
 
-    def fail_reload(*args: object, **kwargs: object) -> None:
-        raise AssertionError("A valid dense cache must not reload sparse facts.")
-
-    monkeypatch.setattr(FrozenPanelStore, "_load_asset_facts", fail_reload)
-    monkeypatch.setattr(FrozenPanelStore, "_load_date_facts", fail_reload)
-    reused = FrozenPanelStore(config.artifact_path)
-    assert reused.cache_path == store.cache_path
-    assert np.array_equal(reused.asset_x, store.asset_x)
+    assert "rebuilding" in first_output
+    assert "published" in first_output
+    assert "reusing" in second_output
+    assert "rebuilding" in rebuilt_output
+    manifest = json.loads((rebuilt.cache_path / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["source_config_sha256"]
+    assert manifest["array_shapes"]["train_asset_x"] == [16, 4, 2]
+    assert manifest["array_dtypes"]["train_asset_x"] == "float32"
 
 
-def test_store_rejects_cache_root_inside_immutable_artifact(tmp_path: Path) -> None:
-    config = _write_model_artifact(tmp_path / "artifact")
-
-    with pytest.raises(ValueError, match="outside the immutable artifact"):
-        FrozenPanelStore(config.artifact_path, cache_root=config.artifact_path / "cache")
-
-
-def test_store_cache_identity_changes_and_incomplete_cache_rebuilds(tmp_path: Path) -> None:
-    config = _write_model_artifact(tmp_path / "artifact")
-    original = FrozenPanelStore(config.artifact_path)
-    original_cache_path = original.cache_path
-    original._close_cache_arrays()
-    (original_cache_path / "asset_x.npy").unlink()
-
-    rebuilt = FrozenPanelStore(config.artifact_path)
-    assert rebuilt.cache_path == original_cache_path
-    assert isinstance(rebuilt.asset_x, np.memmap)
-    assert not rebuilt.asset_x.flags.writeable
-
-    rebuilt._close_cache_arrays()
-    (original_cache_path / "cache_manifest.json").write_text("{}", encoding="utf-8")
-    repaired = FrozenPanelStore(config.artifact_path)
-    assert repaired.cache_path == original_cache_path
-    assert isinstance(repaired.asset_x, np.memmap)
-
-    quality_path = config.artifact_path / "quality_report.json"
-    quality_path.write_text(json.dumps({"stores_windows": False, "revision": 2}))
-    changed = FrozenPanelStore(config.artifact_path)
-    assert changed.cache_path != original_cache_path
-
-
-def test_store_pickle_reopens_read_only_maps_without_serializing_arrays(tmp_path: Path) -> None:
-    config = _write_model_artifact(tmp_path / "artifact")
-    store = FrozenPanelStore(config.artifact_path)
-
+def test_worker_pickle_reopens_existing_cache_read_only(tmp_path: Path) -> None:
+    config = _write_sparse_artifact(tmp_path / "artifact")
+    store = DensePanelStore(config.artifact_path, cache_root=config.cache_root)
     state = store.__getstate__()
-    assert "asset_x" not in state
-    assert "macro_feature_mask" not in state
 
+    assert "train_asset_x" not in state
+    assert "validation_macro_x" not in state
     restored = pickle.loads(pickle.dumps(store))
-    assert restored.cache_path == store.cache_path
-    assert isinstance(restored.asset_x, np.memmap)
-    assert not restored.asset_x.flags.writeable
-    assert np.array_equal(restored.asset_x, store.asset_x)
-    assert not restored.train_permission.flags.writeable
+    assert isinstance(restored.train_asset_x, np.memmap)
+    assert not restored.train_asset_x.flags.writeable
+    assert np.array_equal(restored.train_asset_x, store.train_asset_x)
 
 
-def test_dataset_filters_invalid_samples_and_returns_lightweight_requests(
-    tmp_path: Path,
-) -> None:
-    config = _write_model_artifact(tmp_path / "artifact")
-    store = FrozenPanelStore(config.artifact_path)
-    train = FIJepaWindowDataset(store, config, "train")
-    validation = FIJepaWindowDataset(store, config, "validation")
-
-    assert train.nominal_sample_count == 2
-    assert train.dropped_sample_count == 1
-    assert len(train) == 1
-    assert validation.nominal_sample_count == 3
-    assert validation.dropped_sample_count == 0
-    assert len(validation) == 3
-
-    train_request = train[0]
-    assert isinstance(train_request, WindowRequest)
-    assert train_request.request_kind == "jepa"
-    assert train_request.view_kind == "random_k"
-
-    validation_request = validation[0]
-    assert isinstance(validation_request, WindowRequest)
-    assert validation_request.request_kind == "jepa"
-    assert validation_request.view_kind == "all_valid"
-
-    assembler = FIJepaBatchAssembler(store, config)
-    train_batch = assembler([train_request])
-    assert train_batch["asset_ids"].shape == (1, 2)
-    assert train_batch["asset_slot_mask"].all()
-    assert train_batch["patch_target_eligible"].all()
-    assert int(train_batch["jepa_target_mask"].sum()) == 3
-
-    validation_batch = assembler([validation_request])
-    assert validation_batch["holdout_date_mask"].all()
-    assert validation_batch["patch_target_eligible"].all()
-    assert validation_batch["asset_ids"][0].tolist() == [0, 1, 2]
+# ============================================================================
+# RUNTIME GATHERING AND VIEWS
+# ============================================================================
 
 
-def test_dataset_item_does_not_materialize_store_window(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    config = _write_model_artifact(tmp_path / "artifact")
-    store = FrozenPanelStore(config.artifact_path)
-    dataset = FIJepaWindowDataset(store, config, "train")
+def test_runtime_gathers_model_batch_and_exposes_debug_metadata(tmp_path: Path) -> None:
+    config = _write_sparse_artifact(tmp_path / "artifact")
+    store = DensePanelStore(config.artifact_path, cache_root=config.cache_root)
+    train = build_fi_jepa_dataloader(config, "train", store=store, shuffle=False)
+    validation = build_fi_jepa_dataloader(config, "validation", store=store, shuffle=False)
+    train_batch = next(iter(train))
+    validation_batch = next(iter(validation))
 
-    def fail_window(*args: object, **kwargs: object) -> None:
-        raise AssertionError("Dataset.__getitem__ must not materialize a dense window.")
+    assert train_batch["asset_patches"].shape == (2, 2, 2, 2, 2)
+    assert validation_batch["asset_patches"].shape == (2, 2, 2, 4, 2)
+    assert train_batch["asset_view"] == ["random_k", "random_k"]
+    assert validation_batch["asset_view"] == ["all_valid", "all_valid"]
+    assert train_batch["k_assets"] == [2, 2]
+    assert validation_batch["k_assets"] == [4, 4]
+    assert train_batch["n_endpoint_valid_assets"] == [4, 4]
+    assert validation_batch["n_endpoint_valid_assets"] == [3, 4]
+    assert "asset_x" not in train_batch
+    assert "valid_date_mask" not in train_batch
+    assert train_batch["patch_context_mask"].all()
+    assert train_batch["jepa_target_mask"].sum(dim=1).tolist() == [1, 1]
 
-    monkeypatch.setattr(store, "window", fail_window)
-    assert isinstance(dataset[0], WindowRequest)
 
+def test_random_k_changes_by_epoch_and_fixed_k_is_deterministic(tmp_path: Path) -> None:
+    config = _write_sparse_artifact(tmp_path / "artifact")
+    store = DensePanelStore(config.artifact_path, cache_root=config.cache_root)
+    train = build_fi_jepa_dataloader(config, "train", store=store, shuffle=False)
+    train.dataset.set_epoch(0)
+    first_train = next(iter(train))
+    train.dataset.set_epoch(1)
+    second_train = next(iter(train))
 
-def test_training_views_change_by_epoch_and_validation_views_are_frozen(
-    tmp_path: Path,
-) -> None:
-    config = _write_model_artifact(tmp_path / "artifact")
-    store = FrozenPanelStore(config.artifact_path)
-    train = FIJepaWindowDataset(store, config, "train")
-    validation = FIJepaWindowDataset(store, config, "validation")
-    diagnostic = FIJepaWindowDataset(store, config, "diagnostic", view_index=2)
-
-    training_views = []
-    assembler = FIJepaBatchAssembler(store, config)
-    for epoch in range(5):
-        train.set_epoch(epoch)
-        sample = assembler([train[0]])
-        training_views.append(
-            (
-                tuple(sample["asset_ids"][0].tolist()),
-                tuple(sample["jepa_target_mask"][0].tolist()),
+    fixed_first = next(
+        iter(
+            build_fi_jepa_embedding_dataloader(
+                config, "validation", asset_view="fixed_k", store=store, view_index=2
             )
         )
-    assert len(set(training_views)) > 1
-
-    first_validation = assembler([validation[0]])
-    validation.set_epoch(9)
-    second_validation = assembler([validation[0]])
-    assert torch.equal(first_validation["asset_ids"], second_validation["asset_ids"])
-    assert torch.equal(first_validation["jepa_target_mask"], second_validation["jepa_target_mask"])
-    assert torch.equal(
-        assembler([diagnostic[0]])["asset_ids"],
-        assembler([diagnostic[0]])["asset_ids"],
     )
-
-
-def test_dataloader_pads_variable_assets_and_exposes_patched_views(tmp_path: Path) -> None:
-    config = _write_model_artifact(tmp_path / "artifact")
-    loader = build_fi_jepa_dataloader(config, "validation", shuffle=False)
-    batch = next(iter(loader))
-
-    assert batch["asset_x"].shape == (2, 8, 4, 2)
-    assert batch["asset_patches"].shape == (2, 4, 2, 4, 2)
-    assert batch["market_patches"].shape == (2, 4, 2, 1)
-    assert batch["macro_patches"].shape == (2, 4, 2, 1)
-    assert batch["asset_ids"][0].tolist() == [0, 1, 2, -1]
-    assert batch["asset_slot_mask"][0].tolist() == [True, True, True, False]
-    assert batch["target_patch_ids"].shape == (2, 3)
-    assert batch["target_patch_id_mask"].all()
-    assert (
-        batch["asset_patches"].untyped_storage().data_ptr()
-        == batch["asset_x"].untyped_storage().data_ptr()
-    )
-
-
-def test_embedding_views_are_unmasked_all_valid_and_deterministic_fixed_k(
-    tmp_path: Path,
-) -> None:
-    config = _write_model_artifact(tmp_path / "artifact")
-    store = FrozenPanelStore(config.artifact_path)
-    all_valid = FIJepaEmbeddingDataset(
-        store, config, "validation", asset_view="all_valid"
-    )
-    fixed_first = FIJepaEmbeddingDataset(
-        store, config, "validation", asset_view="fixed_k", view_index=0
-    )
-    fixed_second = FIJepaEmbeddingDataset(
-        store, config, "validation", asset_view="fixed_k", view_index=1
-    )
-
-    assembler = FIJepaBatchAssembler(store, config)
-    all_valid_batch = assembler([all_valid[1]])
-    fixed_first_batch = assembler([fixed_first[1]])
-    fixed_first_repeat = assembler([fixed_first[1]])
-    fixed_second_batch = assembler([fixed_second[1]])
-    assert all_valid_batch["asset_ids"][0].tolist() == [0, 1, 2, 3]
-    assert fixed_first_batch["asset_ids"].shape[1] == config.diagnostic_k_assets
-    assert torch.equal(fixed_first_batch["asset_ids"], fixed_first_repeat["asset_ids"])
-    assert not torch.equal(fixed_first_batch["asset_ids"], fixed_second_batch["asset_ids"])
-
-    loader = build_fi_jepa_embedding_dataloader(
-        config, "validation", asset_view="all_valid", store=store
-    )
-    batch = next(iter(loader))
-    assert "jepa_target_mask" not in batch
-    assert "jepa_context_mask" not in batch
-    assert "target_patch_ids" not in batch
-    assert batch["patch_context_mask"][:, -1].all()
-
-
-@pytest.mark.parametrize(
-    ("request_kind", "asset_view"),
-    [
-        ("train", None),
-        ("validation", None),
-        ("embedding", "all_valid"),
-        ("embedding", "fixed_k"),
-    ],
-)
-def test_batched_gather_matches_per_sample_assembly(
-    tmp_path: Path,
-    request_kind: str,
-    asset_view: str | None,
-) -> None:
-    config = _write_model_artifact(tmp_path / f"{request_kind}_{asset_view}")
-    store = FrozenPanelStore(config.artifact_path)
-    if request_kind == "embedding":
-        dataset = FIJepaEmbeddingDataset(
-            store,
-            config,
-            "validation",
-            asset_view=asset_view,
-            view_index=2,
+    fixed_repeat = next(
+        iter(
+            build_fi_jepa_embedding_dataloader(
+                config, "validation", asset_view="fixed_k", store=store, view_index=2
+            )
         )
-    else:
-        dataset = FIJepaWindowDataset(store, config, request_kind)
-    requests = [dataset[index] for index in range(min(2, len(dataset)))]
-
-    batched = FIJepaBatchAssembler(
-        store, replace(config, assembly_mode="batched_gather")
-    )(requests)
-    per_sample = FIJepaBatchAssembler(
-        store, replace(config, assembly_mode="per_sample")
-    )(requests)
-    _assert_batches_equal(batched, per_sample)
-
-
-@pytest.mark.parametrize("assembly_mode", ["batched_gather", "per_sample"])
-def test_worker_loader_matches_serial_and_reopens_across_iterators(
-    tmp_path: Path,
-    assembly_mode: str,
-) -> None:
-    config = replace(
-        _write_model_artifact(tmp_path / assembly_mode),
-        assembly_mode=assembly_mode,
     )
-    store = FrozenPanelStore(config.artifact_path)
-    serial = build_fi_jepa_dataloader(
-        replace(config, num_workers=0),
-        "validation",
-        store=store,
-        shuffle=False,
+    assert not torch.equal(first_train["asset_ids"], second_train["asset_ids"])
+    assert torch.equal(fixed_first["asset_ids"], fixed_repeat["asset_ids"])
+    assert "jepa_context_mask" not in fixed_first
+    assert fixed_first["patch_context_mask"][:, -1].all()
+
+
+def test_fixed_k_and_invalid_jepa_views_fail_loudly(tmp_path: Path) -> None:
+    config = _write_sparse_artifact(tmp_path / "artifact")
+    store = DensePanelStore(config.artifact_path, cache_root=config.cache_root)
+    too_wide = FIJepaDataConfig(**{**config.__dict__, "fixed_k_assets": 4})
+    loader = build_fi_jepa_embedding_dataloader(
+        too_wide, "validation", asset_view="fixed_k", store=store
     )
-    worker = build_fi_jepa_dataloader(
-        replace(config, num_workers=2),
-        "validation",
-        store=store,
-        shuffle=False,
-    )
+    with pytest.raises(RuntimeError, match="n_endpoint_valid_assets=3"):
+        next(iter(loader))
 
-    expected = list(serial)
-    _assert_loader_batches_equal(expected, list(worker))
-    _assert_loader_batches_equal(expected, list(worker))
-
-
-def test_fixed_k_asset_hash_selection_ignores_candidate_order() -> None:
-    candidates = np.arange(20, dtype=np.int64)
-    expected = fixed_k_asset_ids(
-        candidates,
-        dataset_version="build-a",
-        sample_date="2024-01-05",
-        view_index=2,
-        k=6,
-    )
-    reversed_order = fixed_k_asset_ids(
-        candidates[::-1],
-        dataset_version="build-a",
-        sample_date="2024-01-05",
-        view_index=2,
-        k=6,
-    )
-    other_view = fixed_k_asset_ids(
-        candidates,
-        dataset_version="build-a",
-        sample_date="2024-01-05",
-        view_index=3,
-        k=6,
-    )
-
-    assert expected.tolist() == sorted(expected.tolist())
-    assert np.array_equal(expected, reversed_order)
-    assert not np.array_equal(expected, other_view)
-
-
-# ============================================================================
-# ARTIFACT REJECTION
-# ============================================================================
-
-
-def test_store_rejects_noncontiguous_features_and_target_columns(tmp_path: Path) -> None:
-    config = _write_model_artifact(tmp_path / "bad_indices")
-    features = pd.read_parquet(config.artifact_path / "feature_manifest.parquet")
-    features.loc[features["feature_name"].eq("asset_b"), "feature_index"] = 3
-    features.to_parquet(config.artifact_path / "feature_manifest.parquet", index=False)
-    with pytest.raises(ValueError, match="contiguous"):
-        FrozenPanelStore(config.artifact_path)
-
-    config = _write_model_artifact(tmp_path / "bad_target")
-    path = config.artifact_path / "train_market_features.parquet"
-    market = pd.read_parquet(path)
-    market["future_return_1d"] = 0.0
-    market.to_parquet(path, index=False)
-    with pytest.raises(ValueError, match="forbidden target-like columns"):
-        FrozenPanelStore(config.artifact_path)
-
-
-def test_dataset_allows_lookback_within_artifact_limit_and_rejects_larger(
-    tmp_path: Path,
-) -> None:
-    config = _write_model_artifact(tmp_path / "artifact")
-    resolved = {"dates": {"lookback_days": 10}}
-    (config.artifact_path / "config_resolved.yaml").write_text(yaml.safe_dump(resolved))
-    store = FrozenPanelStore(config.artifact_path)
-
-    FIJepaWindowDataset(store, config, "train")
-
-    with pytest.raises(ValueError, match="exceeds artifact lookback_days=10"):
-        FIJepaWindowDataset(store, replace(config, lookback_days=12), "train")
-
-
-@pytest.mark.parametrize(
-    ("filename", "expected_message"),
-    [
-        ("train_asset_features.parquet", r"duplicate \(date_idx, asset_id\) rows"),
-        ("train_market_features.parquet", "duplicate date_idx rows"),
-    ],
-)
-def test_store_rejects_duplicates_within_one_parquet_batch(
-    tmp_path: Path,
-    filename: str,
-    expected_message: str,
-) -> None:
-    config = _write_model_artifact(tmp_path / filename.removesuffix(".parquet"))
-    path = config.artifact_path / filename
+    invalid_config = _write_sparse_artifact(tmp_path / "invalid_artifact")
+    path = invalid_config.artifact_path / "train_asset_features.parquet"
     facts = pd.read_parquet(path)
-    facts = pd.concat([facts, facts.iloc[[0]]], ignore_index=True)
+    facts = facts.loc[
+        ~facts["asset_id"].eq(3) | facts["date_idx"].isin([3, 5, 7])
+    ]
     facts.to_parquet(path, index=False)
+    (invalid_config.artifact_path / "manifest.json").write_text(
+        json.dumps({"build_id": "invalid-view-build"}), encoding="utf-8"
+    )
+    invalid_store = DensePanelStore(
+        invalid_config.artifact_path, cache_root=invalid_config.cache_root
+    )
+    impossible = FIJepaDataConfig(
+        **{
+            **invalid_config.__dict__,
+            "train_k_assets": 4,
+            "min_valid_days_per_asset_patch": 2,
+            "min_valid_asset_fraction": 1.0,
+        }
+    )
+    loader = build_fi_jepa_dataloader(
+        impossible, "train", store=invalid_store, shuffle=False
+    )
+    with pytest.raises(RuntimeError, match="Selected JEPA view is not viable"):
+        list(loader)
 
-    with pytest.raises(ValueError, match=expected_message):
-        FrozenPanelStore(config.artifact_path)
+
+def test_worker_loader_matches_serial_across_repeated_iterators(tmp_path: Path) -> None:
+    config = _write_sparse_artifact(tmp_path / "artifact")
+    store = DensePanelStore(config.artifact_path, cache_root=config.cache_root)
+    serial = build_fi_jepa_dataloader(config, "validation", store=store, shuffle=False)
+    worker = build_fi_jepa_dataloader(
+        FIJepaDataConfig(**{**config.__dict__, "num_workers": 2}),
+        "validation",
+        store=store,
+        shuffle=False,
+    )
+    expected = list(serial)
+    for actual in (list(worker), list(worker)):
+        assert len(actual) == len(expected)
+        for first, second in zip(expected, actual, strict=True):
+            _assert_batches_equal(first, second)
+
+
+# ============================================================================
+# REJECTION
+# ============================================================================
+
+
+def test_store_requires_build_id_and_rejects_duplicate_sparse_keys(tmp_path: Path) -> None:
+    config = _write_sparse_artifact(tmp_path / "missing_id")
+    (config.artifact_path / "manifest.json").write_text("{}", encoding="utf-8")
+    with pytest.raises(ValueError, match="stable build_id"):
+        DensePanelStore(config.artifact_path, cache_root=config.cache_root)
+
+    config = _write_sparse_artifact(tmp_path / "duplicates")
+    path = config.artifact_path / "train_asset_features.parquet"
+    facts = pd.read_parquet(path)
+    pd.concat([facts, facts.iloc[[0]]], ignore_index=True).to_parquet(path, index=False)
+    with pytest.raises(ValueError, match=r"duplicate \(date_idx, asset_id\)"):
+        DensePanelStore(config.artifact_path, cache_root=config.cache_root)
+
+
+def test_request_dataset_rejects_lookback_requiring_padding(tmp_path: Path) -> None:
+    config = _write_sparse_artifact(tmp_path / "artifact")
+    (config.artifact_path / "config_resolved.yaml").write_text(
+        yaml.safe_dump({"dates": {"lookback_days": 8}}), encoding="utf-8"
+    )
+    store = DensePanelStore(config.artifact_path, cache_root=config.cache_root)
+    invalid = FIJepaDataConfig(**{**config.__dict__, "lookback_days": 6, "patch_len": 2})
+    with pytest.raises(ValueError, match="without padding"):
+        build_fi_jepa_dataloader(invalid, "train", store=store)

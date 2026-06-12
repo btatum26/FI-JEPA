@@ -9,7 +9,7 @@ import pytest
 import torch
 import yaml
 
-from fi_jepa.dataloader import FIJepaDataConfig, FrozenPanelStore, build_fi_jepa_dataloader
+from fi_jepa.dataloader import DensePanelStore, FIJepaDataConfig, build_fi_jepa_dataloader
 from fi_jepa.model import FIJepaModel
 from fi_jepa.model_config import FIJepaModelConfig
 from fi_jepa.training import (
@@ -34,9 +34,9 @@ def _write_training_artifact(root: Path) -> FIJepaDataConfig:
     validation_sample = np.zeros(12, dtype=bool)
     validation_sample[[9, 11]] = True
     sample_eligible = np.zeros(12, dtype=bool)
-    sample_eligible[[3, 5, 7]] = True
+    sample_eligible[[3, 4, 5]] = True
     protected = np.zeros(12, dtype=bool)
-    protected[8:] = True
+    protected[6:] = True
     date_manifest = pd.DataFrame(
         {
             "date_idx": np.arange(12, dtype=np.int32),
@@ -114,17 +114,20 @@ def _write_training_artifact(root: Path) -> FIJepaDataConfig:
                 }
             ).to_parquet(root / f"{split}_{group}_features.parquet", index=False)
 
-    (root / "manifest.json").write_text(json.dumps({"name": "training_test"}), encoding="utf-8")
+    (root / "manifest.json").write_text(
+        json.dumps({"build_id": "training-test"}), encoding="utf-8"
+    )
     (root / "quality_report.json").write_text(json.dumps({"valid": True}), encoding="utf-8")
     (root / "config_resolved.yaml").write_text(
         yaml.safe_dump({"dates": {"lookback_days": 4}}), encoding="utf-8"
     )
     return FIJepaDataConfig(
         artifact_path=root,
+        cache_root=root.parent / "cache",
         lookback_days=4,
         patch_len=2,
         train_k_assets=2,
-        diagnostic_k_assets=2,
+        fixed_k_assets=2,
         mask_ratio=0.5,
         min_masked_patches=1,
         max_masked_patches=1,
@@ -197,7 +200,8 @@ def _write_run_configs(root: Path) -> FIJepaTrainingConfig:
     )
     data_path = root / "dataloader.yaml"
     data_values = data_config.__dict__.copy()
-    data_values["artifact_path"] = str(data_values["artifact_path"])
+    for name in ("artifact_path", "cache_root"):
+        data_values[name] = str(data_values[name])
     data_path.write_text(yaml.safe_dump(data_values, sort_keys=False), encoding="utf-8")
     return FIJepaTrainingConfig(
         run_name="smoke",
@@ -262,7 +266,7 @@ def test_adamw_excludes_frozen_target_encoder() -> None:
 
 def test_validation_is_deterministic(tmp_path: Path) -> None:
     data_config = _write_training_artifact(tmp_path / "artifact")
-    store = FrozenPanelStore(data_config.artifact_path)
+    store = DensePanelStore(data_config.artifact_path, cache_root=data_config.cache_root)
     loader = build_fi_jepa_dataloader(data_config, "validation", store=store, shuffle=False)
     torch.manual_seed(5)
     model = FIJepaModel.from_store(_small_model_config(), store)

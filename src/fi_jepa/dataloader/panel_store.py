@@ -13,91 +13,105 @@ import pandas as pd
 import pyarrow.parquet as pq
 import yaml
 
-Split = Literal["train", "validation", "diagnostic"]
+Split = Literal["train", "validation"]
 
+CACHE_FORMAT_VERSION = 1
+FORBIDDEN_FEATURE_PATTERN = re.compile(r"future_|target|label", re.IGNORECASE)
+SOURCE_HASH_FILES = ("manifest.json", "config_resolved.yaml", "feature_manifest.parquet")
+SPARSE_FACT_FILES = tuple(
+    f"{split}_{group}_features.parquet"
+    for split in ("train", "validation")
+    for group in ("asset", "market", "macro")
+)
 REQUIRED_ARTIFACT_FILES = {
-    "manifest.json",
-    "config_resolved.yaml",
+    *SOURCE_HASH_FILES,
+    *SPARSE_FACT_FILES,
     "dates.parquet",
     "assets.parquet",
-    "feature_manifest.parquet",
-    "normalization.parquet",
-    "quality_report.json",
-    "train_asset_features.parquet",
-    "train_market_features.parquet",
-    "train_macro_features.parquet",
-    "validation_asset_features.parquet",
-    "validation_market_features.parquet",
-    "validation_macro_features.parquet",
 }
-FORBIDDEN_FEATURE_PATTERN = re.compile(r"future_|target|label", re.IGNORECASE)
-CACHE_FORMAT_VERSION = 1
-CACHE_MANIFEST_NAME = "cache_manifest.json"
-CACHE_ARRAY_NAMES = (
-    "asset_x",
-    "asset_feature_mask",
-    "valid_asset",
-    "market_x",
-    "market_feature_mask",
-    "valid_market_date",
-    "macro_x",
-    "macro_feature_mask",
-    "valid_macro_date",
+PANEL_ARRAY_NAMES = tuple(
+    f"{split}_{name}"
+    for split, names in (
+        (
+            "train",
+            (
+                "asset_x",
+                "asset_feature_mask",
+                "valid_asset_mask",
+                "market_x",
+                "market_feature_mask",
+                "valid_market_date",
+                "macro_x",
+                "macro_feature_mask",
+                "valid_macro_date",
+                "target_date_mask",
+            ),
+        ),
+        (
+            "validation",
+            (
+                "asset_x",
+                "asset_feature_mask",
+                "valid_asset_mask",
+                "market_x",
+                "market_feature_mask",
+                "valid_market_date",
+                "macro_x",
+                "macro_feature_mask",
+                "valid_macro_date",
+            ),
+        ),
+    )
+    for name in names
 )
-METADATA_ARRAY_NAMES = (
-    "train_permission",
-    "validation_permission",
-    "protected_holdout",
-    "sample_eligible",
-    "validation_sample",
+CACHE_ARRAY_NAMES = ("dates", "assets", *PANEL_ARRAY_NAMES)
+CACHE_METADATA_FILES = (
+    "config_resolved.yaml",
+    "feature_manifest.parquet",
+    "train_request_index.parquet",
+    "validation_request_index.parquet",
 )
 
 
 # ============================================================================
-# FROZEN PANEL STORE
+# DENSE PANEL STORE
 # ============================================================================
 
 
-class FrozenPanelStore:
-    """Load one immutable sparse artifact through a worker-safe dense cache.
+class DensePanelStore:
+    """Open an immutable, split-specific dense panel cache.
 
-    Sparse facts are streamed once into persistent ``.npy`` memmaps indexed by
-    the artifact's contiguous date and asset IDs. The completed cache is opened
-    read-only in the parent and reopened after worker-process deserialization,
-    avoiding dense-array copies under spawn. Every window slice reapplies the
-    requested split's date permissions, so retaining both fact sets in one
-    cache cannot expose protected validation facts to training samples.
+    Parent-process construction validates or builds the cache before workers
+    exist. Spawned workers receive only metadata and the completed cache path;
+    deserialization reopens every NumPy array read-only and never validates,
+    repairs, deletes, or publishes cache files.
     """
 
     def __init__(
         self,
         artifact_path: Path | str,
         *,
-        cache_root: Path | str | None = None,
+        cache_root: Path | str = Path("data/cache/dense_panel"),
     ):
-        self.artifact_path = Path(artifact_path)
-        self._validate_required_files()
-        self.manifest = json.loads(
-            (self.artifact_path / "manifest.json").read_text(encoding="utf-8")
-        )
-        self.dataset_version = str(
-            self.manifest.get("build_id")
-            or self.manifest.get("artifact_name")
-            or self.manifest.get("name")
-            or self.artifact_path.name
-        )
+        self.artifact_path = Path(artifact_path).resolve()
+        self.cache_root = Path(cache_root).resolve()
+        if self.cache_root.is_relative_to(self.artifact_path):
+            raise ValueError("cache_root must be outside the immutable artifact directory.")
 
-        # Manifests define all dense array axes and split permissions.
-        self.dates = pd.read_parquet(self.artifact_path / "dates.parquet")
-        self.assets = pd.read_parquet(self.artifact_path / "assets.parquet")
+        # validate the build_id matches the artifact
+        self._validate_required_artifact_files_exist()
+        self.manifest = json.loads((self.artifact_path / "manifest.json").read_text(encoding="utf-8"))
+        build_id = self.manifest.get("build_id")
+        if not build_id:
+            raise ValueError("Sparse artifact manifest.json must contain a stable build_id.")
+        self.dataset_version = str(build_id)
+
+        self._source_dates = pd.read_parquet(self.artifact_path / "dates.parquet")
+        self._source_assets = pd.read_parquet(self.artifact_path / "assets.parquet")
         self.feature_manifest = pd.read_parquet(self.artifact_path / "feature_manifest.parquet")
-        self.resolved_config = yaml.safe_load(
-            (self.artifact_path / "config_resolved.yaml").read_text(encoding="utf-8")
-        )
-        self._validate_manifests()
+        self.resolved_config = yaml.safe_load((self.artifact_path / "config_resolved.yaml").read_text(encoding="utf-8"))
+        self._validate_source_manifests()
 
-        # Feature-manifest order, rather than an architecture document, is the
-        # source of truth for tensor dimensions and feature positions.
         self.feature_names = {
             group: (
                 self.feature_manifest.loc[self.feature_manifest["input_group"].eq(group)]
@@ -106,66 +120,80 @@ class FrozenPanelStore:
             )
             for group in ("asset", "market", "macro")
         }
-        self.date_count = len(self.dates)
-        self.asset_count = len(self.assets)
+        self.date_count = len(self._source_dates)
+        self.asset_count = len(self._source_assets)
+        self.cache_path = (self.cache_root / f"{self.dataset_version}_v{CACHE_FORMAT_VERSION}").resolve()
+        self._expected_manifest = self._build_expected_cache_manifest()
 
-        # Permissions are reapplied when slicing windows. Holding both fact
-        # sets in one cache therefore does not grant cross-split visibility.
-        self.train_permission = self.dates["train_fact_allowed"].to_numpy(dtype=bool)
-        self.validation_permission = self.dates["validation_fact_allowed"].to_numpy(dtype=bool)
-        self.protected_holdout = self.dates["protected_holdout"].to_numpy(dtype=bool)
-        self.sample_eligible = self.dates["sample_eligible"].to_numpy(dtype=bool)
-        self.validation_sample = self.dates["validation_sample"].to_numpy(dtype=bool)
-        self.date_values = self.dates["date"].tolist()
-        self._mark_metadata_arrays_read_only()
-
-        default_cache_root = self.artifact_path.parent / ".frozen_panel_store_cache"
-        self.cache_root = Path(cache_root or default_cache_root).resolve()
-        if self.cache_root.is_relative_to(self.artifact_path.resolve()):
-            raise ValueError("cache_root must be outside the immutable artifact directory.")
         self.cache_root.mkdir(parents=True, exist_ok=True)
-        self._cache_key = self._build_cache_key()
-        self.cache_path = (
-            self.cache_root / f"{self.artifact_path.name}_{self._cache_key[:20]}"
-        ).resolve()
         self._ensure_cache()
+        self._load_request_indexes()
         self._open_cache_arrays()
 
+        # Source DataFrames are not needed after the immutable cache is open.
+        del self._source_dates
+        del self._source_assets
+
     def __getstate__(self) -> dict[str, object]:
-        """Serialize store metadata without copying any dense mapped arrays."""
+        """Serialize metadata without copying mapped dense-panel arrays."""
         state = self.__dict__.copy()
         for name in CACHE_ARRAY_NAMES:
             state.pop(name, None)
         return state
 
     def __setstate__(self, state: dict[str, object]) -> None:
-        """Restore metadata and reopen the completed cache read-only."""
+        """Reopen an already-published cache without worker-side mutation."""
         self.__dict__.update(state)
-        self._mark_metadata_arrays_read_only()
-        self._open_cache_arrays()
+        self._open_cache_arrays(validate=False)
 
-    def _mark_metadata_arrays_read_only(self) -> None:
-        """Prevent mutation of the small split-permission arrays held in memory."""
-        for name in METADATA_ARRAY_NAMES:
-            array = getattr(self, name)
-            array.setflags(write=False)
+    def request_index_for(self, split: Split) -> pd.DataFrame:
+        """Return the immutable request index for one split."""
+        return self.train_request_index if split == "train" else self.validation_request_index
 
-    def _validate_required_files(self) -> None:
-        """Require the complete frozen-artifact contract before loading data."""
-        missing = sorted(
-            name for name in REQUIRED_ARTIFACT_FILES if not (self.artifact_path / name).is_file()
+    def endpoint_asset_ids(self, sample_date_idx: int, split: Split) -> np.ndarray:
+        """Return asset IDs with a valid observation at one split endpoint."""
+        valid = getattr(self, f"{split}_valid_asset_mask")
+        return np.flatnonzero(valid[sample_date_idx]).astype(np.int64)
+
+    def arrays_for(self, split: Split) -> dict[str, np.ndarray]:
+        """Return one split's read-only panel arrays under runtime field names."""
+        names = (
+            "asset_x",
+            "asset_feature_mask",
+            "valid_asset_mask",
+            "market_x",
+            "market_feature_mask",
+            "valid_market_date",
+            "macro_x",
+            "macro_feature_mask",
+            "valid_macro_date",
         )
+        arrays = {name: getattr(self, f"{split}_{name}") for name in names}
+        if split == "train":
+            arrays["target_date_mask"] = self.train_target_date_mask
+        return arrays
+
+    def close(self) -> None:
+        """Close every read-only cache mapping owned by this process."""
+        for name in CACHE_ARRAY_NAMES:
+            array = getattr(self, name, None)
+            if array is not None:
+                self._close_memmap(array)
+                delattr(self, name)
+
+    # ============================================================================
+    # SOURCE VALIDATION AND CACHE IDENTITY
+    # ============================================================================
+
+    def _validate_required_artifact_files_exist(self) -> None:
+        """Require the complete sparse model-artifact input contract."""
+        missing = sorted(name for name in REQUIRED_ARTIFACT_FILES if not (self.artifact_path / name).is_file())
         if missing:
-            raise FileNotFoundError(f"Frozen artifact is missing required files: {missing}")
+            raise FileNotFoundError(f"Sparse artifact is missing required files: {missing}")
 
-    def _validate_manifests(self) -> None:
-        """Validate manifest schemas, contiguous IDs, and input-only features.
-
-        Dense indexing relies on ordered contiguous date, asset, and per-group
-        feature IDs. Feature names are also screened here so future or target
-        columns fail before any fact file is loaded into model-facing arrays.
-        """
-        required_date_columns = {
+    def _validate_source_manifests(self) -> None:
+        """Validate dense-axis manifests and reject target-like input features."""
+        required_dates = {
             "date_idx",
             "date",
             "sample_eligible",
@@ -174,33 +202,32 @@ class FrozenPanelStore:
             "train_fact_allowed",
             "validation_fact_allowed",
         }
-        missing_dates = sorted(required_date_columns - set(self.dates.columns))
+
+        # checks dates file
+        missing_dates = sorted(required_dates - set(self._source_dates.columns))
         if missing_dates:
             raise ValueError(f"dates.parquet is missing columns: {missing_dates}")
-        if self.dates["date_idx"].tolist() != list(range(len(self.dates))):
+        if self._source_dates["date_idx"].tolist() != list(range(len(self._source_dates))):
             raise ValueError("dates.parquet date_idx must be contiguous and ordered.")
-        if not self.dates["date"].is_monotonic_increasing:
+        if not self._source_dates["date"].is_monotonic_increasing:
             raise ValueError("dates.parquet dates must be ordered.")
 
-        required_asset_columns = {"asset_id", "symbol", "trainable"}
-        missing_assets = sorted(required_asset_columns - set(self.assets.columns))
+        # checks assets file
+        required_assets = {"asset_id", "symbol", "trainable"}
+        missing_assets = sorted(required_assets - set(self._source_assets.columns))
         if missing_assets:
             raise ValueError(f"assets.parquet is missing columns: {missing_assets}")
-        if self.assets["asset_id"].tolist() != list(range(len(self.assets))):
+        if self._source_assets["asset_id"].tolist() != list(range(len(self._source_assets))):
             raise ValueError("assets.parquet asset_id must be contiguous and ordered.")
 
-        required_feature_columns = {"feature_name", "feature_index", "input_group", "dtype"}
-        missing_features = sorted(required_feature_columns - set(self.feature_manifest.columns))
+        # checks features file
+        required_features = {"feature_name", "feature_index", "input_group", "dtype"}
+        missing_features = sorted(required_features - set(self.feature_manifest.columns))
         if missing_features:
             raise ValueError(f"feature_manifest.parquet is missing columns: {missing_features}")
         if set(self.feature_manifest["input_group"]) != {"asset", "market", "macro"}:
             raise ValueError("Feature manifest must contain asset, market, and macro groups.")
-
-        forbidden = (
-            self.feature_manifest["feature_name"]
-            .astype(str)
-            .str.contains(FORBIDDEN_FEATURE_PATTERN)
-        )
+        forbidden = self.feature_manifest["feature_name"].astype(str).str.contains(FORBIDDEN_FEATURE_PATTERN)
         if forbidden.any():
             names = self.feature_manifest.loc[forbidden, "feature_name"].tolist()
             raise ValueError(f"Forbidden target-like features in artifact: {names}")
@@ -209,80 +236,86 @@ class FrozenPanelStore:
             if indices != list(range(len(indices))):
                 raise ValueError(f"{group} feature indices must be contiguous from zero.")
 
-    def _cache_array_specs(self) -> dict[str, dict[str, object]]:
-        """Return the authoritative shape and dtype contract for cached arrays."""
-        asset_dim = len(self.feature_names["asset"])
-        market_dim = len(self.feature_names["market"])
-        macro_dim = len(self.feature_names["macro"])
-        return {
-            "asset_x": {
-                "shape": [self.date_count, self.asset_count, asset_dim],
-                "dtype": "float32",
-            },
-            "asset_feature_mask": {
-                "shape": [self.date_count, self.asset_count, asset_dim],
-                "dtype": "bool",
-            },
-            "valid_asset": {
-                "shape": [self.date_count, self.asset_count],
-                "dtype": "bool",
-            },
-            "market_x": {
-                "shape": [self.date_count, market_dim],
-                "dtype": "float32",
-            },
-            "market_feature_mask": {
-                "shape": [self.date_count, market_dim],
-                "dtype": "bool",
-            },
-            "valid_market_date": {"shape": [self.date_count], "dtype": "bool"},
-            "macro_x": {
-                "shape": [self.date_count, macro_dim],
-                "dtype": "float32",
-            },
-            "macro_feature_mask": {
-                "shape": [self.date_count, macro_dim],
-                "dtype": "bool",
-            },
-            "valid_macro_date": {"shape": [self.date_count], "dtype": "bool"},
-        }
+    @staticmethod
+    def _sha256(path: Path) -> str:
+        """Return the SHA-256 digest of one source-contract file."""
+        digest = hashlib.sha256()
+        with path.open("rb") as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
 
-    def _build_cache_key(self) -> str:
-        """Hash the cache format, artifact identity, manifest, and file metadata."""
-        files = {}
-        for name in sorted(REQUIRED_ARTIFACT_FILES):
-            stat = (self.artifact_path / name).stat()
-            files[name] = {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
-        identity = {
-            "cache_format_version": CACHE_FORMAT_VERSION,
-            "artifact_path": str(self.artifact_path.resolve()),
-            "artifact_manifest": self.manifest,
-            "required_files": files,
+    def _array_specs(self) -> dict[str, dict[str, object]]:
+        """Return the exact required shape and dtype of every cache array."""
+        d = self.date_count
+        n = self.asset_count
+        fa = len(self.feature_names["asset"])
+        fm = len(self.feature_names["market"])
+        fx = len(self.feature_names["macro"])
+        date_values = pd.to_datetime(self._source_dates["date"]).to_numpy(dtype="datetime64[D]")
+        asset_values = np.asarray(self._source_assets["symbol"].astype(str).tolist(), dtype=str)
+        common = {
+            "asset_x": ([d, n, fa], "float32"),
+            "asset_feature_mask": ([d, n, fa], "bool"),
+            "valid_asset_mask": ([d, n], "bool"),
+            "market_x": ([d, fm], "float32"),
+            "market_feature_mask": ([d, fm], "bool"),
+            "valid_market_date": ([d], "bool"),
+            "macro_x": ([d, fx], "float32"),
+            "macro_feature_mask": ([d, fx], "bool"),
+            "valid_macro_date": ([d], "bool"),
         }
-        encoded = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
-        return hashlib.sha256(encoded).hexdigest()
+        specs = {
+            "dates": {"shape": [d], "dtype": date_values.dtype.str},
+            "assets": {"shape": [n], "dtype": asset_values.dtype.str},
+        }
+        for split in ("train", "validation"):
+            for name, (shape, dtype) in common.items():
+                specs[f"{split}_{name}"] = {"shape": shape, "dtype": dtype}
+        specs["train_target_date_mask"] = {"shape": [d], "dtype": "bool"}
+        return specs
+
+    def _build_expected_cache_manifest(self) -> dict[str, object]:
+        """Build the strict manifest required for cache reuse."""
+        fact_stats = {}
+        for name in SPARSE_FACT_FILES:
+            stat = (self.artifact_path / name).stat()
+            fact_stats[name] = {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+        specs = self._array_specs()
+        return {
+            "cache_format_version": CACHE_FORMAT_VERSION,
+            "source_artifact_id": self.dataset_version,
+            "source_manifest_sha256": self._sha256(self.artifact_path / "manifest.json"),
+            "source_config_sha256": self._sha256(self.artifact_path / "config_resolved.yaml"),
+            "source_feature_manifest_sha256": self._sha256(self.artifact_path / "feature_manifest.parquet"),
+            "source_dates_sha256": self._sha256(self.artifact_path / "dates.parquet"),
+            "source_assets_sha256": self._sha256(self.artifact_path / "assets.parquet"),
+            "source_sparse_fact_files": fact_stats,
+            "array_shapes": {name: spec["shape"] for name, spec in specs.items()},
+            "array_dtypes": {name: spec["dtype"] for name, spec in specs.items()},
+        }
 
     def _validate_cache(self, cache_path: Path) -> bool:
-        """Return whether one published cache exactly matches the expected contract."""
+        """Return whether a published cache exactly matches the source contract."""
         try:
-            cache_manifest = json.loads(
-                (cache_path / CACHE_MANIFEST_NAME).read_text(encoding="utf-8")
-            )
-            if cache_manifest != {
-                "cache_format_version": CACHE_FORMAT_VERSION,
-                "cache_key": self._cache_key,
-                "arrays": self._cache_array_specs(),
-            }:
+            actual = json.loads((cache_path / "manifest.json").read_text(encoding="utf-8"))
+            if actual != self._expected_manifest:
                 return False
-            for name, spec in self._cache_array_specs().items():
+            for name in CACHE_METADATA_FILES:
+                if not (cache_path / name).is_file():
+                    return False
+
+            specs = self._array_specs()
+            for name, spec in specs.items():
                 array = np.load(cache_path / f"{name}.npy", mmap_mode="r", allow_pickle=False)
                 try:
                     if list(array.shape) != spec["shape"]:
                         return False
-                    if array.dtype != np.dtype(str(spec["dtype"])):
+                    if array.dtype.str != np.dtype(str(spec["dtype"])).str:
                         return False
                 finally:
                     self._close_memmap(array)
+
         except (
             AttributeError,
             EOFError,
@@ -296,67 +329,79 @@ class FrozenPanelStore:
             return False
         return True
 
+    # ============================================================================
+    # CACHE BUILD AND WORKER-SAFE OPEN
+    # ============================================================================
+
     def _ensure_cache(self) -> None:
-        """Build and atomically publish the dense cache when no valid cache exists."""
+        """Validate, build, and atomically publish the cache in the parent."""
+        print(f"Dense panel cache: checking {self.cache_path}")
         if self._validate_cache(self.cache_path):
+            print(f"Dense panel cache: reusing {self.cache_path}")
             return
+
+        print(f"Dense panel cache: rebuilding {self.cache_path}")
         if self.cache_path.exists():
             if self.cache_path.is_dir():
                 shutil.rmtree(self.cache_path)
             else:
                 self.cache_path.unlink()
-
-        temporary_path = Path(
+        temporary = Path(
             tempfile.mkdtemp(prefix=f".{self.cache_path.name}.tmp-", dir=self.cache_root)
         )
         try:
-            self._build_cache(temporary_path)
+            self._build_cache(temporary)
             try:
-                temporary_path.rename(self.cache_path)
+                temporary.rename(self.cache_path)
+                print(f"Dense panel cache: published {self.cache_path}")
             except OSError:
-                # Another process may have published the same immutable cache
-                # while this process was building its private temporary copy.
                 if not self._validate_cache(self.cache_path):
                     raise
+                print(f"Dense panel cache: reusing concurrently published {self.cache_path}")
         finally:
-            if temporary_path.exists():
-                shutil.rmtree(temporary_path)
-
+            if temporary.exists():
+                shutil.rmtree(temporary)
         if not self._validate_cache(self.cache_path):
-            raise RuntimeError(f"Failed to publish a valid FrozenPanelStore cache: {self.cache_path}")
+            raise RuntimeError(f"Failed to publish a valid dense panel cache: {self.cache_path}")
 
     def _build_cache(self, cache_path: Path) -> None:
-        """Stream validated sparse facts into writable maps, then mark completion."""
+        """Write split-specific panels and request indexes, then manifest last."""
         self._allocate_cache_arrays(cache_path)
         try:
-            # Train and validation facts are date-disjoint, so both can occupy
-            # one dense cache without overwriting one another.
             for split in ("train", "validation"):
                 self._load_asset_facts(split)
                 self._load_date_facts(split, "market")
                 self._load_date_facts(split, "macro")
+            self.train_target_date_mask[:] = self._source_dates[
+                "train_fact_allowed"
+            ].to_numpy(dtype=bool)
             self._flush_cache_arrays()
+            self._write_request_indexes(cache_path)
         finally:
             self._close_cache_arrays()
 
-        cache_manifest = {
-            "cache_format_version": CACHE_FORMAT_VERSION,
-            "cache_key": self._cache_key,
-            "arrays": self._cache_array_specs(),
-        }
-        (cache_path / CACHE_MANIFEST_NAME).write_text(
-            json.dumps(cache_manifest, indent=2, sort_keys=True),
+        shutil.copy2(
+            self.artifact_path / "config_resolved.yaml",
+            cache_path / "config_resolved.yaml",
+        )
+        shutil.copy2(
+            self.artifact_path / "feature_manifest.parquet",
+            cache_path / "feature_manifest.parquet",
+        )
+        (cache_path / "manifest.json").write_text(
+            json.dumps(self._expected_manifest, indent=2, sort_keys=True),
             encoding="utf-8",
         )
 
     def _allocate_cache_arrays(self, cache_path: Path) -> None:
-        """Allocate zero-filled writable memmaps and in-memory overlap trackers.
-
-        Asset arrays use ``[date, asset, feature]``. Market and macro arrays use
-        ``[date, feature]``. Zeros are storage fill values only; paired boolean
-        masks preserve all missingness semantics.
-        """
-        for name, spec in self._cache_array_specs().items():
+        """Allocate zero-filled arrays using the final cache contract."""
+        date_values = pd.to_datetime(self._source_dates["date"]).to_numpy(dtype="datetime64[D]")
+        asset_values = np.asarray(self._source_assets["symbol"].astype(str).tolist(), dtype=str)
+        np.save(cache_path / "dates.npy", date_values, allow_pickle=False)
+        np.save(cache_path / "assets.npy", asset_values, allow_pickle=False)
+        for name, spec in self._array_specs().items():
+            if name in {"dates", "assets"}:
+                continue
             array = np.lib.format.open_memmap(
                 cache_path / f"{name}.npy",
                 mode="w+",
@@ -366,54 +411,56 @@ class FrozenPanelStore:
             array[...] = 0
             setattr(self, name, array)
 
-        # Separate row-presence masks detect split overlap even when valid_date is false.
-        self._market_row_present = np.zeros(self.date_count, dtype=bool)
-        self._macro_row_present = np.zeros(self.date_count, dtype=bool)
-
     def _flush_cache_arrays(self) -> None:
-        """Flush every writable map before the cache directory is published."""
-        for name in CACHE_ARRAY_NAMES:
+        """Flush every writable panel map before publishing metadata."""
+        for name in PANEL_ARRAY_NAMES:
             array = getattr(self, name)
             if isinstance(array, np.memmap):
                 array.flush()
 
     @staticmethod
     def _close_memmap(array: np.ndarray) -> None:
-        """Close one NumPy memmap's underlying file mapping when present."""
+        """Close a NumPy memmap's underlying file mapping when present."""
         mapping = getattr(array, "_mmap", None)
         if mapping is not None:
             mapping.close()
 
     def _close_cache_arrays(self) -> None:
-        """Close and remove live mapped-array attributes."""
-        for name in CACHE_ARRAY_NAMES:
+        """Close live mapped arrays during cache construction."""
+        for name in PANEL_ARRAY_NAMES:
             array = getattr(self, name, None)
             if array is not None:
                 self._close_memmap(array)
                 delattr(self, name)
-        self.__dict__.pop("_market_row_present", None)
-        self.__dict__.pop("_macro_row_present", None)
 
-    def _open_cache_arrays(self) -> None:
-        """Open every completed dense array read-only in the current process."""
-        if not self._validate_cache(self.cache_path):
-            raise RuntimeError(f"FrozenPanelStore cache is invalid: {self.cache_path}")
+    def _open_cache_arrays(self, *, validate: bool = True) -> None:
+        """Open all completed arrays read-only in the current process."""
+        if validate and not self._validate_cache(self.cache_path):
+            raise RuntimeError(f"Dense panel cache is invalid: {self.cache_path}")
         for name in CACHE_ARRAY_NAMES:
-            array = np.load(self.cache_path / f"{name}.npy", mmap_mode="r", allow_pickle=False)
-            setattr(self, name, array)
+            setattr(self, name, np.load(self.cache_path / f"{name}.npy", mmap_mode="r", allow_pickle=False))
+
+    def _load_request_indexes(self) -> None:
+        """Load small request tables once for dataset construction and workers."""
+        self.train_request_index = pd.read_parquet(
+            self.cache_path / "train_request_index.parquet"
+        )
+        self.validation_request_index = pd.read_parquet(
+            self.cache_path / "validation_request_index.parquet"
+        )
+
+    # ============================================================================
+    # SPARSE FACT IMPORT
+    # ============================================================================
 
     def _validate_fact_schema(self, path: Path, group: str) -> None:
-        """Validate one sparse fact file against its feature-manifest group."""
+        """Require values, validity masks, keys, and row-validity fields."""
         columns = set(pq.read_schema(path).names)
-
-        # Every value must retain its paired validity column. Zero alone cannot
-        # distinguish a real observation from a missing-value fill.
         required = {"date", "date_idx", *self.feature_names[group]}
         required.update(f"{name}__valid" for name in self.feature_names[group])
         required.add("valid_asset" if group == "asset" else "valid_date")
         if group == "asset":
             required.add("asset_id")
-
         missing = sorted(required - columns)
         if missing:
             raise ValueError(f"{path.name} is missing columns: {missing}")
@@ -421,20 +468,18 @@ class FrozenPanelStore:
         if forbidden:
             raise ValueError(f"{path.name} contains forbidden target-like columns: {forbidden}")
 
-    def _load_asset_facts(self, split: str) -> None:
-        """Stream sparse asset facts directly into final dense array positions.
-
-        Parquet row groups are processed in bounded batches. Each sparse
-        ``(date_idx, asset_id)`` row writes directly to ``[date, asset, feature]``
-        and duplicate or overlapping keys are rejected before assignment.
-        """
+    def _load_asset_facts(self, split: Split) -> None:
+        """Stream sparse asset rows into one split-specific dense panel."""
         path = self.artifact_path / f"{split}_asset_features.parquet"
         self._validate_fact_schema(path, "asset")
         features = self.feature_names["asset"]
         columns = ["date_idx", "asset_id", "valid_asset", *features]
         columns.extend(f"{name}__valid" for name in features)
+        values = getattr(self, f"{split}_asset_x")
+        feature_mask = getattr(self, f"{split}_asset_feature_mask")
+        valid_mask = getattr(self, f"{split}_valid_asset_mask")
+        present = np.zeros((self.date_count, self.asset_count), dtype=bool)
 
-        # Avoid materializing the full sparse asset panel as an intermediate frame.
         for batch in pq.ParquetFile(path).iter_batches(batch_size=65_536, columns=columns):
             frame = batch.to_pandas()
             if frame.duplicated(["date_idx", "asset_id"]).any():
@@ -448,33 +493,26 @@ class FrozenPanelStore:
                 or (asset_ids >= self.asset_count).any()
             ):
                 raise ValueError(f"{path.name} contains out-of-range fact keys.")
-            if self.valid_asset[date_ids, asset_ids].any():
-                raise ValueError(f"{path.name} overlaps existing asset facts.")
-
-            # Advanced indexing writes sparse rows into final [date, asset, feature] slots.
-            self.asset_x[date_ids, asset_ids] = frame[features].to_numpy(dtype=np.float32)
-            self.asset_feature_mask[date_ids, asset_ids] = frame[
+            if present[date_ids, asset_ids].any():
+                raise ValueError(f"{path.name} contains duplicate (date_idx, asset_id) rows.")
+            present[date_ids, asset_ids] = True
+            values[date_ids, asset_ids] = frame[features].to_numpy(dtype=np.float32)
+            feature_mask[date_ids, asset_ids] = frame[
                 [f"{name}__valid" for name in features]
             ].to_numpy(dtype=bool)
-            self.valid_asset[date_ids, asset_ids] = frame["valid_asset"].to_numpy(dtype=bool)
+            valid_mask[date_ids, asset_ids] = frame["valid_asset"].to_numpy(dtype=bool)
 
-    def _load_date_facts(self, split: str, group: Literal["market", "macro"]) -> None:
-        """Stream one date-level feature group into the shared date spine.
-
-        Market and macro files are dense within a split but remain keyed by
-        ``date_idx``. Loading through those IDs preserves alignment across split
-        files and allows explicit duplicate/overlap checks.
-        """
+    def _load_date_facts(self, split: Split, group: Literal["market", "macro"]) -> None:
+        """Stream sparse date rows into one split-specific dense stream."""
         path = self.artifact_path / f"{split}_{group}_features.parquet"
         self._validate_fact_schema(path, group)
-
         features = self.feature_names[group]
         columns = ["date_idx", "valid_date", *features]
         columns.extend(f"{name}__valid" for name in features)
-        values = self.market_x if group == "market" else self.macro_x
-        feature_mask = self.market_feature_mask if group == "market" else self.macro_feature_mask
-        valid_date = self.valid_market_date if group == "market" else self.valid_macro_date
-        row_present = self._market_row_present if group == "market" else self._macro_row_present
+        values = getattr(self, f"{split}_{group}_x")
+        feature_mask = getattr(self, f"{split}_{group}_feature_mask")
+        valid_date = getattr(self, f"{split}_valid_{group}_date")
+        present = np.zeros(self.date_count, dtype=bool)
 
         for batch in pq.ParquetFile(path).iter_batches(batch_size=65_536, columns=columns):
             frame = batch.to_pandas()
@@ -483,137 +521,45 @@ class FrozenPanelStore:
             date_ids = frame["date_idx"].to_numpy(dtype=np.int64)
             if (date_ids < 0).any() or (date_ids >= self.date_count).any():
                 raise ValueError(f"{path.name} contains out-of-range date_idx values.")
-            if row_present[date_ids].any():
-                raise ValueError(f"{path.name} overlaps existing {group} facts.")
-
+            if present[date_ids].any():
+                raise ValueError(f"{path.name} contains duplicate date_idx rows.")
+            present[date_ids] = True
             values[date_ids] = frame[features].to_numpy(dtype=np.float32)
-            feature_mask[date_ids] = frame[[f"{name}__valid" for name in features]].to_numpy(
-                dtype=bool
-            )
+            feature_mask[date_ids] = frame[
+                [f"{name}__valid" for name in features]
+            ].to_numpy(dtype=bool)
             valid_date[date_ids] = frame["valid_date"].to_numpy(dtype=bool)
-            row_present[date_ids] = True
 
-    def permission_for(self, split: Split) -> np.ndarray:
-        """Return the date-level fact permission mask for a requested split."""
-        return self.train_permission if split == "train" else self.validation_permission
-
-    def sample_indices_for(self, split: Split) -> np.ndarray:
-        """Return candidate sample endpoints for training or evaluation."""
-        if split == "train":
-            return np.flatnonzero(self.sample_eligible & self.train_permission)
-        return np.flatnonzero(self.validation_sample)
-
-    def endpoint_asset_ids(self, date_idx: int, split: Split) -> np.ndarray:
-        """Return endpoint-valid assets only when the split may read the date."""
-        if not self.permission_for(split)[date_idx]:
-            return np.empty(0, dtype=np.int64)
-        return np.flatnonzero(self.valid_asset[date_idx]).astype(np.int64)
-
-    def window_masks(
-        self,
-        sample_date_idx: int,
-        asset_ids: np.ndarray,
-        split: Split,
-        lookback_days: int,
-    ) -> dict[str, np.ndarray]:
-        """Build permission-filtered daily masks for one lookback window.
-
-        Early-history windows are left-padded to the requested fixed length.
-        Padded asset IDs use ``-1`` externally and gather harmless asset zero
-        internally, after which slot and split permissions clear placeholder
-        validity. No feature-value arrays are copied by this method.
-        """
-        asset_ids = np.asarray(asset_ids, dtype=np.int64)
-        asset_slot_mask = asset_ids >= 0
-        safe_asset_ids = np.where(asset_slot_mask, asset_ids, 0)
-
-        # Fixed destination arrays make all downstream samples shape-stable.
-        valid_asset_mask = np.zeros((lookback_days, len(asset_ids)), dtype=bool)
-        valid_market_date_mask = np.zeros(lookback_days, dtype=bool)
-        valid_macro_date_mask = np.zeros(lookback_days, dtype=bool)
-        holdout_date_mask = np.zeros(lookback_days, dtype=bool)
-        padded_date_mask = np.ones(lookback_days, dtype=bool)
-        date_indices = np.full(lookback_days, -1, dtype=np.int64)
-
-        source_start = max(0, sample_date_idx - lookback_days + 1)
-        source_stop = sample_date_idx + 1
-        destination_start = lookback_days - (source_stop - source_start)
-        destination = slice(destination_start, lookback_days)
-        source = slice(source_start, source_stop)
-        permission = self.permission_for(split)[source]
-
-        # Gather real source dates into the right side of the padded destination.
-        valid_asset_mask[destination] = self.valid_asset[source][:, safe_asset_ids]
-        valid_asset_mask[destination] &= permission[:, None] & asset_slot_mask[None, :]
-        valid_market_date_mask[destination] = self.valid_market_date[source] & permission
-        valid_macro_date_mask[destination] = self.valid_macro_date[source] & permission
-        holdout_date_mask[destination] = self.protected_holdout[source]
-        padded_date_mask[destination] = False
-        date_indices[destination] = np.arange(source_start, source_stop, dtype=np.int64)
-
-        # A day is usable context when any stream has split-permitted data.
-        valid_date_mask = (
-            valid_market_date_mask | valid_macro_date_mask | valid_asset_mask.any(axis=1)
+    def _write_request_indexes(self, cache_path: Path) -> None:
+        """Persist only artifact-stable request metadata."""
+        window_names = (
+            self._source_dates["validation_window_name"]
+            if "validation_window_name" in self._source_dates
+            else pd.Series([""] * self.date_count)
         )
-        return {
-            "asset_slot_mask": asset_slot_mask,
-            "valid_asset_mask": valid_asset_mask,
-            "valid_market_date_mask": valid_market_date_mask,
-            "valid_macro_date_mask": valid_macro_date_mask,
-            "valid_date_mask": valid_date_mask,
-            "holdout_date_mask": holdout_date_mask,
-            "padded_date_mask": padded_date_mask,
-            "date_indices": date_indices,
-        }
-
-    def window(
-        self,
-        sample_date_idx: int,
-        asset_ids: np.ndarray,
-        split: Split,
-        lookback_days: int,
-    ) -> dict[str, np.ndarray]:
-        """Reconstruct a zero-filled dense window with every validity mask.
-
-        Values are gathered only for real source dates. Split permissions and
-        padded-asset masks are then applied to both values and feature-validity
-        masks, ensuring inaccessible values remain exactly zero.
-        """
-        masks = self.window_masks(sample_date_idx, asset_ids, split, lookback_days)
-        asset_ids = np.asarray(asset_ids, dtype=np.int64)
-        safe_asset_ids = np.where(masks["asset_slot_mask"], asset_ids, 0)
-
-        # [W, A, F_asset].
-        asset_x = np.zeros((lookback_days, len(asset_ids), self.asset_x.shape[2]), np.float32)
-        asset_feature_mask = np.zeros_like(asset_x, dtype=bool)
-        # [W, F_market].
-        market_x = np.zeros((lookback_days, self.market_x.shape[1]), np.float32)
-        market_feature_mask = np.zeros_like(market_x, dtype=bool)
-        # [W, F_macro].
-        macro_x = np.zeros((lookback_days, self.macro_x.shape[1]), np.float32)
-        macro_feature_mask = np.zeros_like(macro_x, dtype=bool)
-
-        real_slots = masks["date_indices"] >= 0
-        source_ids = masks["date_indices"][real_slots]
-        permission = self.permission_for(split)[source_ids]
-
-        # Gather only real dates, then clear values and masks the split cannot consume.
-        asset_x[real_slots] = self.asset_x[source_ids][:, safe_asset_ids]
-        asset_feature_mask[real_slots] = self.asset_feature_mask[source_ids][:, safe_asset_ids]
-        asset_x[real_slots] *= permission[:, None, None] & masks["asset_slot_mask"][None, :, None]
-        asset_feature_mask[real_slots] &= (
-            permission[:, None, None] & masks["asset_slot_mask"][None, :, None]
-        )
-        market_x[real_slots] = self.market_x[source_ids] * permission[:, None]
-        market_feature_mask[real_slots] = self.market_feature_mask[source_ids] & permission[:, None]
-        macro_x[real_slots] = self.macro_x[source_ids] * permission[:, None]
-        macro_feature_mask[real_slots] = self.macro_feature_mask[source_ids] & permission[:, None]
-        return {
-            **masks,
-            "asset_x": asset_x,
-            "asset_feature_mask": asset_feature_mask,
-            "market_x": market_x,
-            "market_feature_mask": market_feature_mask,
-            "macro_x": macro_x,
-            "macro_feature_mask": macro_feature_mask,
-        }
+        for split, selector in (
+            (
+                "train",
+                self._source_dates["sample_eligible"]
+                & self._source_dates["train_fact_allowed"],
+            ),
+            ("validation", self._source_dates["validation_sample"]),
+        ):
+            date_ids = self._source_dates.loc[selector, "date_idx"].to_numpy(dtype=np.int64)
+            valid_assets = getattr(self, f"{split}_valid_asset_mask")
+            frame = pd.DataFrame(
+                {
+                    "sample_date_idx": date_ids,
+                    "sample_date": self._source_dates.loc[selector, "date"].tolist(),
+                    "n_endpoint_valid_assets": valid_assets[date_ids].sum(axis=1).astype(np.int32),
+                    "validation_window_name": window_names.loc[selector]
+                    .fillna("")
+                    .astype(str)
+                    .tolist(),
+                }
+            )
+            frame.to_parquet(
+                cache_path / f"{split}_request_index.parquet",
+                index=False,
+                compression="zstd",
+            )

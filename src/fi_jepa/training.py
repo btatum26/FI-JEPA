@@ -20,7 +20,7 @@ from torch.optim import AdamW
 from tqdm.auto import tqdm
 import yaml
 
-from fi_jepa.dataloader import FIJepaDataConfig, FrozenPanelStore, build_fi_jepa_dataloader
+from fi_jepa.dataloader import DensePanelStore, FIJepaDataConfig, build_fi_jepa_dataloader
 from fi_jepa.model import ENCODER_BATCH_TENSOR_NAMES, JEPA_BATCH_TENSOR_NAMES, FIJepaModel
 from fi_jepa.model_config import FIJepaModelConfig
 from fi_jepa.model_output import FIJepaOutput
@@ -205,7 +205,7 @@ def _build_resolved_config(
     training_config: FIJepaTrainingConfig,
     model_config: FIJepaModelConfig,
     data_config: FIJepaDataConfig,
-    store: FrozenPanelStore,
+    store: DensePanelStore,
     *,
     device: torch.device,
     amp_dtype: torch.dtype | None,
@@ -498,6 +498,7 @@ def train_fi_jepa(
 
         data_values = dict(resolved_config["dataloader"])
         data_values["artifact_path"] = Path(data_values["artifact_path"])
+        data_values["cache_root"] = Path(data_values["cache_root"])
         data_config = FIJepaDataConfig(**data_values)
 
     else:
@@ -528,7 +529,7 @@ def train_fi_jepa(
     _seed_everything(data_config.seed)
 
     # build datastore and dataloaders
-    store = FrozenPanelStore(data_config.artifact_path)
+    store = DensePanelStore(data_config.artifact_path, cache_root=data_config.cache_root)
     train_loader = build_fi_jepa_dataloader(data_config, "train", store=store)
     validation_loader = build_fi_jepa_dataloader(data_config, "validation", store=store, shuffle=False)
     if len(train_loader) == 0 or len(validation_loader) == 0:

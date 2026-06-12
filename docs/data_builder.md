@@ -152,31 +152,39 @@ Zero-filled values are never considered valid observations.
 
 ## Runtime Dataloader
 
-`FrozenPanelStore` streams the sparse files into persistent dense NumPy memmaps.
-The cache lives beside, not inside, the immutable artifact under
-`.frozen_panel_store_cache/`. Completed caches are keyed by the artifact
-manifest and required-file metadata, then reopened read-only by the parent and
-spawned dataloader workers. Dense arrays are excluded from worker pickle state,
-so Windows workers map the same cache files instead of receiving copied arrays.
-`FIJepaWindowDataset` and `FIJepaEmbeddingDataset` return lightweight
-`WindowRequest` values containing only endpoint, split, view, and deterministic
-seed metadata. `FIJepaBatchAssembler` then:
+`DensePanelStore` converts each immutable sparse artifact into one split-specific
+dense panel cache:
 
-- Builds the batch date and asset index matrices.
-- Gathers 252-day asset, market, and macro windows once per batch.
-- Reapplies split permissions and pads variable asset panels.
-- Exposes patched tensors as views over the daily batch tensors.
-- Builds feature, date, asset, context, and target-eligibility masks.
-- Samples temporal JEPA targets for JEPA requests.
+```text
+data/cache/dense_panel/<artifact_build_id>_v<cache_format_version>/
+```
 
-`dataloader.assembly_mode: batched_gather` is the normal runtime path.
-`per_sample` retains the original per-window reconstruction path as a slow
-correctness reference while emitting the same model-facing batch contract.
-The default runtime also leaves `pin_memory` disabled because recursively
-pinning both retained daily tensors and their patched aliases costs more CPU
-time than it saves in this batch contract.
-`persistent_workers` remains disabled because the training dataset's epoch is
-updated in the parent process before each iterator is created.
+The cache stores normalized zero-filled values and their source validity masks
+at `[date, asset, feature]` or `[date, feature]`. Train and validation arrays
+are separate, so the runtime never applies split permissions or clears
+inaccessible values.
+
+On first parent-process load, the store prints whether it is checking, reusing,
+rebuilding, or publishing the cache. Reuse requires an exact manifest match for
+the cache format, source hashes, sparse-file metadata, array names, shapes, and
+dtypes. Cache publication is atomic and writes `manifest.json` last.
+
+Workers receive no dense arrays through pickle. They reopen only the completed
+`.npy` files using read-only memory maps; worker deserialization never validates,
+builds, repairs, deletes, or publishes a cache.
+
+The runtime request dataset contains only artifact-defined endpoint metadata.
+The batch assembler:
+
+- Selects a random fixed-K training view, deterministic fixed-K embedding view,
+  or the complete global asset axis.
+- Gathers values and stored masks through batch date/asset indices.
+- Reshapes gathered daily tensors into zero-copy patch views.
+- Aggregates daily validity into patch masks and samples temporal JEPA targets.
+- Fails loudly when a fixed-K or JEPA request is not viable.
+
+No dense windows or patches are cached. `persistent_workers` remains disabled
+because the training dataset's epoch is updated before each iterator is created.
 
 Target eligibility is split-relative:
 
@@ -202,9 +210,9 @@ those facts to training.
 - Train-only normalization.
 - Recorded JEPA target-policy metadata.
 
-`configs/dataloader.yaml` controls runtime assembly mode, reconstruction, asset
-sampling, patch validity thresholds, and temporal masking. Runtime settings are
-not baked into dense windows because no dense windows are stored.
+`configs/dataloader.yaml` controls the cache root, runtime lookback, asset views,
+patch validity thresholds, temporal masking, and PyTorch loader settings.
+Runtime settings are not baked into the dense panel cache.
 
 ## Implementation
 
@@ -215,8 +223,8 @@ not baked into dense windows because no dense windows are stored.
 | Train-only normalization | `dataset_pipeline.dataset_builder.normalization` |
 | Sparse Parquet export and quality checks | `dataset_pipeline.dataset_builder.export` |
 | Atomic immutable build orchestration | `dataset_pipeline.dataset_builder.builder` |
-| Runtime sparse-artifact loading | `fi_jepa.dataloader.panel_store` |
-| Runtime windows and asset views | `fi_jepa.dataloader.dataset` |
+| Dense panel cache construction/loading | `fi_jepa.dataloader.panel_store` |
+| Runtime requests and asset views | `fi_jepa.dataloader.dataset` |
 | Runtime patch and JEPA masks | `fi_jepa.dataloader.masking` |
 
 ## Tests

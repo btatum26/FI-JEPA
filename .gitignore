@@ -16,5 +16,6 @@ data/model_ready/
 data/probe_targets/
 data/quality_reports/
 data/catalog.duckdb
+data/cache/
 
 runs/

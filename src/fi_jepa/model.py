@@ -8,7 +8,7 @@ from torch import nn
 from torch.nn import functional as F
 
 if TYPE_CHECKING:
-    from fi_jepa.dataloader import FrozenPanelStore
+    from fi_jepa.dataloader import DensePanelStore
 
 from fi_jepa.model_config import FIJepaModelConfig
 from fi_jepa.model_output import FIJepaOutput
@@ -52,8 +52,8 @@ JEPA_BATCH_TENSOR_NAMES = frozenset(
 class FIJepaModel(nn.Module):
     """Configurable patch-tokenized variable-asset temporal FI-JEPA core model.
 
-    The model consumes the patched batch dictionary emitted by
-    ``FIJepaBatchAssembler`` or its compatibility collator. Shared tokenizers,
+    The model consumes the patched batch dictionary emitted by the dense-panel
+    dataloader. Shared tokenizers,
     asset pooling, and fusion are deterministic; the online temporal encoder
     and predictor may use dropout. The target temporal encoder is a frozen EMA
     copy that always evaluates the full valid patch sequence before target
@@ -194,8 +194,8 @@ class FIJepaModel(nn.Module):
         nn.init.normal_(self.target_mask_token, std=0.02)
 
     @classmethod
-    def from_store(cls, config: FIJepaModelConfig, store: FrozenPanelStore) -> FIJepaModel:
-        """Construct a model using the frozen artifact's feature manifest dimensions."""
+    def from_store(cls, config: FIJepaModelConfig, store: DensePanelStore) -> FIJepaModel:
+        """Construct a model using dense-cache feature-manifest dimensions."""
         return cls(
             config,
             asset_feature_dim=len(store.feature_names["asset"]),

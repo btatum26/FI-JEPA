@@ -89,7 +89,7 @@ def test_evaluate_checkpoint_overrides_only_runtime_batch_size(
     class FakeStore:
         """Expose only metadata required by on-demand checkpoint evaluation."""
 
-        def __init__(self, artifact_path: Path):
+        def __init__(self, artifact_path: Path, *, cache_root: Path):
             self.artifact_path = artifact_path
             self.dataset_version = "dataset-test"
 
@@ -117,7 +117,7 @@ def test_evaluate_checkpoint_overrides_only_runtime_batch_size(
         captured["data_config"] = data_config
 
     monkeypatch.setattr(representation_module.torch, "load", lambda *args, **kwargs: checkpoint)
-    monkeypatch.setattr(representation_module, "FrozenPanelStore", FakeStore)
+    monkeypatch.setattr(representation_module, "DensePanelStore", FakeStore)
     monkeypatch.setattr(representation_module, "FIJepaModel", FakeModel)
     monkeypatch.setattr(
         representation_module,

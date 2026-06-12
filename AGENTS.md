@@ -26,3 +26,4 @@
 - If a function is only used once, inline it unless extracting it materially improves readability.
 - Do not hide important logic behind layers of helper methods.
 - Helper functions are appropriate for mundane, repetitive tasks or behavior clearly described by a short function name.
+- Allow line lengths up to 130 char before splitting.

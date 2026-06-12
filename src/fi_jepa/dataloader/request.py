@@ -10,18 +10,13 @@ ViewKind = Literal["random_k", "all_valid", "fixed_k"]
 
 
 # ============================================================================
-# WINDOW REQUEST
+# DENSE PANEL REQUEST
 # ============================================================================
 
 
 @dataclass(frozen=True)
-class WindowRequest:
-    """Describe one runtime window without materializing any panel arrays.
-
-    The request carries only deterministic sampling inputs and metadata. Dense
-    values, selected asset IDs, patch masks, and JEPA masks are intentionally
-    deferred to the batch assembler.
-    """
+class DensePanelRequest:
+    """Carry only metadata required to gather one dense-panel window."""
 
     sample_date_idx: int
     sample_date: str
@@ -30,3 +25,5 @@ class WindowRequest:
     view_kind: ViewKind
     view_index: int
     seed: int
+    n_endpoint_valid_assets: int
+    validation_window_name: str

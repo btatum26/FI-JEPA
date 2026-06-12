@@ -14,7 +14,7 @@ from tqdm.auto import tqdm
 
 from fi_jepa.dataloader import (
     FIJepaDataConfig,
-    FrozenPanelStore,
+    DensePanelStore,
     build_fi_jepa_embedding_dataloader,
 )
 from fi_jepa.model import ENCODER_BATCH_TENSOR_NAMES, FIJepaModel
@@ -359,7 +359,7 @@ def _invariant_summary(report: dict[str, object]) -> dict[str, object]:
 
 def run_representation_evaluation(
     model: FIJepaModel,
-    store: FrozenPanelStore,
+    store: DensePanelStore,
     data_config: FIJepaDataConfig,
     *,
     device: torch.device,
@@ -552,10 +552,11 @@ def evaluate_checkpoint(
     model_config = FIJepaModelConfig(**resolved["model"])
     data_values = dict(resolved["dataloader"])
     data_values["artifact_path"] = Path(data_values["artifact_path"])
+    data_values["cache_root"] = Path(data_values["cache_root"])
     if batch_size is not None:
         data_values["validation_batch_size"] = batch_size
     data_config = FIJepaDataConfig(**data_values)
-    store = FrozenPanelStore(data_config.artifact_path)
+    store = DensePanelStore(data_config.artifact_path, cache_root=data_config.cache_root)
     model = FIJepaModel.from_store(model_config, store)
     model.load_state_dict(checkpoint["model"])
 

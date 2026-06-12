@@ -270,40 +270,29 @@ def test_build_model_dataset_migrates_legacy_hash_only_directory(tmp_path) -> No
 def test_jepa_target_eligibility_rejects_protected_padded_and_sparse_patches() -> None:
     valid_dates = np.array([True, True, True, False])
     valid_assets = np.ones((4, 4), dtype=bool)
-    clear = np.zeros(4, dtype=bool)
-    slots = np.ones(4, dtype=bool)
+    target_dates = np.ones(4, dtype=bool)
     rules = {
         "patch_len": 4,
         "min_valid_days_per_asset_patch": 1,
         "min_valid_dates_in_patch": 3,
         "min_valid_asset_fraction": 0.25,
-        "allow_holdout_targets": False,
     }
 
-    assert compute_patch_masks(valid_assets, valid_dates, clear, clear, slots, **rules)[
+    assert compute_patch_masks(valid_assets, valid_dates, target_dates, **rules)[
         "patch_target_eligible"
     ][0]
     assert not compute_patch_masks(
         valid_assets,
         valid_dates,
-        np.array([False, True, False, False]),
-        clear,
-        slots,
+        np.array([True, False, True, True]),
         **rules,
     )["patch_target_eligible"][0]
     assert not compute_patch_masks(
-        valid_assets,
-        valid_dates,
-        clear,
-        np.array([False, False, False, True]),
-        slots,
-        **rules,
+        valid_assets, np.array([True, False, False, True]), target_dates, **rules
     )["patch_target_eligible"][0]
     assert not compute_patch_masks(
         np.zeros((4, 4), dtype=bool),
         valid_dates,
-        clear,
-        clear,
-        slots,
+        target_dates,
         **rules,
     )["patch_target_eligible"][0]
