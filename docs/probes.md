@@ -32,8 +32,13 @@ not train `state_exporter`.
 ```bash
 uv run evaluate-fi-jepa \
   --checkpoint runs/pretraining/<run>/checkpoints/best_validation.pt \
-  --device auto
+  --device auto \
+  --batch-size 1
 ```
+
+`--batch-size` overrides the checkpoint's validation batch size for every
+representation-evaluation loader, including the all-valid train and validation
+passes. Lower it when those views exceed GPU memory.
 
 The evaluation artifact includes:
 

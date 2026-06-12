@@ -208,10 +208,13 @@ Export representation diagnostics and frozen embeddings from a checkpoint:
 ```bash
 uv run evaluate-fi-jepa \
   --checkpoint runs/pretraining/<run>/checkpoints/best_validation.pt \
-  --device auto
+  --device auto \
+  --batch-size 1
 ```
 
-Evaluation artifacts are written under `runs/evaluation/`.
+Evaluation artifacts are written under `runs/evaluation/`. `--batch-size`
+overrides the checkpoint's validation batch size for every representation
+loader and is useful when all-valid asset views exceed GPU memory.
 
 Export future probe targets from the canonical database:
 

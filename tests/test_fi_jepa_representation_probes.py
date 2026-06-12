@@ -1,13 +1,18 @@
 from __future__ import annotations
 
+from dataclasses import asdict
 import json
 from pathlib import Path
+import sys
 
 import duckdb
 import numpy as np
 import pandas as pd
 import pytest
 
+import fi_jepa.representation as representation_module
+from fi_jepa.dataloader import FIJepaDataConfig
+from fi_jepa.model_config import FIJepaModelConfig
 from fi_jepa.probes import export_probe_targets, run_frozen_probes
 from fi_jepa.representation import fit_pca_exporter, representation_diagnostics
 
@@ -51,6 +56,97 @@ def test_representation_diagnostics_report_rank_geometry_and_zero_norms() -> Non
     assert diagnostics["near_zero_norm_count"] == 1
     assert diagnostics["effective_rank"] == pytest.approx(2.0)
     assert diagnostics["pairwise_cosine"]["pair_count"] == 10
+
+
+# ============================================================================
+# ON-DEMAND EVALUATION OVERRIDES
+# ============================================================================
+
+
+def test_evaluate_checkpoint_overrides_only_runtime_batch_size(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Apply the CLI batch override without mutating checkpoint configuration."""
+    checkpoint_path = tmp_path / "checkpoint.pt"
+    checkpoint_path.write_bytes(b"checkpoint")
+    embedded_data_config = asdict(
+        FIJepaDataConfig(artifact_path=tmp_path / "artifact", validation_batch_size=16)
+    )
+    checkpoint = {
+        "format_version": 1,
+        "global_step": 7,
+        "model": {},
+        "resolved_config": {
+            "model": asdict(FIJepaModelConfig()),
+            "dataloader": embedded_data_config,
+            "training": {
+                "representation_pca_components": 8,
+                "representation_views_per_date": 3,
+            },
+        },
+    }
+
+    class FakeStore:
+        """Expose only metadata required by on-demand checkpoint evaluation."""
+
+        def __init__(self, artifact_path: Path):
+            self.artifact_path = artifact_path
+            self.dataset_version = "dataset-test"
+
+    class FakeModel:
+        """Capture model loading while avoiding a real evaluation allocation."""
+
+        @classmethod
+        def from_store(cls, model_config: FIJepaModelConfig, store: FakeStore) -> FakeModel:
+            return cls()
+
+        def load_state_dict(self, state: dict[str, object]) -> None:
+            return None
+
+        def to(self, device: object) -> FakeModel:
+            return self
+
+    captured: dict[str, object] = {}
+
+    def fake_run_representation_evaluation(
+        model: FakeModel,
+        store: FakeStore,
+        data_config: FIJepaDataConfig,
+        **kwargs: object,
+    ) -> None:
+        captured["data_config"] = data_config
+
+    monkeypatch.setattr(representation_module.torch, "load", lambda *args, **kwargs: checkpoint)
+    monkeypatch.setattr(representation_module, "FrozenPanelStore", FakeStore)
+    monkeypatch.setattr(representation_module, "FIJepaModel", FakeModel)
+    monkeypatch.setattr(
+        representation_module,
+        "run_representation_evaluation",
+        fake_run_representation_evaluation,
+    )
+
+    representation_module.evaluate_checkpoint(
+        checkpoint_path,
+        output_root=tmp_path / "evaluation",
+        device_name="cpu",
+        batch_size=1,
+    )
+
+    runtime_config = captured["data_config"]
+    assert isinstance(runtime_config, FIJepaDataConfig)
+    assert runtime_config.validation_batch_size == 1
+    assert checkpoint["resolved_config"]["dataloader"]["validation_batch_size"] == 16
+
+
+def test_evaluation_cli_parses_batch_size_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Expose the on-demand evaluation batch override through the CLI."""
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["evaluate-fi-jepa", "--checkpoint", "checkpoint.pt", "--batch-size", "2"],
+    )
+
+    assert representation_module.parse_args().batch_size == 2
 
 
 # ============================================================================

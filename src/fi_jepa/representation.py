@@ -538,14 +538,22 @@ def evaluate_checkpoint(
     output_root: Path = Path("runs/evaluation"),
     device_name: str = "auto",
     export_embeddings: bool = True,
+    batch_size: int | None = None,
 ) -> Path:
-    """Load one checkpoint and write an immutable representation evaluation artifact."""
+    """Load one checkpoint and write an immutable representation evaluation artifact.
+
+    ``batch_size`` overrides the checkpoint's validation batch size only for
+    this evaluation run. All embedding loaders use that value, including the
+    memory-heavy all-valid train and validation views.
+    """
     checkpoint_path = checkpoint_path.resolve()
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     resolved = checkpoint["resolved_config"]
     model_config = FIJepaModelConfig(**resolved["model"])
     data_values = dict(resolved["dataloader"])
     data_values["artifact_path"] = Path(data_values["artifact_path"])
+    if batch_size is not None:
+        data_values["validation_batch_size"] = batch_size
     data_config = FIJepaDataConfig(**data_values)
     store = FrozenPanelStore(data_config.artifact_path)
     model = FIJepaModel.from_store(model_config, store)
@@ -592,6 +600,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--output-root", type=Path, default=Path("runs/evaluation"))
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        help="Override the checkpoint batch size for all representation-evaluation loaders.",
+    )
     parser.add_argument("--no-embeddings", action="store_true")
     return parser.parse_args()
 
@@ -604,6 +617,7 @@ def main() -> None:
         output_root=args.output_root,
         device_name=args.device,
         export_embeddings=not args.no_embeddings,
+        batch_size=args.batch_size,
     )
 
 
