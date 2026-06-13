@@ -93,15 +93,9 @@ class FIJepaModel(nn.Module):
         # Each tokenizer maps one stream-specific patch to its configured token
         # width before the three streams are combined.
         if config.tokenizer_type == "mean":
-            self.asset_tokenizer = MaskedPatchTokenizer(
-                asset_feature_dim, config.asset_hidden_dim, config.asset_token_dim
-            )
-            self.market_tokenizer = MaskedPatchTokenizer(
-                market_feature_dim, config.market_hidden_dim, config.market_token_dim
-            )
-            self.macro_tokenizer = MaskedPatchTokenizer(
-                macro_feature_dim, config.macro_hidden_dim, config.macro_token_dim
-            )
+            self.asset_tokenizer = MaskedPatchTokenizer(asset_feature_dim, config.asset_hidden_dim, config.asset_token_dim)
+            self.market_tokenizer = MaskedPatchTokenizer(market_feature_dim, config.market_hidden_dim, config.market_token_dim)
+            self.macro_tokenizer = MaskedPatchTokenizer(macro_feature_dim, config.macro_hidden_dim, config.macro_token_dim)
         else:
             attention_kwargs = {
                 "layers": config.tokenizer_layers,
@@ -159,9 +153,7 @@ class FIJepaModel(nn.Module):
             batch_first=True,
             norm_first=True,
         )
-        self.context_encoder = nn.TransformerEncoder(
-            context_layer, num_layers=config.context_layers, enable_nested_tensor=False
-        )
+        self.context_encoder = nn.TransformerEncoder(context_layer, num_layers=config.context_layers, enable_nested_tensor=False)
         # The target encoder starts as an exact online-encoder copy and remains
         # gradient-free; training code advances it only through EMA updates.
         self.target_encoder = deepcopy(self.context_encoder)
@@ -475,20 +467,14 @@ class FIJepaModel(nn.Module):
         positioned_tokens = fused_tokens + self.patch_position_embedding.unsqueeze(0)  # [B, P, D].
 
         # [B, P, D] -> [B, C, D], removing masked targets and invalid patches.
-        context_tokens, context_mask = pack_masked_sequence(
-            positioned_tokens, tensors["jepa_context_mask"]
-        )
-        context_encoded = self.context_encoder(
-            context_tokens, src_key_padding_mask=~context_mask
-        )  # [B, C, D].
+        context_tokens, context_mask = pack_masked_sequence(positioned_tokens, tensors["jepa_context_mask"])
+        context_encoded = self.context_encoder(context_tokens, src_key_padding_mask=~context_mask)  # [B, C, D].
 
         patch_context = tensors["patch_context_mask"]
         self.target_encoder.eval()
         with torch.no_grad():
             # The EMA branch encodes the full valid sequence: [B, P, D].
-            target_full = self.target_encoder(
-                positioned_tokens.detach(), src_key_padding_mask=~patch_context
-            )
+            target_full = self.target_encoder(positioned_tokens.detach(), src_key_padding_mask=~patch_context)
 
         target_ids = tensors["target_patch_ids"]
         target_mask = tensors["target_patch_id_mask"]

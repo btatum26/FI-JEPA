@@ -8,7 +8,7 @@ import torch
 from fi_jepa.dataloader.config import FIJepaDataConfig
 from fi_jepa.dataloader.masking import compute_batched_patch_masks, sample_jepa_target_mask
 from fi_jepa.dataloader.panel_store import DensePanelStore
-from fi_jepa.dataloader.request import DensePanelRequest
+from fi_jepa.dataloader.request import DensePanelWindowRequest
 
 
 # ============================================================================
@@ -23,7 +23,7 @@ class DensePanelBatchAssembler:
         self.store = store
         self.config = config
 
-    def __call__(self, requests: list[DensePanelRequest]) -> dict[str, object]:
+    def __call__(self, requests: list[DensePanelWindowRequest]) -> dict[str, object]:
         """Gather one homogeneous request batch and derive patch/JEPA masks."""
         self._validate_requests(requests)
         selected_assets = [self._select_asset_ids(request) for request in requests]
@@ -178,12 +178,14 @@ class DensePanelBatchAssembler:
             batch.update(self._sample_jepa_masks(requests, patch_masks))
         return batch
 
-    def _validate_requests(self, requests: list[DensePanelRequest]) -> None:
+    def _validate_requests(self, requests: list[DensePanelWindowRequest]) -> None:
         """Require one non-empty homogeneous request batch."""
         if not requests:
             raise ValueError("Cannot assemble an empty dense panel request list.")
-        if not all(isinstance(request, DensePanelRequest) for request in requests):
-            raise TypeError("DensePanelBatchAssembler accepts only DensePanelRequest values.")
+        if not all(isinstance(request, DensePanelWindowRequest) for request in requests):
+            raise TypeError(
+                "DensePanelBatchAssembler accepts only DensePanelWindowRequest values."
+            )
         first = requests[0]
         for request in requests[1:]:
             if (
@@ -193,7 +195,7 @@ class DensePanelBatchAssembler:
             ):
                 raise ValueError("Dense panel request batches must be homogeneous.")
 
-    def _select_asset_ids(self, request: DensePanelRequest) -> np.ndarray:
+    def _select_asset_ids(self, request: DensePanelWindowRequest) -> np.ndarray:
         """Select the global axis, a random K view, or a deterministic fixed-K view."""
         if request.view_kind == "all_valid":
             return np.arange(self.store.asset_count, dtype=np.int64)
@@ -230,7 +232,7 @@ class DensePanelBatchAssembler:
 
     def _sample_jepa_masks(
         self,
-        requests: list[DensePanelRequest],
+        requests: list[DensePanelWindowRequest],
         patch_masks: dict[str, np.ndarray],
     ) -> dict[str, torch.Tensor]:
         """Sample deterministic JEPA targets and pad only target-ID metadata."""

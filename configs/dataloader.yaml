@@ -16,7 +16,7 @@ min_valid_asset_fraction: 0.25
 
 batch_size: 32
 validation_batch_size: 16
-num_workers: 4
+num_workers: 0
 pin_memory: false
 drop_last: false
 

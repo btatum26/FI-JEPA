@@ -287,7 +287,33 @@ def test_random_k_changes_by_epoch_and_fixed_k_is_deterministic(tmp_path: Path) 
     assert fixed_first["patch_context_mask"][:, -1].all()
 
 
-def test_fixed_k_and_invalid_jepa_views_fail_loudly(tmp_path: Path) -> None:
+def test_structurally_invalid_jepa_endpoints_are_filtered(tmp_path: Path) -> None:
+    config = _write_sparse_artifact(tmp_path / "artifact")
+    path = config.artifact_path / "train_asset_features.parquet"
+    facts = pd.read_parquet(path)
+    facts = facts.loc[
+        ~facts["asset_id"].eq(3) | facts["date_idx"].isin([3, 5, 7])
+    ]
+    facts.to_parquet(path, index=False)
+    (config.artifact_path / "manifest.json").write_text(
+        json.dumps({"build_id": "structurally-invalid-build"}), encoding="utf-8"
+    )
+    store = DensePanelStore(config.artifact_path, cache_root=config.cache_root)
+    impossible = FIJepaDataConfig(
+        **{
+            **config.__dict__,
+            "min_valid_days_per_asset_patch": 2,
+            "min_valid_asset_fraction": 1.0,
+        }
+    )
+    loader = build_fi_jepa_dataloader(impossible, "train", store=store, shuffle=False)
+
+    assert loader.dataset.nominal_request_count == 3
+    assert loader.dataset.dropped_request_count == 3
+    assert loader.dataset.request_index.empty
+
+
+def test_fixed_k_and_selected_jepa_views_fail_loudly(tmp_path: Path) -> None:
     config = _write_sparse_artifact(tmp_path / "artifact")
     store = DensePanelStore(config.artifact_path, cache_root=config.cache_root)
     too_wide = FIJepaDataConfig(**{**config.__dict__, "fixed_k_assets": 4})
@@ -297,32 +323,38 @@ def test_fixed_k_and_invalid_jepa_views_fail_loudly(tmp_path: Path) -> None:
     with pytest.raises(RuntimeError, match="n_endpoint_valid_assets=3"):
         next(iter(loader))
 
-    invalid_config = _write_sparse_artifact(tmp_path / "invalid_artifact")
-    path = invalid_config.artifact_path / "train_asset_features.parquet"
+    selected_view_config = _write_sparse_artifact(tmp_path / "selected_view_artifact")
+    first_seed = np.random.SeedSequence(
+        [selected_view_config.seed, 3, 0, 0]
+    ).generate_state(1, dtype=np.uint64)[0]
+    selected_asset = int(
+        np.random.default_rng(first_seed).choice(np.arange(4), size=1)[0]
+    )
+    path = selected_view_config.artifact_path / "train_asset_features.parquet"
     facts = pd.read_parquet(path)
     facts = facts.loc[
-        ~facts["asset_id"].eq(3) | facts["date_idx"].isin([3, 5, 7])
+        ~facts["asset_id"].eq(selected_asset) | facts["date_idx"].isin([3, 5, 7])
     ]
     facts.to_parquet(path, index=False)
-    (invalid_config.artifact_path / "manifest.json").write_text(
-        json.dumps({"build_id": "invalid-view-build"}), encoding="utf-8"
+    (selected_view_config.artifact_path / "manifest.json").write_text(
+        json.dumps({"build_id": "selected-view-build"}), encoding="utf-8"
     )
-    invalid_store = DensePanelStore(
-        invalid_config.artifact_path, cache_root=invalid_config.cache_root
+    selected_view_store = DensePanelStore(
+        selected_view_config.artifact_path, cache_root=selected_view_config.cache_root
     )
-    impossible = FIJepaDataConfig(
+    selected_view_invalid = FIJepaDataConfig(
         **{
-            **invalid_config.__dict__,
-            "train_k_assets": 4,
+            **selected_view_config.__dict__,
+            "train_k_assets": 1,
             "min_valid_days_per_asset_patch": 2,
-            "min_valid_asset_fraction": 1.0,
+            "min_valid_asset_fraction": 0.5,
         }
     )
     loader = build_fi_jepa_dataloader(
-        impossible, "train", store=invalid_store, shuffle=False
+        selected_view_invalid, "train", store=selected_view_store, shuffle=False
     )
     with pytest.raises(RuntimeError, match="Selected JEPA view is not viable"):
-        list(loader)
+        next(iter(loader))
 
 
 def test_worker_loader_matches_serial_across_repeated_iterators(tmp_path: Path) -> None:

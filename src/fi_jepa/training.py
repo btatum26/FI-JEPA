@@ -5,7 +5,6 @@ from contextlib import nullcontext
 from dataclasses import asdict, replace
 from datetime import datetime, timezone
 import json
-import math
 import os
 from pathlib import Path
 import random
@@ -30,129 +29,15 @@ from fi_jepa.representation import (
     run_representation_evaluation,
 )
 from fi_jepa.training_config import FIJepaTrainingConfig
+from fi_jepa.training_profiler import (
+    TimingRecord,
+    append_runtime_timing_to_profile_summary,
+    build_training_profiler,
+    profile_range,
+    write_runtime_timing_summary,
+)
 
-
-# ============================================================================
-# STEP SCHEDULES
-# ============================================================================
-
-
-class WarmupCosineLRSchedule:
-    """Warm one AdamW learning rate linearly, then decay it with cosine.
-
-    The schedule is indexed by successful optimizer steps. Calls beyond the
-    originally planned run clamp to ``min_lr``, which keeps replayed batches
-    after a basic epoch resume from extending the cosine curve.
-    """
-
-    def __init__(
-        self,
-        optimizer: AdamW,
-        *,
-        base_lr: float,
-        min_lr: float,
-        warmup_steps: int,
-        total_steps: int,
-    ):
-        if not 0 <= warmup_steps < total_steps:
-            raise ValueError("warmup_steps must be in [0, total_steps).")
-        if not 0.0 <= min_lr <= base_lr:
-            raise ValueError("Learning rates must satisfy 0 <= min_lr <= base_lr.")
-        self.optimizer = optimizer
-        self.base_lr = base_lr
-        self.min_lr = min_lr
-        self.warmup_steps = warmup_steps
-        self.total_steps = total_steps
-        self.last_step = -1
-
-    def value_at(self, step: int) -> float:
-        """Return the clamped learning rate for a zero-based optimizer step."""
-        if step < 0:
-            raise ValueError("Schedule step cannot be negative.")
-        if step >= self.total_steps:
-            return self.min_lr
-        if self.warmup_steps and step < self.warmup_steps:
-            return self.base_lr * float(step + 1) / float(self.warmup_steps)
-
-        decay_steps = self.total_steps - self.warmup_steps
-        if decay_steps <= 1:
-            return self.min_lr
-        progress = float(step - self.warmup_steps) / float(decay_steps - 1)
-        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
-        return self.min_lr + (self.base_lr - self.min_lr) * cosine
-
-    def apply(self, step: int, *, commit: bool) -> float:
-        """Apply one step's LR, optionally recording that the step succeeded."""
-        value = self.value_at(step)
-        for group in self.optimizer.param_groups:
-            group["lr"] = value
-        if commit:
-            self.last_step = step
-        return value
-
-    def state_dict(self) -> dict[str, int | float]:
-        """Return the complete schedule state stored in checkpoints."""
-        return {
-            "base_lr": self.base_lr,
-            "min_lr": self.min_lr,
-            "warmup_steps": self.warmup_steps,
-            "total_steps": self.total_steps,
-            "last_step": self.last_step,
-        }
-
-    def load_state_dict(self, state: dict[str, int | float]) -> None:
-        """Restore state while rejecting a schedule with different bounds."""
-        expected = self.state_dict()
-        for name in ("base_lr", "min_lr", "warmup_steps", "total_steps"):
-            if state[name] != expected[name]:
-                raise ValueError(f"Checkpoint LR schedule disagrees on {name}.")
-        self.last_step = int(state["last_step"])
-
-
-class LinearEMAMomentumSchedule:
-    """Increase target-encoder EMA momentum linearly by optimizer step."""
-
-    def __init__(self, *, start: float, end: float, total_steps: int):
-        if not 0.0 <= start <= end <= 1.0:
-            raise ValueError("EMA momentum must satisfy 0 <= start <= end <= 1.")
-        if total_steps <= 0:
-            raise ValueError("total_steps must be positive.")
-        self.start = start
-        self.end = end
-        self.total_steps = total_steps
-        self.last_step = -1
-
-    def value_at(self, step: int) -> float:
-        """Return momentum for a zero-based step, clamped at the final value."""
-        if step < 0:
-            raise ValueError("Schedule step cannot be negative.")
-        if self.total_steps == 1 or step >= self.total_steps - 1:
-            return self.end
-        progress = float(step) / float(self.total_steps - 1)
-        return self.start + (self.end - self.start) * progress
-
-    def commit(self, step: int) -> float:
-        """Record one successful EMA update and return its momentum."""
-        value = self.value_at(step)
-        self.last_step = step
-        return value
-
-    def state_dict(self) -> dict[str, int | float]:
-        """Return the complete schedule state stored in checkpoints."""
-        return {
-            "start": self.start,
-            "end": self.end,
-            "total_steps": self.total_steps,
-            "last_step": self.last_step,
-        }
-
-    def load_state_dict(self, state: dict[str, int | float]) -> None:
-        """Restore state while rejecting a schedule with different bounds."""
-        expected = self.state_dict()
-        for name in ("start", "end", "total_steps"):
-            if state[name] != expected[name]:
-                raise ValueError(f"Checkpoint EMA schedule disagrees on {name}.")
-        self.last_step = int(state["last_step"])
+from fi_jepa.schedulers import WarmupCosineLRSchedule, LinearEMAMomentumSchedule
 
 
 # ============================================================================
@@ -477,13 +362,24 @@ def train_fi_jepa(
     *,
     resume: Path | str | None = None,
     device_override: str | None = None,
+    profile: bool = False,
+    profile_wait_steps: int = 5,
+    profile_warmup_steps: int = 5,
+    profile_active_steps: int = 20,
+    profile_python_stacks: bool = False,
 ) -> Path:
     """Run or resume FI-JEPA pretraining and return its self-contained run folder.
 
     Periodic checkpoints resume from the beginning of their saved epoch.
     Epoch-end and best-validation checkpoints resume from the following epoch.
     No batch cursor, sampler state, or processed-batch list is stored.
+    Profiling runs are bounded, non-resumable, and skip validation/checkpoints.
     """
+    if profile and resume is not None:
+        raise ValueError("Profiling runs cannot resume an existing run.")
+    if profile_wait_steps < 0 or profile_warmup_steps < 0 or profile_active_steps <= 0:
+        raise ValueError("Profiler steps require wait >= 0, warmup >= 0, and active > 0.")
+
     checkpoint: dict[str, Any] | None = None
     if resume is not None:
         # Resume training from an existing checkpoint, ignoring any provided config. The
@@ -538,6 +434,11 @@ def train_fi_jepa(
     model = FIJepaModel.from_store(model_config, store).to(device)
     optimizer = build_adamw(model, training_config)
     total_steps = len(train_loader) * training_config.epochs
+    profiler_steps = profile_wait_steps + profile_warmup_steps + profile_active_steps
+    if profile and total_steps < profiler_steps:
+        raise ValueError(
+            f"Profiler requires {profiler_steps} training steps, but this run only has {total_steps}."
+        )
     lr_schedule = WarmupCosineLRSchedule(
         optimizer,
         base_lr=training_config.lr,
@@ -620,6 +521,22 @@ def train_fi_jepa(
     checkpoints_dir = run_dir / "checkpoints"
     checkpoints_dir.mkdir(exist_ok=True)
     log_path = run_dir / "train_log.jsonl"
+    runtime_summary_path = run_dir / "runtime_summary.txt"
+    warmup_timing_records: list[TimingRecord] = []
+    boundary_timing_records: list[TimingRecord] = []
+    profiler_dir = run_dir / "profiler"
+    training_profiler = (
+        build_training_profiler(
+            profiler_dir,
+            device,
+            wait_steps=profile_wait_steps,
+            warmup_steps=profile_warmup_steps,
+            active_steps=profile_active_steps,
+            python_stacks=profile_python_stacks,
+        )
+        if profile
+        else None
+    )
     print(f"FI-JEPA run: {run_dir}")
     print(
         "Training plan: "
@@ -629,13 +546,62 @@ def train_fi_jepa(
         f"validation_samples={len(validation_loader.dataset)} | "
         f"validation_batches={len(validation_loader)}"
     )
+    if training_profiler is not None:
+        print(
+            "Profiler plan: "
+            f"wait_steps={profile_wait_steps} | warmup_steps={profile_warmup_steps} | "
+            f"active_steps={profile_active_steps} | python_stacks={profile_python_stacks} | "
+            f"output={profiler_dir}"
+        )
+        training_profiler.start()
 
+    profile_complete = False
+    profiled_steps = 0
     for epoch in range(start_epoch, training_config.epochs):
+        epoch_warmup_started = time.perf_counter()
         dataset = train_loader.dataset
         if not hasattr(dataset, "set_epoch"):
             raise TypeError("FI-JEPA training dataset must implement set_epoch(epoch).")
-        dataset.set_epoch(epoch)
-        model.train()
+        dataset_update_started = time.perf_counter()
+        with profile_range("epoch_warmup.dataset_epoch_update", enabled=training_profiler is not None):
+            dataset.set_epoch(epoch)
+            model.train()
+        dataset_epoch_update_seconds = time.perf_counter() - dataset_update_started
+        print(f"Starting epoch {epoch + 1}/{training_config.epochs}: creating training iterator.")
+        iterator_started = time.perf_counter()
+        with profile_range(
+            "epoch_warmup.dataloader_iterator_startup",
+            enabled=training_profiler is not None,
+        ):
+            train_iterator = iter(train_loader)
+        dataloader_iterator_startup_seconds = time.perf_counter() - iterator_started
+        warmup_record: TimingRecord = {
+            "epoch": epoch,
+            "dataset_epoch_update_seconds": dataset_epoch_update_seconds,
+            "dataloader_iterator_startup_seconds": dataloader_iterator_startup_seconds,
+            "total_seconds": time.perf_counter() - epoch_warmup_started,
+        }
+        warmup_timing_records.append(warmup_record)
+        _append_jsonl(
+            log_path,
+            {
+                "event": "epoch_warmup",
+                "timestamp": _utc_timestamp(),
+                "step": global_step,
+                **warmup_record,
+            },
+        )
+        write_runtime_timing_summary(
+            runtime_summary_path,
+            warmup_timing_records,
+            boundary_timing_records,
+        )
+        print(
+            "Epoch warm-up: "
+            f"dataset_epoch_update={dataset_epoch_update_seconds:.3f}s | "
+            f"dataloader_iterator_startup={dataloader_iterator_startup_seconds:.3f}s | "
+            f"total={float(warmup_record['total_seconds']):.3f}s"
+        )
 
         interval_start = time.perf_counter()
         interval_samples = 0
@@ -649,14 +615,17 @@ def train_fi_jepa(
             "masked_patch_count_mean": 0.0,
         }
         progress = tqdm(
-            train_loader,
+            range(len(train_loader)),
             desc=f"Epoch {epoch + 1}/{training_config.epochs} [{device}]",
             total=len(train_loader),
             unit="step",
             dynamic_ncols=True,
         )
-        for batch_index, cpu_batch in enumerate(progress):
-            batch = _move_batch(cpu_batch, device)
+        for batch_index in progress:
+            with profile_range("next_batch_cpu", enabled=training_profiler is not None):
+                cpu_batch = next(train_iterator)
+            with profile_range("move_batch_to_device", enabled=training_profiler is not None):
+                batch = _move_batch(cpu_batch, device)
             step_index = global_step
             learning_rate = lr_schedule.apply(step_index, commit=False)
             ema_momentum = ema_schedule.value_at(step_index)
@@ -667,26 +636,28 @@ def train_fi_jepa(
                 if amp_dtype is not None
                 else nullcontext()
             )
-            with autocast:
-                output = model(batch)
+            with profile_range("forward_and_loss", enabled=training_profiler is not None):
+                with autocast:
+                    output = model(batch)
 
-            if scaler.is_enabled():
-                scaler.scale(output.loss).backward()
-                scaler.unscale_(optimizer)
-                gradient_norm = nn.utils.clip_grad_norm_(
-                    model.parameters(), training_config.grad_clip_norm
-                )
-                old_scale = scaler.get_scale()
-                scaler.step(optimizer)
-                scaler.update()
-                step_succeeded = scaler.get_scale() >= old_scale
-            else:
-                output.loss.backward()
-                gradient_norm = nn.utils.clip_grad_norm_(
-                    model.parameters(), training_config.grad_clip_norm
-                )
-                optimizer.step()
-                step_succeeded = True
+            with profile_range("backward_and_optimizer", enabled=training_profiler is not None):
+                if scaler.is_enabled():
+                    scaler.scale(output.loss).backward()
+                    scaler.unscale_(optimizer)
+                    gradient_norm = nn.utils.clip_grad_norm_(
+                        model.parameters(), training_config.grad_clip_norm
+                    )
+                    old_scale = scaler.get_scale()
+                    scaler.step(optimizer)
+                    scaler.update()
+                    step_succeeded = scaler.get_scale() >= old_scale
+                else:
+                    output.loss.backward()
+                    gradient_norm = nn.utils.clip_grad_norm_(
+                        model.parameters(), training_config.grad_clip_norm
+                    )
+                    optimizer.step()
+                    step_succeeded = True
 
             if not step_succeeded:
                 _append_jsonl(
@@ -698,12 +669,19 @@ def train_fi_jepa(
                         "step": global_step,
                     },
                 )
+                if training_profiler is not None:
+                    training_profiler.step()
+                    profiled_steps += 1
+                    profile_complete = profiled_steps >= profiler_steps
+                if profile_complete:
+                    break
                 continue
 
-            lr_schedule.apply(step_index, commit=True)
-            ema_momentum = ema_schedule.commit(step_index)
-            model.update_target_encoder(ema_momentum)
-            global_step += 1
+            with profile_range("ema_update", enabled=training_profiler is not None):
+                lr_schedule.apply(step_index, commit=True)
+                ema_momentum = ema_schedule.commit(step_index)
+                model.update_target_encoder(ema_momentum)
+                global_step += 1
 
             batch_targets = int(output.target_patch_mask.sum().item())
             batch_samples = int(output.target_patch_mask.shape[0])
@@ -762,7 +740,7 @@ def train_fi_jepa(
                 interval_gradient_norm = 0.0
                 interval_successful_steps = 0
                 interval_metrics = {name: 0.0 for name in interval_metrics}
-            if global_step % training_config.checkpoint_every_steps == 0:
+            if training_profiler is None and global_step % training_config.checkpoint_every_steps == 0:
                 state = _checkpoint_state(
                     kind="periodic",
                     model=model,
@@ -783,9 +761,28 @@ def train_fi_jepa(
                     _write_checkpoint(periodic_path, state)
                 _write_checkpoint(checkpoints_dir / "latest.pt", state)
 
+            if training_profiler is not None:
+                training_profiler.step()
+                profiled_steps += 1
+                profile_complete = profiled_steps >= profiler_steps
+            if profile_complete:
+                break
+
+        if training_profiler is not None:
+            if profile_complete:
+                break
+            continue
+
+        epoch_boundary_started = time.perf_counter()
+        validation_seconds = 0.0
+        representation_evaluation_seconds = 0.0
+        best_checkpoint_seconds = 0.0
         should_validate = (epoch + 1) % training_config.validation_every_epochs == 0
         if should_validate:
-            validation_metrics = validate_jepa(model, validation_loader, device, amp_dtype)
+            validation_started = time.perf_counter()
+            with profile_range("epoch_boundary.validation", enabled=training_profiler is not None):
+                validation_metrics = validate_jepa(model, validation_loader, device, amp_dtype)
+            validation_seconds = time.perf_counter() - validation_started
             representation_result: dict[str, object] | None = None
             should_evaluate_representations = (
                 training_config.representation_evaluation_enabled
@@ -798,25 +795,31 @@ def train_fi_jepa(
                 checkpoint_id = (
                     f"step_{global_step:09d}_{model_state_hash(model)[:12]}"
                 )
-                representation_result = run_representation_evaluation(
-                    model,
-                    store,
-                    data_config,
-                    device=device,
-                    amp_dtype=amp_dtype,
-                    n_components=training_config.representation_pca_components,
-                    views_per_date=training_config.representation_views_per_date,
-                    output_dir=(
-                        run_dir
-                        / "representation_diagnostics"
-                        / f"step_{global_step:09d}"
-                    ),
-                    checkpoint_id=checkpoint_id,
-                    checkpoint_step=global_step,
-                    checkpoint_format_version=1,
-                    model_version=canonical_version_hash(resolved_config["model"]),
-                    export_embeddings=training_config.representation_export_embeddings,
-                )
+                representation_started = time.perf_counter()
+                with profile_range(
+                    "epoch_boundary.representation_evaluation",
+                    enabled=training_profiler is not None,
+                ):
+                    representation_result = run_representation_evaluation(
+                        model,
+                        store,
+                        data_config,
+                        device=device,
+                        amp_dtype=amp_dtype,
+                        n_components=training_config.representation_pca_components,
+                        views_per_date=training_config.representation_views_per_date,
+                        output_dir=(
+                            run_dir
+                            / "representation_diagnostics"
+                            / f"step_{global_step:09d}"
+                        ),
+                        checkpoint_id=checkpoint_id,
+                        checkpoint_step=global_step,
+                        checkpoint_format_version=1,
+                        model_version=canonical_version_hash(resolved_config["model"]),
+                        export_embeddings=training_config.representation_export_embeddings,
+                    )
+                representation_evaluation_seconds = time.perf_counter() - representation_started
             _append_jsonl(
                 log_path,
                 {
@@ -837,34 +840,86 @@ def train_fi_jepa(
                 or validation_metrics["validation_jepa_loss"] < best_validation_loss
             ):
                 best_validation_loss = validation_metrics["validation_jepa_loss"]
-                best_state = _checkpoint_state(
-                    kind="epoch_end",
-                    model=model,
-                    optimizer=optimizer,
-                    lr_schedule=lr_schedule,
-                    ema_schedule=ema_schedule,
-                    scaler=scaler,
-                    resume_epoch=epoch + 1,
-                    global_step=global_step,
-                    best_validation_loss=best_validation_loss,
-                    resolved_config=resolved_config,
-                )
-                _write_checkpoint(checkpoints_dir / "best_validation.pt", best_state)
+                best_checkpoint_started = time.perf_counter()
+                with profile_range(
+                    "epoch_boundary.best_checkpoint",
+                    enabled=training_profiler is not None,
+                ):
+                    best_state = _checkpoint_state(
+                        kind="epoch_end",
+                        model=model,
+                        optimizer=optimizer,
+                        lr_schedule=lr_schedule,
+                        ema_schedule=ema_schedule,
+                        scaler=scaler,
+                        resume_epoch=epoch + 1,
+                        global_step=global_step,
+                        best_validation_loss=best_validation_loss,
+                        resolved_config=resolved_config,
+                    )
+                    _write_checkpoint(checkpoints_dir / "best_validation.pt", best_state)
+                best_checkpoint_seconds = time.perf_counter() - best_checkpoint_started
 
-        latest_state = _checkpoint_state(
-            kind="epoch_end",
-            model=model,
-            optimizer=optimizer,
-            lr_schedule=lr_schedule,
-            ema_schedule=ema_schedule,
-            scaler=scaler,
-            resume_epoch=epoch + 1,
-            global_step=global_step,
-            best_validation_loss=best_validation_loss,
-            resolved_config=resolved_config,
+        latest_checkpoint_started = time.perf_counter()
+        with profile_range("epoch_boundary.latest_checkpoint", enabled=training_profiler is not None):
+            latest_state = _checkpoint_state(
+                kind="epoch_end",
+                model=model,
+                optimizer=optimizer,
+                lr_schedule=lr_schedule,
+                ema_schedule=ema_schedule,
+                scaler=scaler,
+                resume_epoch=epoch + 1,
+                global_step=global_step,
+                best_validation_loss=best_validation_loss,
+                resolved_config=resolved_config,
+            )
+            _write_checkpoint(checkpoints_dir / "latest.pt", latest_state)
+        latest_checkpoint_seconds = time.perf_counter() - latest_checkpoint_started
+        boundary_record: TimingRecord = {
+            "epoch": epoch,
+            "validation_seconds": validation_seconds,
+            "representation_evaluation_seconds": representation_evaluation_seconds,
+            "best_checkpoint_seconds": best_checkpoint_seconds,
+            "latest_checkpoint_seconds": latest_checkpoint_seconds,
+            "total_seconds": time.perf_counter() - epoch_boundary_started,
+        }
+        boundary_timing_records.append(boundary_record)
+        _append_jsonl(
+            log_path,
+            {
+                "event": "epoch_boundary",
+                "timestamp": _utc_timestamp(),
+                "step": global_step,
+                **boundary_record,
+            },
         )
-        _write_checkpoint(checkpoints_dir / "latest.pt", latest_state)
+        write_runtime_timing_summary(
+            runtime_summary_path,
+            warmup_timing_records,
+            boundary_timing_records,
+        )
+        print(
+            "Epoch boundary: "
+            f"validation={validation_seconds:.3f}s | "
+            f"representation_evaluation={representation_evaluation_seconds:.3f}s | "
+            f"best_checkpoint={best_checkpoint_seconds:.3f}s | "
+            f"latest_checkpoint={latest_checkpoint_seconds:.3f}s | "
+            f"total={float(boundary_record['total_seconds']):.3f}s"
+        )
         print(f"Completed epoch {epoch + 1}/{training_config.epochs} at step {global_step}.")
+
+    if training_profiler is not None:
+        training_profiler.stop()
+        append_runtime_timing_to_profile_summary(
+            profiler_dir / "summary.txt",
+            runtime_summary_path,
+        )
+        append_runtime_timing_to_profile_summary(
+            profiler_dir / "cpu_summary.txt",
+            runtime_summary_path,
+        )
+        print(f"Profiler capture complete after {profiled_steps} steps: {profiler_dir}")
 
     return run_dir
 
@@ -889,13 +944,50 @@ def parse_args() -> argparse.Namespace:
         help="Existing run directory or checkpoint. Its resolved config is authoritative.",
     )
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), help="Override run device.")
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="Capture a bounded training-only PyTorch profiler trace, then stop.",
+    )
+    parser.add_argument(
+        "--profile-wait-steps",
+        type=int,
+        default=5,
+        help="Unrecorded profiler steps before warmup.",
+    )
+    parser.add_argument(
+        "--profile-warmup-steps",
+        type=int,
+        default=5,
+        help="Profiler warmup steps before trace capture.",
+    )
+    parser.add_argument(
+        "--profile-active-steps",
+        type=int,
+        default=20,
+        help="Training steps recorded in the profiler trace.",
+    )
+    parser.add_argument(
+        "--profile-python-stacks",
+        action="store_true",
+        help="Record Python stacks and write profiler/cpu_stacks.txt; adds substantial overhead.",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     """Run the FI-JEPA pretraining CLI."""
     args = parse_args()
-    train_fi_jepa(args.config, resume=args.resume, device_override=args.device)
+    train_fi_jepa(
+        args.config,
+        resume=args.resume,
+        device_override=args.device,
+        profile=args.profile,
+        profile_wait_steps=args.profile_wait_steps,
+        profile_warmup_steps=args.profile_warmup_steps,
+        profile_active_steps=args.profile_active_steps,
+        profile_python_stacks=args.profile_python_stacks,
+    )
 
 
 if __name__ == "__main__":

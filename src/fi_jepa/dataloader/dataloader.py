@@ -8,7 +8,7 @@ from torch.utils.data import DataLoader
 
 from fi_jepa.dataloader.batch_assembler import DensePanelBatchAssembler
 from fi_jepa.dataloader.config import FIJepaDataConfig
-from fi_jepa.dataloader.dataset import DensePanelRequestDataset
+from fi_jepa.dataloader.dataset import DensePanelWindowRequestDataset
 from fi_jepa.dataloader.panel_store import DensePanelStore, Split
 
 AssetView = Literal["all_valid", "fixed_k"]
@@ -30,7 +30,7 @@ def build_fi_jepa_dataloader(
     """Build a JEPA loader over the split-specific dense panel cache."""
     config, store = _resolve_config_and_store(config, store)
     view_kind = "random_k" if split == "train" else "all_valid"
-    dataset = DensePanelRequestDataset(
+    dataset = DensePanelWindowRequestDataset(
         store,
         config,
         split,
@@ -61,7 +61,7 @@ def build_fi_jepa_embedding_dataloader(
 ) -> DataLoader:
     """Build an unmasked embedding loader over the dense panel cache."""
     config, store = _resolve_config_and_store(config, store)
-    dataset = DensePanelRequestDataset(
+    dataset = DensePanelWindowRequestDataset(
         store,
         config,
         split,
@@ -94,7 +94,7 @@ def _resolve_config_and_store(
 
 
 def _build_loader(
-    dataset: DensePanelRequestDataset,
+    dataset: DensePanelWindowRequestDataset,
     store: DensePanelStore,
     config: FIJepaDataConfig,
     *,

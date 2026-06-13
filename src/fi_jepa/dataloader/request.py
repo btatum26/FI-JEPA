@@ -10,12 +10,12 @@ ViewKind = Literal["random_k", "all_valid", "fixed_k"]
 
 
 # ============================================================================
-# DENSE PANEL REQUEST
+# DENSE PANEL WINDOW REQUEST
 # ============================================================================
 
 
 @dataclass(frozen=True)
-class DensePanelRequest:
+class DensePanelWindowRequest:
     """Carry only metadata required to gather one dense-panel window."""
 
     sample_date_idx: int

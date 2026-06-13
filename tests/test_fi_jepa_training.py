@@ -277,6 +277,35 @@ def test_validation_is_deterministic(tmp_path: Path) -> None:
     assert first == second
 
 
+def test_profile_training_writes_trace_and_skips_validation_checkpoints(tmp_path: Path) -> None:
+    config = _write_run_configs(tmp_path)
+
+    run_dir = train_fi_jepa(
+        config,
+        profile=True,
+        profile_wait_steps=0,
+        profile_warmup_steps=1,
+        profile_active_steps=1,
+        profile_python_stacks=True,
+    )
+    profiler_dir = run_dir / "profiler"
+    records = [
+        json.loads(line)
+        for line in (run_dir / "train_log.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+
+    summary = (profiler_dir / "summary.txt").read_text(encoding="utf-8")
+    cpu_summary = (profiler_dir / "cpu_summary.txt").read_text(encoding="utf-8")
+    assert "WALL-CLOCK RUNTIME SECTIONS" in summary
+    assert "dataloader_iterator_startup_s" in summary
+    assert "Self CPU time total" in cpu_summary
+    assert "WALL-CLOCK RUNTIME SECTIONS" in cpu_summary
+    assert (profiler_dir / "cpu_stacks.txt").stat().st_size > 0
+    assert list(profiler_dir.glob("*.pt.trace.json"))
+    assert not any((run_dir / "checkpoints").iterdir())
+    assert [record["event"] for record in records] == ["epoch_warmup", "train", "train"]
+
+
 def test_smoke_training_and_basic_epoch_resume(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -345,8 +374,13 @@ def test_smoke_training_and_basic_epoch_resume(
         for record in train_records
     )
     assert sum(record["event"] == "resume" for record in records) == 2
+    assert sum(record["event"] == "epoch_warmup" for record in records) == 4
+    assert sum(record["event"] == "epoch_boundary" for record in records) == 4
+    assert "EPOCH BOUNDARY" in (run_dir / "runtime_summary.txt").read_text(encoding="utf-8")
     assert (checkpoints / "step_000000006.pt").is_file()
 
     terminal_output = capsys.readouterr()
     assert "Training plan:" in terminal_output.out
+    assert "Epoch warm-up:" in terminal_output.out
+    assert "Epoch boundary:" in terminal_output.out
     assert "rank=" in terminal_output.err

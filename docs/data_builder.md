@@ -173,7 +173,8 @@ Workers receive no dense arrays through pickle. They reopen only the completed
 `.npy` files using read-only memory maps; worker deserialization never validates,
 builds, repairs, deletes, or publishes a cache.
 
-The runtime request dataset contains only artifact-defined endpoint metadata.
+The runtime request dataset starts from artifact-defined endpoint metadata and
+filters structurally invalid JEPA endpoints once in the parent process.
 The batch assembler:
 
 - Selects a random fixed-K training view, deterministic fixed-K embedding view,
@@ -181,7 +182,7 @@ The batch assembler:
 - Gathers values and stored masks through batch date/asset indices.
 - Reshapes gathered daily tensors into zero-copy patch views.
 - Aggregates daily validity into patch masks and samples temporal JEPA targets.
-- Fails loudly when a fixed-K or JEPA request is not viable.
+- Fails loudly when a fixed-K or selected JEPA asset view is not viable.
 
 No dense windows or patches are cached. `persistent_workers` remains disabled
 because the training dataset's epoch is updated before each iterator is created.
