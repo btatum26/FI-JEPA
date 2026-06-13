@@ -35,6 +35,10 @@ class FIJepaTrainingConfig:
     warmup_epochs: int = 5
     grad_clip_norm: float = 1.0
     mixed_precision: bool = True
+    anti_collapse_variance_weight: float = 0.0
+    anti_collapse_covariance_weight: float = 0.0
+    anti_collapse_variance_floor: float = 0.1
+    anti_collapse_epsilon: float = 0.0001
     ema_momentum_start: float = 0.996
     ema_momentum_end: float = 0.999
     validation_every_epochs: int = 1
@@ -62,6 +66,14 @@ class FIJepaTrainingConfig:
             raise ValueError("epochs must be positive and warmup_epochs must be in [0, epochs).")
         if self.grad_clip_norm <= 0.0:
             raise ValueError("grad_clip_norm must be positive.")
+        if self.anti_collapse_variance_weight < 0.0:
+            raise ValueError("anti_collapse_variance_weight cannot be negative.")
+        if self.anti_collapse_covariance_weight < 0.0:
+            raise ValueError("anti_collapse_covariance_weight cannot be negative.")
+        if self.anti_collapse_variance_floor < 0.0:
+            raise ValueError("anti_collapse_variance_floor cannot be negative.")
+        if self.anti_collapse_epsilon <= 0.0:
+            raise ValueError("anti_collapse_epsilon must be positive.")
         if not 0.0 <= self.ema_momentum_start <= self.ema_momentum_end <= 1.0:
             raise ValueError("EMA momentum must satisfy 0 <= start <= end <= 1.")
         for name, value in (
@@ -89,6 +101,7 @@ class FIJepaTrainingConfig:
         run = values["run"]
         configs = values["configs"]
         optimization = values["optimization"]
+        anti_collapse = values.get("anti_collapse") or {}
         representation = values.get("representation_evaluation") or {}
         return cls(
             run_name=str(run["name"]),
@@ -104,6 +117,10 @@ class FIJepaTrainingConfig:
             warmup_epochs=int(optimization["warmup_epochs"]),
             grad_clip_norm=float(optimization["grad_clip_norm"]),
             mixed_precision=bool(optimization["mixed_precision"]),
+            anti_collapse_variance_weight=float(anti_collapse.get("variance_weight", 0.0)),
+            anti_collapse_covariance_weight=float(anti_collapse.get("covariance_weight", 0.0)),
+            anti_collapse_variance_floor=float(anti_collapse.get("variance_floor", 0.1)),
+            anti_collapse_epsilon=float(anti_collapse.get("epsilon", 0.0001)),
             ema_momentum_start=float(values["ema"]["momentum_start"]),
             ema_momentum_end=float(values["ema"]["momentum_end"]),
             validation_every_epochs=int(values["validation"]["every_epochs"]),

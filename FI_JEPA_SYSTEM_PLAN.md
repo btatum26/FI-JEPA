@@ -73,7 +73,8 @@ The current model:
 6. Encodes the complete valid positioned patch sequence with an EMA target
    encoder.
 7. Predicts gathered target-position representations from visible context.
-8. Trains with normalized latent prediction loss.
+8. Trains with normalized latent prediction loss plus a weak variance and
+   covariance guardrail on pooled visible-context states.
 
 The exact model and representation contracts are in
 [FI_JEPA_MODEL_ARCHITECTURE_PLAN.md](FI_JEPA_MODEL_ARCHITECTURE_PLAN.md).
@@ -124,8 +125,9 @@ on train embeddings dated before that window begins.
   volatility, maximum drawdown, and trend score for 21, 63, and 126 days.
 - Frozen probes are continuous-target ridge regressions. Classification probes,
   nonlinear probes, target buckets, and regime labels are not implemented.
-- The current loss has no explicit variance, covariance, or redundancy
-  regularizer.
+- The current anti-collapse regularizer is only a weak batch-level guardrail on
+  pooled visible-context states. It does not regularize the EMA target branch
+  or guarantee a full-rank representation.
 - No conditional IC integration, alignment objective, mixture-of-experts model,
   or trading backtest is implemented.
 
@@ -141,8 +143,8 @@ on train embeddings dated before that window begins.
    - PCA on input features.
    - A small autoencoder or supervised baseline.
 3. Add residualized probes that measure information beyond volatility.
-4. Add explicit collapse diagnostics or regularization only if training evidence
-   shows collapse.
+4. Tune or broaden anti-collapse regularization only if training diagnostics
+   show that the weak pooled-state guardrail is insufficient.
 
 ### Data
 

@@ -20,6 +20,7 @@ from tqdm.auto import tqdm
 import yaml
 
 from fi_jepa.dataloader import DensePanelStore, FIJepaDataConfig, build_fi_jepa_dataloader
+from fi_jepa.losses import pooled_variance_covariance_loss
 from fi_jepa.model import ENCODER_BATCH_TENSOR_NAMES, JEPA_BATCH_TENSOR_NAMES, FIJepaModel
 from fi_jepa.model_config import FIJepaModelConfig
 from fi_jepa.model_output import FIJepaOutput
@@ -37,6 +38,7 @@ from fi_jepa.training_profiler import (
     profile_range,
     write_runtime_timing_summary,
 )
+from fi_jepa.tokenizer import masked_mean
 
 from fi_jepa.schedulers import WarmupCosineLRSchedule, LinearEMAMomentumSchedule
 
@@ -215,6 +217,39 @@ def _batch_representation_metrics(output: FIJepaOutput) -> dict[str, float]:
     }
 
 
+def _training_objective(
+    output: FIJepaOutput,
+    config: FIJepaTrainingConfig,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Combine JEPA prediction loss with weak visible-context anti-collapse terms.
+
+    The regularizer uses one masked-mean visible-context state per sample. It
+    therefore adds no second encoder pass, never exposes hidden target patches
+    to the online encoder, and estimates batch variation without treating patch
+    positions as interchangeable samples.
+    """
+    pooled_context = masked_mean(
+        output.context_representations,
+        output.context_mask,
+        dimension=1,
+    )  # [B, C, D] -> [B, D].
+    variance_loss, covariance_loss, mean_feature_std = pooled_variance_covariance_loss(
+        pooled_context,
+        variance_floor=config.anti_collapse_variance_floor,
+        epsilon=config.anti_collapse_epsilon,
+    )
+    weighted_variance = variance_loss * config.anti_collapse_variance_weight
+    weighted_covariance = covariance_loss * config.anti_collapse_covariance_weight
+    total_loss = output.loss.float() + weighted_variance + weighted_covariance
+    return total_loss, {
+        "anti_collapse_variance_loss": variance_loss,
+        "anti_collapse_covariance_loss": covariance_loss,
+        "anti_collapse_weighted_variance_loss": weighted_variance,
+        "anti_collapse_weighted_covariance_loss": weighted_covariance,
+        "context_pooled_mean_feature_std": mean_feature_std,
+    }
+
+
 def validate_jepa(
     model: FIJepaModel,
     loader: torch.utils.data.DataLoader,
@@ -372,7 +407,7 @@ def _log_training_step(
         },
     )
     progress.set_postfix(
-        loss=f"{log_metrics['train_jepa_loss']:.4f}",
+        loss=f"{log_metrics['train_loss']:.4f}",
         cos=f"{log_metrics['matched_target_cosine']:.4f}",
         rank=(
             f"{log_metrics['predictor_effective_rank']:.1f}"
@@ -617,6 +652,7 @@ def train_fi_jepa(
     # Main training loop 
     # =======================================
     
+    print(f"Starting training from epoch {start_epoch + 1}/{training_config.epochs}, global step {global_step}.")
     for epoch in range(start_epoch, training_config.epochs):
         epoch_warmup_started = time.perf_counter()
         dataset = train_loader.dataset
@@ -664,9 +700,17 @@ def train_fi_jepa(
         interval_start = time.perf_counter()
         interval_samples = 0
         interval_targets = 0
-        interval_weighted_loss = 0.0
+        interval_total_loss = 0.0
+        interval_weighted_jepa_loss = 0.0
         interval_gradient_norm = 0.0
         interval_successful_steps = 0
+        interval_loss_components = {
+            "anti_collapse_variance_loss": 0.0,
+            "anti_collapse_covariance_loss": 0.0,
+            "anti_collapse_weighted_variance_loss": 0.0,
+            "anti_collapse_weighted_covariance_loss": 0.0,
+            "context_pooled_mean_feature_std": 0.0,
+        }
         interval_metrics = {
             "target_patch_eligibility_rate": 0.0,
             "masked_patch_rate": 0.0,
@@ -701,11 +745,12 @@ def train_fi_jepa(
             with profile_range("forward_and_loss", enabled=training_profiler is not None):
                 with autocast:
                     output = model(batch)
+                    training_loss, loss_components = _training_objective(output, training_config)
 
             # back propigation and optimization
             with profile_range("backward_and_optimizer", enabled=training_profiler is not None):
                 if scaler.is_enabled():
-                    scaler.scale(output.loss).backward()
+                    scaler.scale(training_loss).backward()
                     scaler.unscale_(optimizer)
                     gradient_norm = nn.utils.clip_grad_norm_(model.parameters(), training_config.grad_clip_norm)
                     old_scale = scaler.get_scale()
@@ -713,7 +758,7 @@ def train_fi_jepa(
                     scaler.update()
                     step_succeeded = scaler.get_scale() >= old_scale
                 else:
-                    output.loss.backward()
+                    training_loss.backward()
                     gradient_norm = nn.utils.clip_grad_norm_(
                         model.parameters(), training_config.grad_clip_norm
                     )
@@ -750,9 +795,12 @@ def train_fi_jepa(
             mask_metrics = _batch_mask_metrics(cpu_batch)
             interval_samples += batch_samples
             interval_targets += batch_targets
-            interval_weighted_loss += float(output.loss.item()) * batch_targets
+            interval_total_loss += float(training_loss.item())
+            interval_weighted_jepa_loss += float(output.loss.item()) * batch_targets
             interval_gradient_norm += float(gradient_norm.item())
             interval_successful_steps += 1
+            for name, value in loss_components.items():
+                interval_loss_components[name] += float(value.item())
             for name in interval_metrics:
                 interval_metrics[name] += mask_metrics[name] * batch_samples
 
@@ -760,10 +808,15 @@ def train_fi_jepa(
             if (  global_step % training_config.logging_every_steps == 0 or batch_index == len(train_loader) - 1):
                 elapsed = max(time.perf_counter() - interval_start, 1e-12)
                 log_metrics = {
-                    "train_jepa_loss": interval_weighted_loss / interval_targets,
+                    "train_loss": interval_total_loss / interval_successful_steps,
+                    "train_jepa_loss": interval_weighted_jepa_loss / interval_targets,
                     "learning_rate": learning_rate,
                     "ema_momentum": ema_momentum,
                     "gradient_norm": interval_gradient_norm / interval_successful_steps,
+                    **{
+                        name: value / interval_successful_steps
+                        for name, value in interval_loss_components.items()
+                    },
                     **_batch_representation_metrics(output),
                     **{name: value / interval_samples for name, value in interval_metrics.items()},
                     "samples_per_second": interval_samples / elapsed,
@@ -772,9 +825,13 @@ def train_fi_jepa(
                 interval_start = time.perf_counter()
                 interval_samples = 0
                 interval_targets = 0
-                interval_weighted_loss = 0.0
+                interval_total_loss = 0.0
+                interval_weighted_jepa_loss = 0.0
                 interval_gradient_norm = 0.0
                 interval_successful_steps = 0
+                interval_loss_components = {
+                    name: 0.0 for name in interval_loss_components
+                }
                 interval_metrics = {name: 0.0 for name in interval_metrics}
                 
             # write checkpoint if its time

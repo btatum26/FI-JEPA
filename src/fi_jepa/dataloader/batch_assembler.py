@@ -247,6 +247,8 @@ class DensePanelBatchAssembler:
                 mask_ratio=self.config.mask_ratio,
                 min_masked_patches=self.config.min_masked_patches,
                 max_masked_patches=self.config.max_masked_patches,
+                min_target_blocks=self.config.min_target_blocks,
+                max_target_blocks=self.config.max_target_blocks,
             )
             target_masks.append(target)
             context_masks.append(context)

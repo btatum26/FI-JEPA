@@ -16,6 +16,7 @@ from fi_jepa.dataloader import (
     build_fi_jepa_dataloader,
     build_fi_jepa_embedding_dataloader,
 )
+from fi_jepa.dataloader.masking import sample_jepa_target_mask
 from fi_jepa.dataloader.panel_store import CACHE_FORMAT_VERSION
 
 
@@ -116,6 +117,8 @@ def _write_sparse_artifact(root: Path) -> FIJepaDataConfig:
         mask_ratio=0.5,
         min_masked_patches=1,
         max_masked_patches=1,
+        min_target_blocks=1,
+        max_target_blocks=1,
         min_valid_days_per_asset_patch=1,
         min_valid_dates_in_patch=1,
         min_valid_asset_fraction=0.25,
@@ -285,6 +288,73 @@ def test_random_k_changes_by_epoch_and_fixed_k_is_deterministic(tmp_path: Path) 
     assert torch.equal(fixed_first["asset_ids"], fixed_repeat["asset_ids"])
     assert "jepa_context_mask" not in fixed_first
     assert fixed_first["patch_context_mask"][:, -1].all()
+
+
+def test_jepa_targets_are_random_contiguous_blocks_within_configured_bounds() -> None:
+    eligible = np.ones(50, dtype=bool)
+    context = np.ones(50, dtype=bool)
+    rng = np.random.default_rng(1337)
+
+    samples = [
+        sample_jepa_target_mask(
+            eligible,
+            context,
+            rng,
+            mask_ratio=0.35,
+            min_masked_patches=5,
+            max_masked_patches=20,
+            min_target_blocks=2,
+            max_target_blocks=4,
+        )
+        for _ in range(100)
+    ]
+    target_counts = [int(target.sum()) for target, _, _ in samples]
+    block_counts = [
+        int(np.count_nonzero(target & np.concatenate(([True], ~target[:-1]))))
+        for target, _, _ in samples
+    ]
+
+    assert len(set(target_counts)) > 1
+    assert set(block_counts) >= {2, 3, 4}
+    assert min(target_counts) >= 5
+    assert max(target_counts) <= 20
+    assert min(block_counts) >= 2
+    assert max(block_counts) <= 4
+    for target, visible_context, target_ids in samples:
+        assert np.array_equal(visible_context, context & ~target)
+        assert np.array_equal(np.flatnonzero(target), target_ids)
+
+
+def test_jepa_target_blocks_fall_back_to_one_block_then_random_sampling() -> None:
+    context = np.ones(10, dtype=bool)
+    contiguous_eligible = np.zeros(10, dtype=bool)
+    contiguous_eligible[5:] = True
+    fragmented_eligible = np.zeros(10, dtype=bool)
+    fragmented_eligible[::2] = True
+
+    one_block, _, _ = sample_jepa_target_mask(
+        contiguous_eligible,
+        context,
+        np.random.default_rng(1),
+        mask_ratio=1.0,
+        min_masked_patches=5,
+        max_masked_patches=5,
+        min_target_blocks=2,
+        max_target_blocks=4,
+    )
+    random_fallback, _, _ = sample_jepa_target_mask(
+        fragmented_eligible,
+        context,
+        np.random.default_rng(2),
+        mask_ratio=1.0,
+        min_masked_patches=5,
+        max_masked_patches=5,
+        min_target_blocks=2,
+        max_target_blocks=4,
+    )
+
+    assert np.array_equal(np.flatnonzero(one_block), np.arange(5, 10))
+    assert np.array_equal(random_fallback, fragmented_eligible)
 
 
 def test_structurally_invalid_jepa_endpoints_are_filtered(tmp_path: Path) -> None:

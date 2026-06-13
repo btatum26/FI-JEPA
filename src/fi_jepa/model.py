@@ -154,8 +154,8 @@ class FIJepaModel(nn.Module):
             norm_first=True,
         )
         self.context_encoder = nn.TransformerEncoder(context_layer, num_layers=config.context_layers, enable_nested_tensor=False)
-        # The target encoder starts as an exact online-encoder copy and remains
-        # gradient-free; training code advances it only through EMA updates.
+        # The target encoder starts as an exact online-encoder copy and remains gradient-free.
+        # training code advances it only through EMA updates.
         self.target_encoder = deepcopy(self.context_encoder)
         self.target_encoder.requires_grad_(False)
         self.target_encoder.eval()
@@ -172,8 +172,8 @@ class FIJepaModel(nn.Module):
         self.predictor = nn.TransformerDecoder(predictor_layer, num_layers=config.predictor_layers)
         # One learned query is combined with each target patch's positional embedding.
         self.target_mask_token = nn.Parameter(torch.empty(1, 1, config.d_model))
-        # Checkpoint compatibility only. The JEPA loss does not train this
-        # projection, so evaluation uses encode_pooled_state() plus train-fit PCA.
+        # Checkpoint compatibility only. The JEPA loss does not train this projection, 
+        # so evaluation uses encode_pooled_state() plus train-fit PCA.
         self.state_exporter = nn.Sequential(
             nn.LayerNorm(config.d_model * 2),
             nn.Linear(config.d_model * 2, config.d_model),
@@ -216,9 +216,7 @@ class FIJepaModel(nn.Module):
         # First establish the complete interface. Optional or silently ignored
         # tensors at this boundary would allow loader/model contracts to drift.
         required = (
-            ENCODER_BATCH_TENSOR_NAMES | JEPA_BATCH_TENSOR_NAMES
-            if require_jepa_targets
-            else ENCODER_BATCH_TENSOR_NAMES
+            ENCODER_BATCH_TENSOR_NAMES | JEPA_BATCH_TENSOR_NAMES if require_jepa_targets else ENCODER_BATCH_TENSOR_NAMES
         )
         missing = sorted(required - set(batch))
         if missing:

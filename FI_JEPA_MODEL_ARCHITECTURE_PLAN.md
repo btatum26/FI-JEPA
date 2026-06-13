@@ -117,6 +117,19 @@ loss = mean(sum((normalize(prediction) - normalize(target)) ** 2))
 
 Padded target slots are zeroed and excluded from the loss.
 
+Training adds a weak batch-level regularizer on the masked-mean visible-context
+state produced by the online encoder:
+
+```text
+train_loss = jepa_loss + lambda_var * variance_loss + lambda_cov * covariance_loss
+```
+
+The variance term floors aggregate mean feature standard deviation, not every
+dimension independently. The covariance term penalizes off-diagonal covariance
+per feature. This is a low-weight collapse guardrail, not a requirement that all
+128 dimensions remain equally active. Validation and best-checkpoint selection
+continue to use pure JEPA prediction loss.
+
 ## Target Eligibility
 
 Patch eligibility is split-relative:
@@ -211,8 +224,8 @@ uv run pytest -q
 
 ## Future Investigations
 
-- Explicit anti-collapse regularization if representation diagnostics justify
-  it.
+- Broader patch-state or target-path anti-collapse regularization if the weak
+  pooled visible-context guardrail proves insufficient.
 - Full EMA copies of tokenizers and fusion instead of only the temporal encoder.
 - Alternative target-block sampling strategies.
 - Learned or attention-based asset pooling.

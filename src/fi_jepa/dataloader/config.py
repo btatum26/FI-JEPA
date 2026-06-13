@@ -24,6 +24,8 @@ class FIJepaDataConfig:
     mask_ratio: float = 0.35
     min_masked_patches: int = 3
     max_masked_patches: int = 5
+    min_target_blocks: int = 2
+    max_target_blocks: int = 4
     min_valid_days_per_asset_patch: int = 10
     min_valid_dates_in_patch: int = 10
     min_valid_asset_fraction: float = 0.25
@@ -48,6 +50,12 @@ class FIJepaDataConfig:
             raise ValueError("Masked patch bounds are invalid.")
         if self.max_masked_patches > self.num_patches:
             raise ValueError("max_masked_patches exceeds the number of patches.")
+        if not 1 <= self.min_target_blocks <= self.max_target_blocks:
+            raise ValueError("Target block bounds are invalid.")
+        if self.min_target_blocks > self.min_masked_patches:
+            raise ValueError("min_target_blocks cannot exceed min_masked_patches.")
+        if self.max_target_blocks > self.max_masked_patches:
+            raise ValueError("max_target_blocks cannot exceed max_masked_patches.")
         if not 1 <= self.min_valid_days_per_asset_patch <= self.patch_len:
             raise ValueError("min_valid_days_per_asset_patch must be within one patch.")
         if not 1 <= self.min_valid_dates_in_patch <= self.patch_len:

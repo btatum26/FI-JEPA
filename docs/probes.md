@@ -109,17 +109,27 @@ runs/probes/<timestamp>_<run_id>/
 `report.json` contains per-fold and aggregate out-of-fold RMSE, MAE, R-squared,
 Pearson correlation, baseline metrics, and ridge coefficients.
 
-## Interpret One Latent Coordinate
+## Interpret Latent Coordinates
 
-Correlate one exported PCA coordinate with raw VIX, SPY realized volatility,
-SPY drawdown, market breadth, cross-sectional dispersion, and separate future
-SPY volatility targets. Explicit calendar-day and trading-row controls expose
-latent drift that can masquerade as market-state meaning:
+Correlate exported PCA coordinates with selected numeric columns from the live
+canonical `features`, `ticker_features`, and `targets` tables. Omitting
+`--coordinates` analyzes every exported `z_*` dimension:
 
 ```bash
 uv run python -m fi_jepa.analysis.analyze_latent_factor \
   --embeddings runs/evaluation/<evaluation_artifact> \
-  --coordinate z_1
+  --features vix_level ticker_features.realized_vol_63d targets.future_realized_vol_63d
+```
+
+Select specific coordinates or inspect every selectable feature:
+
+```bash
+uv run python -m fi_jepa.analysis.analyze_latent_factor \
+  --embeddings runs/evaluation/<evaluation_artifact> \
+  --coordinates z_1 z_4 z_8 \
+  --features features.vix_level breadth_1d elapsed_trading_rows
+
+uv run python -m fi_jepa.analysis.analyze_latent_factor --list-features
 ```
 
 The analysis verifies the canonical database hash and writes under
@@ -131,10 +141,15 @@ correlations.csv
 report.json
 ```
 
-`correlations.csv` reports full-sample, train, validation, and named
-validation-window Pearson and Spearman correlations. It reports raw levels,
-first differences, and linear-time-detrended values because a dominant PCA
-axis can carry a time trend that creates misleading level correlations.
+Feature selectors may use a unique column name or an explicit
+`table.column` name. `--features all` selects every numeric canonical column.
+The default feature set remains the original VIX, volatility, drawdown,
+breadth, dispersion, future-volatility, and time-control set.
+
+`correlations.csv` reports every coordinate-feature pair for full-sample,
+train, validation, and named validation-window segments. It includes raw
+levels, first differences, and linear-time-detrended values because a dominant
+PCA axis can carry a time trend that creates misleading level correlations.
 Future targets are joined only into this analysis artifact.
 
 ## Current Limits

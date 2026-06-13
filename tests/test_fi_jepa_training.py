@@ -12,9 +12,11 @@ import yaml
 from fi_jepa.dataloader import DensePanelStore, FIJepaDataConfig, build_fi_jepa_dataloader
 from fi_jepa.model import FIJepaModel
 from fi_jepa.model_config import FIJepaModelConfig
+from fi_jepa.model_output import FIJepaOutput
 from fi_jepa.training import (
     LinearEMAMomentumSchedule,
     WarmupCosineLRSchedule,
+    _training_objective,
     build_adamw,
     train_fi_jepa,
     validate_jepa,
@@ -131,6 +133,8 @@ def _write_training_artifact(root: Path) -> FIJepaDataConfig:
         mask_ratio=0.5,
         min_masked_patches=1,
         max_masked_patches=1,
+        min_target_blocks=1,
+        max_target_blocks=1,
         min_valid_days_per_asset_patch=1,
         min_valid_dates_in_patch=1,
         min_valid_asset_fraction=0.25,
@@ -229,6 +233,28 @@ def _write_run_configs(root: Path) -> FIJepaTrainingConfig:
 def test_training_config_and_schedules_validate_endpoints_and_clamp() -> None:
     with pytest.raises(ValueError, match="warmup_epochs"):
         FIJepaTrainingConfig(epochs=2, warmup_epochs=2)
+    with pytest.raises(ValueError, match="variance_weight"):
+        FIJepaTrainingConfig(
+            epochs=2,
+            warmup_epochs=0,
+            anti_collapse_variance_weight=-0.001,
+        )
+
+    configured = FIJepaTrainingConfig.from_yaml(Path("configs/pretraining.yaml"))
+    assert configured.anti_collapse_variance_weight == pytest.approx(0.001)
+    assert configured.anti_collapse_covariance_weight == pytest.approx(0.0001)
+
+    legacy_checkpoint_config = FIJepaTrainingConfig(epochs=2, warmup_epochs=0).to_dict()
+    for name in (
+        "anti_collapse_variance_weight",
+        "anti_collapse_covariance_weight",
+        "anti_collapse_variance_floor",
+        "anti_collapse_epsilon",
+    ):
+        legacy_checkpoint_config.pop(name)
+    restored_legacy = FIJepaTrainingConfig.from_dict(legacy_checkpoint_config)
+    assert restored_legacy.anti_collapse_variance_weight == 0.0
+    assert restored_legacy.anti_collapse_covariance_weight == 0.0
 
     parameter = torch.nn.Parameter(torch.tensor(1.0))
     optimizer = torch.optim.AdamW([parameter], lr=1.0)
@@ -257,6 +283,48 @@ def test_adamw_excludes_frozen_target_encoder() -> None:
     assert optimized == {
         id(parameter) for parameter in model.parameters() if parameter.requires_grad
     }
+
+
+def test_training_objective_adds_weak_regularizer_and_preserves_jepa_loss() -> None:
+    context = torch.tensor(
+        [
+            [[-1.0, -1.0], [-1.0, -1.0]],
+            [[0.0, 0.0], [0.0, 0.0]],
+            [[1.0, 1.0], [1.0, 1.0]],
+        ],
+        requires_grad=True,
+    )
+    jepa_loss = torch.tensor(2.0, requires_grad=True)
+    output = FIJepaOutput(
+        loss=jepa_loss,
+        predicted_targets=torch.zeros(3, 1, 2),
+        target_representations=torch.zeros(3, 1, 2),
+        target_patch_mask=torch.ones(3, 1, dtype=torch.bool),
+        context_representations=context,
+        context_mask=torch.ones(3, 2, dtype=torch.bool),
+        fused_tokens=torch.zeros(3, 2, 2),
+    )
+    config = FIJepaTrainingConfig(
+        epochs=2,
+        warmup_epochs=0,
+        anti_collapse_variance_weight=0.1,
+        anti_collapse_covariance_weight=0.2,
+        anti_collapse_variance_floor=2.0,
+    )
+
+    total_loss, components = _training_objective(output, config)
+    expected = (
+        jepa_loss
+        + 0.1 * components["anti_collapse_variance_loss"]
+        + 0.2 * components["anti_collapse_covariance_loss"]
+    )
+
+    assert total_loss.item() > jepa_loss.item()
+    assert torch.allclose(total_loss, expected)
+    total_loss.backward()
+    assert jepa_loss.grad == pytest.approx(1.0)
+    assert context.grad is not None
+    assert torch.isfinite(context.grad).all()
 
 
 # ============================================================================
@@ -366,6 +434,13 @@ def test_smoke_training_and_basic_epoch_resume(
     train_records = [record for record in records if record["event"] == "train"]
     assert all(
         {
+            "train_loss",
+            "train_jepa_loss",
+            "anti_collapse_variance_loss",
+            "anti_collapse_covariance_loss",
+            "anti_collapse_weighted_variance_loss",
+            "anti_collapse_weighted_covariance_loss",
+            "context_pooled_mean_feature_std",
             "matched_target_cosine",
             "predictor_effective_rank",
             "target_effective_rank",

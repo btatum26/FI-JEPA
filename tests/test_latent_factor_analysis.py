@@ -10,7 +10,10 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from fi_jepa.analysis.analyze_latent_factor import analyze_latent_coordinate
+from fi_jepa.analysis.analyze_latent_factor import (
+    analyze_latent_coordinate,
+    analyze_latent_coordinates,
+)
 
 
 # ============================================================================
@@ -162,3 +165,42 @@ def test_latent_factor_analysis_rejects_database_version_mismatch(tmp_path: Path
             database,
             output_root=tmp_path / "analysis",
         )
+
+
+def test_latent_factor_analysis_selects_features_and_defaults_to_all_coordinates(
+    tmp_path: Path,
+) -> None:
+    dates = pd.bdate_range(date(2024, 1, 1), periods=12)
+    database = tmp_path / "market.duckdb"
+    _write_market_database(database, dates)
+    embeddings = _write_embedding_artifact(
+        tmp_path / "embeddings",
+        dates,
+        _file_sha256(database),
+    )
+
+    output = analyze_latent_coordinates(
+        embeddings,
+        database,
+        feature_names=[
+            "features.vix_level",
+            "ticker_features.drawdown_21d",
+            "targets.future_realized_vol_63d",
+        ],
+        output_root=tmp_path / "analysis",
+    )
+    correlations = pd.read_csv(output / "correlations.csv")
+    report = json.loads((output / "report.json").read_text(encoding="utf-8"))
+
+    assert report["coordinates"] == ["z_1", "z_2"]
+    assert [feature["selector"] for feature in report["features"]] == [
+        "features.vix_level",
+        "ticker_features.drawdown_21d",
+        "targets.future_realized_vol_63d",
+    ]
+    assert set(correlations["coordinate"]) == {"z_1", "z_2"}
+    assert set(correlations["feature_selector"]) == {
+        "features.vix_level",
+        "ticker_features.drawdown_21d",
+        "targets.future_realized_vol_63d",
+    }

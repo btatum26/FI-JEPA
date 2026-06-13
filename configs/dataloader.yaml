@@ -8,8 +8,10 @@ train_k_assets: 128
 fixed_k_assets: 256
 
 mask_ratio: 0.35
-min_masked_patches: 3
-max_masked_patches: 5
+min_masked_patches: 5
+max_masked_patches: 15
+min_target_blocks: 2
+max_target_blocks: 4
 min_valid_days_per_asset_patch: 4
 min_valid_dates_in_patch: 4
 min_valid_asset_fraction: 0.25
