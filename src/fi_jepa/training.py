@@ -185,8 +185,7 @@ def _effective_rank(values: torch.Tensor) -> float:
     if values.shape[0] < 2:
         return 0.0
 
-    # Center valid target rows so rank measures represented variation rather
-    # than a large shared mean direction.
+    # Center valid target rows so rank measures represented variation rather than a large shared mean direction.
     centered = values.detach().float()
     centered = centered - centered.mean(dim=0, keepdim=True)
     spectrum = torch.linalg.svdvals(centered).square()
@@ -260,7 +259,7 @@ def validate_jepa(
             masked_count_weighted += metrics["masked_patch_count_mean"] * batch_samples
             sample_count += batch_samples
 
-    print("validation_jepa_loss=%.4f | target_patch_eligibility_rate=%.4f | masked_patch_rate=%.4f | masked_patch_count_mean=%.4f", weighted_loss / target_count, eligibility_weighted / sample_count, masked_rate_weighted / sample_count, masked_count_weighted / sample_count)
+    print(f"validation_jepa_loss={weighted_loss / target_count:.4f} | target_patch_eligibility_rate={eligibility_weighted / sample_count:.4f} | masked_patch_rate={masked_rate_weighted / sample_count:.4f} | masked_patch_count_mean={masked_count_weighted / sample_count:.4f}")
     if was_training:
         model.train()
     if target_count == 0 or sample_count == 0:
@@ -352,6 +351,40 @@ def _resolve_resume_checkpoint(path: Path) -> tuple[Path, Path]:
         raise ValueError("Resume checkpoint must live inside a run's checkpoints directory.")
     return checkpoint, checkpoint.parent.parent
 
+def _log_training_step(
+    log_path: Path,
+    log_metrics: dict[str, float],
+    epoch: int,
+    global_step: int,
+    progress: tqdm,
+    
+):  
+    
+    # add metrics to log file
+    _append_jsonl(
+        log_path,
+        {
+            "event": "train",
+            "timestamp": _utc_timestamp(),
+            "epoch": epoch,
+            "step": global_step,
+            **log_metrics,
+        },
+    )
+    progress.set_postfix(
+        loss=f"{log_metrics['train_jepa_loss']:.4f}",
+        cos=f"{log_metrics['matched_target_cosine']:.4f}",
+        rank=(
+            f"{log_metrics['predictor_effective_rank']:.1f}"
+            f"/{log_metrics['target_effective_rank']:.1f}"
+        ),
+        lr=f"{log_metrics['learning_rate']:.2e}",
+        samples_per_second=f"{log_metrics['samples_per_second']:.1f}",
+        refresh=False,
+    )
+    
+
+
 
 # ============================================================================
 # PRETRAINING ORCHESTRATION
@@ -382,6 +415,11 @@ def train_fi_jepa(
         raise ValueError("Python stack sampling requires profile=True.")
     if profile_wait_steps < 0 or profile_warmup_steps < 0 or profile_active_steps <= 0:
         raise ValueError("Profiler steps require wait >= 0, warmup >= 0, and active > 0.")
+    
+    
+    # =========================================
+    # Is this a resumed run or a new run?
+    # =========================================
 
     checkpoint: dict[str, Any] | None = None
     if resume is not None:
@@ -417,6 +455,12 @@ def train_fi_jepa(
         run_dir = training_config.output_root / f"{run_stamp}_{training_config.run_name}"
         run_dir.mkdir(parents=True, exist_ok=False)
 
+
+
+    # =======================================
+    # Do all the init stuff
+    # =======================================
+    
     # check configs make sense
     if model_config.patch_len != data_config.patch_len:
         raise ValueError("Model and dataloader patch_len values must match.")
@@ -437,11 +481,12 @@ def train_fi_jepa(
     model = FIJepaModel.from_store(model_config, store).to(device)
     optimizer = build_adamw(model, training_config)
     total_steps = len(train_loader) * training_config.epochs
+    
     profiler_steps = profile_wait_steps + profile_warmup_steps + profile_active_steps
     if profile and total_steps < profiler_steps:
-        raise ValueError(
-            f"Profiler requires {profiler_steps} training steps, but this run only has {total_steps}."
-        )
+        raise ValueError(f"Profiler requires {profiler_steps} training steps, but this run only has {total_steps}.")
+    
+    
     lr_schedule = WarmupCosineLRSchedule(
         optimizer,
         base_lr=training_config.lr,
@@ -454,12 +499,9 @@ def train_fi_jepa(
         end=training_config.ema_momentum_end,
         total_steps=total_steps,
     )
-    scaler = torch.amp.GradScaler(
-        device.type,
-        enabled=amp_dtype == torch.float16,
-    )
+    scaler = torch.amp.GradScaler(device.type, enabled=amp_dtype == torch.float16)
 
-    if checkpoint is None:
+    if checkpoint is None:          # if this is a new run
         resolved_config = _build_resolved_config(
             training_config,
             model_config,
@@ -475,7 +517,8 @@ def train_fi_jepa(
         start_epoch = 0
         global_step = 0
         best_validation_loss: float | None = None
-    else:
+        
+    else:                           # if this is a resumed run
         runtime = resolved_config["runtime"]
         current_manifest = json.loads(
             (store.artifact_path / "manifest.json").read_text(encoding="utf-8")
@@ -493,13 +536,12 @@ def train_fi_jepa(
         if int(runtime["validation_sample_count"]) != len(validation_loader.dataset):
             raise ValueError("Current validation sample count differs from the resumed run.")
         
-        # Device is the only supported resume-time override. Persist the actual
-        # resumed runtime so later checkpoints do not claim a stale device.
+        # Device is the only supported resume-time override. 
+        # Persist the actual resumed runtime so later checkpoints do not claim a stale device.
         resolved_config["training"] = training_config.to_dict()
         runtime["device"] = str(device)
-        runtime["amp_dtype"] = (
-            None if amp_dtype is None else str(amp_dtype).removeprefix("torch.")
-        )
+        runtime["amp_dtype"] = (None if amp_dtype is None else str(amp_dtype).removeprefix("torch."))
+        
         _write_resolved_config(run_dir / "resolved_config.yaml", resolved_config)
         model.load_state_dict(checkpoint["model"])
         optimizer.load_state_dict(checkpoint["optimizer"])
@@ -521,6 +563,7 @@ def train_fi_jepa(
             },
         )
 
+    # pathing and logging setup
     checkpoints_dir = run_dir / "checkpoints"
     checkpoints_dir.mkdir(exist_ok=True)
     log_path = run_dir / "train_log.jsonl"
@@ -528,6 +571,8 @@ def train_fi_jepa(
     warmup_timing_records: list[TimingRecord] = []
     boundary_timing_records: list[TimingRecord] = []
     profiler_dir = run_dir / "profiler"
+    
+    # sets to None if profile = false
     training_profiler = (
         build_training_profiler(
             profiler_dir,
@@ -540,11 +585,10 @@ def train_fi_jepa(
         if profile
         else None
     )
-    python_stack_sampler = (
-        PythonStackSampler(profiler_dir / "cpu_stacks.txt")
-        if profile and profile_python_stacks
-        else None
-    )
+    # sets to None if profile_python_stacks = false
+    python_stack_sampler = (PythonStackSampler(profiler_dir / "cpu_stacks.txt") if profile and profile_python_stacks else None)
+    
+    
     print(f"FI-JEPA run: {run_dir}")
     print(
         "Training plan: "
@@ -567,6 +611,12 @@ def train_fi_jepa(
 
     profile_complete = False
     profiled_steps = 0
+    
+    
+    # =======================================
+    # Main training loop 
+    # =======================================
+    
     for epoch in range(start_epoch, training_config.epochs):
         epoch_warmup_started = time.perf_counter()
         dataset = train_loader.dataset
@@ -576,42 +626,40 @@ def train_fi_jepa(
         with profile_range("epoch_warmup.dataset_epoch_update", enabled=training_profiler is not None):
             dataset.set_epoch(epoch)
             model.train()
-        dataset_epoch_update_seconds = time.perf_counter() - dataset_update_started
-        print(f"Starting epoch {epoch + 1}/{training_config.epochs}: creating training iterator.")
-        iterator_started = time.perf_counter()
-        with profile_range(
-            "epoch_warmup.dataloader_iterator_startup",
-            enabled=training_profiler is not None,
-        ):
-            train_iterator = iter(train_loader)
-        dataloader_iterator_startup_seconds = time.perf_counter() - iterator_started
-        warmup_record: TimingRecord = {
-            "epoch": epoch,
-            "dataset_epoch_update_seconds": dataset_epoch_update_seconds,
-            "dataloader_iterator_startup_seconds": dataloader_iterator_startup_seconds,
-            "total_seconds": time.perf_counter() - epoch_warmup_started,
-        }
-        warmup_timing_records.append(warmup_record)
-        _append_jsonl(
-            log_path,
-            {
-                "event": "epoch_warmup",
-                "timestamp": _utc_timestamp(),
-                "step": global_step,
-                **warmup_record,
-            },
-        )
-        write_runtime_timing_summary(
-            runtime_summary_path,
-            warmup_timing_records,
-            boundary_timing_records,
-        )
-        print(
-            "Epoch warm-up: "
-            f"dataset_epoch_update={dataset_epoch_update_seconds:.3f}s | "
-            f"dataloader_iterator_startup={dataloader_iterator_startup_seconds:.3f}s | "
-            f"total={float(warmup_record['total_seconds']):.3f}s"
-        )
+        # print(f"Starting epoch {epoch + 1}/{training_config.epochs}: creating training iterator.")
+        
+        
+        with profile_range("epoch_warmup.dataloader_iterator_startup", enabled=training_profiler is not None,):
+                train_iterator = iter(train_loader)
+                
+        # profiler setup
+        if training_profiler is not None:
+            iterator_started = time.perf_counter()
+            dataset_epoch_update_seconds = time.perf_counter() - dataset_update_started
+            dataloader_iterator_startup_seconds = time.perf_counter() - iterator_started
+            warmup_record: TimingRecord = {
+                "epoch": epoch,
+                "dataset_epoch_update_seconds": dataset_epoch_update_seconds,
+                "dataloader_iterator_startup_seconds": dataloader_iterator_startup_seconds,
+                "total_seconds": time.perf_counter() - epoch_warmup_started,
+            }
+            warmup_timing_records.append(warmup_record)
+            _append_jsonl(
+                log_path,
+                {
+                    "event": "epoch_warmup",
+                    "timestamp": _utc_timestamp(),
+                    "step": global_step,
+                    **warmup_record,
+                },
+            )
+            write_runtime_timing_summary(runtime_summary_path, warmup_timing_records, boundary_timing_records,)
+            print(
+                "Epoch warm-up: "
+                f"dataset_epoch_update={dataset_epoch_update_seconds:.3f}s | "
+                f"dataloader_iterator_startup={dataloader_iterator_startup_seconds:.3f}s | "
+                f"total={float(warmup_record['total_seconds']):.3f}s"
+            )
 
         interval_start = time.perf_counter()
         interval_samples = 0
@@ -624,13 +672,19 @@ def train_fi_jepa(
             "masked_patch_rate": 0.0,
             "masked_patch_count_mean": 0.0,
         }
+        
         progress = tqdm(
             range(len(train_loader)),
-            desc=f"Epoch {epoch + 1}/{training_config.epochs} [{device}]",
+            desc=f"Epoch {epoch + 1}/{training_config.epochs}: ",
+            bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} {postfix}",
             total=len(train_loader),
             unit="step",
             dynamic_ncols=True,
         )
+        
+        # =========================================
+        # Training steps within the epoch
+        # =========================================
         for batch_index in progress:
             with profile_range("next_batch_cpu", enabled=training_profiler is not None):
                 cpu_batch = next(train_iterator)
@@ -641,22 +695,19 @@ def train_fi_jepa(
             ema_momentum = ema_schedule.value_at(step_index)
             optimizer.zero_grad(set_to_none=True)
 
-            autocast = (
-                torch.amp.autocast(device.type, dtype=amp_dtype)
-                if amp_dtype is not None
-                else nullcontext()
-            )
+            autocast = torch.amp.autocast(device.type, dtype=amp_dtype) if amp_dtype is not None else nullcontext()
+            
+            # forward step
             with profile_range("forward_and_loss", enabled=training_profiler is not None):
                 with autocast:
                     output = model(batch)
 
+            # back propigation and optimization
             with profile_range("backward_and_optimizer", enabled=training_profiler is not None):
                 if scaler.is_enabled():
                     scaler.scale(output.loss).backward()
                     scaler.unscale_(optimizer)
-                    gradient_norm = nn.utils.clip_grad_norm_(
-                        model.parameters(), training_config.grad_clip_norm
-                    )
+                    gradient_norm = nn.utils.clip_grad_norm_(model.parameters(), training_config.grad_clip_norm)
                     old_scale = scaler.get_scale()
                     scaler.step(optimizer)
                     scaler.update()
@@ -687,6 +738,7 @@ def train_fi_jepa(
                     break
                 continue
 
+            # update EMA target encoder
             with profile_range("ema_update", enabled=training_profiler is not None):
                 lr_schedule.apply(step_index, commit=True)
                 ema_momentum = ema_schedule.commit(step_index)
@@ -704,10 +756,8 @@ def train_fi_jepa(
             for name in interval_metrics:
                 interval_metrics[name] += mask_metrics[name] * batch_samples
 
-            if (
-                global_step % training_config.logging_every_steps == 0
-                or batch_index == len(train_loader) - 1
-            ):
+            # if this is a log step or the last step of the epoch
+            if (  global_step % training_config.logging_every_steps == 0 or batch_index == len(train_loader) - 1):
                 elapsed = max(time.perf_counter() - interval_start, 1e-12)
                 log_metrics = {
                     "train_jepa_loss": interval_weighted_loss / interval_targets,
@@ -715,34 +765,10 @@ def train_fi_jepa(
                     "ema_momentum": ema_momentum,
                     "gradient_norm": interval_gradient_norm / interval_successful_steps,
                     **_batch_representation_metrics(output),
-                    **{
-                        name: value / interval_samples
-                        for name, value in interval_metrics.items()
-                    },
+                    **{name: value / interval_samples for name, value in interval_metrics.items()},
                     "samples_per_second": interval_samples / elapsed,
                 }
-                _append_jsonl(
-                    log_path,
-                    {
-                        "event": "train",
-                        "timestamp": _utc_timestamp(),
-                        "epoch": epoch,
-                        "step": global_step,
-                        **log_metrics,
-                    },
-                )
-                progress.set_postfix(
-                    loss=f"{log_metrics['train_jepa_loss']:.4f}",
-                    cos=f"{log_metrics['matched_target_cosine']:.4f}",
-                    rank=(
-                        f"{log_metrics['predictor_effective_rank']:.1f}"
-                        f"/{log_metrics['target_effective_rank']:.1f}"
-                    ),
-                    global_step=f"{global_step}/{total_steps}",
-                    lr=f"{log_metrics['learning_rate']:.2e}",
-                    samples_per_second=f"{log_metrics['samples_per_second']:.1f}",
-                    refresh=False,
-                )
+                _log_training_step(log_path, log_metrics, epoch, global_step, progress)
                 interval_start = time.perf_counter()
                 interval_samples = 0
                 interval_targets = 0
@@ -750,6 +776,8 @@ def train_fi_jepa(
                 interval_gradient_norm = 0.0
                 interval_successful_steps = 0
                 interval_metrics = {name: 0.0 for name in interval_metrics}
+                
+            # write checkpoint if its time
             if training_profiler is None and global_step % training_config.checkpoint_every_steps == 0:
                 state = _checkpoint_state(
                     kind="periodic",
@@ -787,13 +815,17 @@ def train_fi_jepa(
         validation_seconds = 0.0
         representation_evaluation_seconds = 0.0
         best_checkpoint_seconds = 0.0
-        should_validate = (epoch + 1) % training_config.validation_every_epochs == 0
-        if should_validate:
+        
+        # runs a validation and representation eval if its time
+        if (epoch + 1) % training_config.validation_every_epochs == 0:
             validation_started = time.perf_counter()
+            # run the validation
             with profile_range("epoch_boundary.validation", enabled=training_profiler is not None):
                 validation_metrics = validate_jepa(model, validation_loader, device, amp_dtype)
             validation_seconds = time.perf_counter() - validation_started
             representation_result: dict[str, object] | None = None
+            
+            # whether to run the representation eval
             should_evaluate_representations = (
                 training_config.representation_evaluation_enabled
                 and (
@@ -830,6 +862,8 @@ def train_fi_jepa(
                         export_embeddings=training_config.representation_export_embeddings,
                     )
                 representation_evaluation_seconds = time.perf_counter() - representation_started
+                
+            # writes to the jsonl log
             _append_jsonl(
                 log_path,
                 {
@@ -845,6 +879,8 @@ def train_fi_jepa(
                     ),
                 },
             )
+            
+            # if this is the best validation so far, write a best_validation.pt checkpoint
             if (
                 best_validation_loss is None
                 or validation_metrics["validation_jepa_loss"] < best_validation_loss
@@ -909,15 +945,15 @@ def train_fi_jepa(
             warmup_timing_records,
             boundary_timing_records,
         )
-        print(
-            "Epoch boundary: "
-            f"validation={validation_seconds:.3f}s | "
-            f"representation_evaluation={representation_evaluation_seconds:.3f}s | "
-            f"best_checkpoint={best_checkpoint_seconds:.3f}s | "
-            f"latest_checkpoint={latest_checkpoint_seconds:.3f}s | "
-            f"total={float(boundary_record['total_seconds']):.3f}s"
-        )
-        print(f"Completed epoch {epoch + 1}/{training_config.epochs} at step {global_step}.")
+        #print(
+        #    "Epoch boundary: "
+        #    f"validation={validation_seconds:.3f}s | "
+        #    f"representation_evaluation={representation_evaluation_seconds:.3f}s | "
+        #    f"best_checkpoint={best_checkpoint_seconds:.3f}s | "
+        #    f"latest_checkpoint={latest_checkpoint_seconds:.3f}s | "
+        #    f"total={float(boundary_record['total_seconds']):.3f}s"
+        #)
+        #print(f"Completed epoch {epoch + 1}/{training_config.epochs} at step {global_step}.")
 
     if training_profiler is not None:
         training_profiler.stop()

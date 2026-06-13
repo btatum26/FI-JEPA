@@ -109,6 +109,34 @@ runs/probes/<timestamp>_<run_id>/
 `report.json` contains per-fold and aggregate out-of-fold RMSE, MAE, R-squared,
 Pearson correlation, baseline metrics, and ridge coefficients.
 
+## Interpret One Latent Coordinate
+
+Correlate one exported PCA coordinate with raw VIX, SPY realized volatility,
+SPY drawdown, market breadth, cross-sectional dispersion, and separate future
+SPY volatility targets. Explicit calendar-day and trading-row controls expose
+latent drift that can masquerade as market-state meaning:
+
+```bash
+uv run python -m fi_jepa.analysis.analyze_latent_factor \
+  --embeddings runs/evaluation/<evaluation_artifact> \
+  --coordinate z_1
+```
+
+The analysis verifies the canonical database hash and writes under
+`runs/latent_factor_analysis/`:
+
+```text
+analysis_dataset.parquet
+correlations.csv
+report.json
+```
+
+`correlations.csv` reports full-sample, train, validation, and named
+validation-window Pearson and Spearman correlations. It reports raw levels,
+first differences, and linear-time-detrended values because a dominant PCA
+axis can carry a time trend that creates misleading level correlations.
+Future targets are joined only into this analysis artifact.
+
 ## Current Limits
 
 - Probes are continuous-target ridge regressions only.

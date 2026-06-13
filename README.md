@@ -251,6 +251,15 @@ uv run run-fi-jepa-probes \
   --targets data/probe_targets/<target_artifact>
 ```
 
+Interpret an exported PCA coordinate against raw market variables and separate
+future-volatility targets:
+
+```bash
+uv run python -m fi_jepa.analysis.analyze_latent_factor \
+  --embeddings runs/evaluation/<evaluation_artifact> \
+  --coordinate z_1
+```
+
 Embedding and target artifacts remain separate until probe evaluation. See
 [docs/probes.md](docs/probes.md) for the artifact and walk-forward probe
 contracts.
