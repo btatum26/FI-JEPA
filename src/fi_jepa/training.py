@@ -30,6 +30,7 @@ from fi_jepa.representation import (
 )
 from fi_jepa.training_config import FIJepaTrainingConfig
 from fi_jepa.training_profiler import (
+    PythonStackSampler,
     TimingRecord,
     append_runtime_timing_to_profile_summary,
     build_training_profiler,
@@ -377,6 +378,8 @@ def train_fi_jepa(
     """
     if profile and resume is not None:
         raise ValueError("Profiling runs cannot resume an existing run.")
+    if profile_python_stacks and not profile:
+        raise ValueError("Python stack sampling requires profile=True.")
     if profile_wait_steps < 0 or profile_warmup_steps < 0 or profile_active_steps <= 0:
         raise ValueError("Profiler steps require wait >= 0, warmup >= 0, and active > 0.")
 
@@ -537,6 +540,11 @@ def train_fi_jepa(
         if profile
         else None
     )
+    python_stack_sampler = (
+        PythonStackSampler(profiler_dir / "cpu_stacks.txt")
+        if profile and profile_python_stacks
+        else None
+    )
     print(f"FI-JEPA run: {run_dir}")
     print(
         "Training plan: "
@@ -554,6 +562,8 @@ def train_fi_jepa(
             f"output={profiler_dir}"
         )
         training_profiler.start()
+        if python_stack_sampler is not None:
+            python_stack_sampler.start()
 
     profile_complete = False
     profiled_steps = 0
@@ -911,6 +921,8 @@ def train_fi_jepa(
 
     if training_profiler is not None:
         training_profiler.stop()
+        if python_stack_sampler is not None:
+            python_stack_sampler.stop()
         append_runtime_timing_to_profile_summary(
             profiler_dir / "summary.txt",
             runtime_summary_path,
@@ -970,7 +982,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--profile-python-stacks",
         action="store_true",
-        help="Record Python stacks and write profiler/cpu_stacks.txt; adds substantial overhead.",
+        help="Sample Python stacks into profiler/cpu_stacks.txt; adds substantial overhead.",
     )
     return parser.parse_args()
 

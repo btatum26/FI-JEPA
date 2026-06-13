@@ -1,13 +1,77 @@
 from __future__ import annotations
 
+from collections import Counter
 from contextlib import nullcontext
 from pathlib import Path
+import sys
+import threading
+import traceback
 from typing import Any
 
 import torch
 
 
 TimingRecord = dict[str, float | int]
+
+
+# ============================================================================
+# PYTHON STACK SAMPLING
+# ============================================================================
+
+
+class PythonStackSampler:
+    """Sample the constructing thread's Python stack into folded-stack format.
+
+    PyTorch's Kineto stack export is empty on some Windows builds. This sampler
+    records the main training thread independently, producing a non-empty
+    ``cpu_stacks.txt`` that can be loaded by folded-stack/flame-graph tools.
+    Dataloader worker processes remain outside this parent-process sampler.
+    """
+
+    def __init__(self, output_path: Path, *, interval_seconds: float = 0.01):
+        if interval_seconds <= 0.0:
+            raise ValueError("Python stack sampling interval must be positive.")
+        self.output_path = output_path
+        self.interval_seconds = interval_seconds
+        self.target_thread_id = threading.get_ident()
+        self.samples: Counter[str] = Counter()
+        self.stop_event = threading.Event()
+        self.thread = threading.Thread(
+            target=self._sample_until_stopped,
+            name="fi-jepa-python-stack-sampler",
+            daemon=True,
+        )
+
+    def start(self) -> None:
+        """Start sampling the training thread."""
+        self.thread.start()
+
+    def stop(self) -> None:
+        """Stop sampling and write folded stacks ordered by sample count."""
+        self.stop_event.set()
+        self.thread.join()
+        self.output_path.parent.mkdir(parents=True, exist_ok=True)
+        lines = [
+            f"{stack} {count}"
+            for stack, count in self.samples.most_common()
+        ]
+        self.output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    def _sample_until_stopped(self) -> None:
+        """Collect complete Python stacks until the owning training run stops."""
+        while not self.stop_event.is_set():
+            frame = sys._current_frames().get(self.target_thread_id)
+            if frame is not None:
+                stack = ";".join(
+                    (
+                        f"{entry.name} "
+                        f"[{entry.filename.replace(chr(92), '/')}:{entry.lineno}]"
+                    ).replace(";", "_")
+                    for entry in traceback.extract_stack(frame)
+                )
+                if stack:
+                    self.samples[stack] += 1
+            self.stop_event.wait(self.interval_seconds)
 
 
 # ============================================================================
@@ -48,11 +112,6 @@ def build_training_profiler(
         cpu_summary = key_averages.table(sort_by="self_cpu_time_total", row_limit=-1)
         (output_dir / "summary.txt").write_text(summary + "\n", encoding="utf-8")
         (output_dir / "cpu_summary.txt").write_text(cpu_summary + "\n", encoding="utf-8")
-        if python_stacks:
-            profiler.export_stacks(
-                str(output_dir / "cpu_stacks.txt"),
-                metric="self_cpu_time_total",
-            )
 
     activities = [torch.profiler.ProfilerActivity.CPU]
     if device.type == "cuda":

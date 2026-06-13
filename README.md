@@ -213,7 +213,9 @@ device-first `summary.txt` plus exhaustive CPU-sorted `cpu_summary.txt` under
 `runs/pretraining/<run>/profiler/`. Override the schedule with
 `--profile-wait-steps`, `--profile-warmup-steps`, and `--profile-active-steps`.
 Pass `--profile-python-stacks` to additionally write `cpu_stacks.txt`; stack
-capture materially increases profiler overhead and trace size.
+capture materially increases profiler overhead and trace size. Stack sampling
+covers the main training process. Set dataloader `num_workers: 0` when profiling
+if the stack output must include dataloader assembly internals.
 
 Every training run also prints and records epoch warm-up and boundary timings.
 `runs/pretraining/<run>/runtime_summary.txt` separates dataset epoch updates,
