@@ -135,9 +135,15 @@ def test_latent_factor_analysis_writes_segmented_market_correlations(tmp_path: P
         & correlations["transform"].eq("level")
         & correlations["variable"].eq("drawdown_21d")
     ].iloc[0]
+    detrended_time = correlations.loc[
+        correlations["segment"].eq("all")
+        & correlations["transform"].eq("linear_time_detrended")
+        & correlations["variable"].eq("elapsed_trading_rows")
+    ].iloc[0]
 
     assert vix["pearson_correlation"] == pytest.approx(1.0)
     assert drawdown["pearson_correlation"] == pytest.approx(-1.0)
+    assert np.isnan(detrended_time["pearson_correlation"])
     assert "validation_window:test_window" in correlations["segment"].unique()
     assert report["future_targets_joined_only_for_analysis"] is True
     assert report["pretraining_artifact_mutated"] is False

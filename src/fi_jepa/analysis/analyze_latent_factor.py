@@ -147,7 +147,10 @@ def _linear_time_detrend(pair: pd.DataFrame) -> pd.DataFrame:
     for name in pair.columns:
         values = pair[name].to_numpy(dtype=np.float64)
         coefficients = np.linalg.lstsq(design, values, rcond=None)[0]
-        detrended[name] = values - design @ coefficients
+        residuals = values - design @ coefficients
+        if np.std(residuals) <= np.std(values) * 1e-10:
+            residuals = np.zeros_like(residuals)
+        detrended[name] = residuals
     return detrended
 
 
