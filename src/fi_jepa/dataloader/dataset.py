@@ -8,6 +8,7 @@ from fi_jepa.dataloader.config import FIJepaDataConfig
 from fi_jepa.dataloader.masking import compute_patch_masks
 from fi_jepa.dataloader.panel_store import DensePanelStore, Split
 from fi_jepa.dataloader.request import DensePanelWindowRequest, RequestKind, ViewKind
+from fi_jepa.dataloader.validation import validate_request_dataset_options, validate_request_history
 
 
 # ============================================================================
@@ -33,30 +34,17 @@ class DensePanelWindowRequestDataset(Dataset[DensePanelWindowRequest]):
         view_kind: ViewKind,
         view_index: int = 0,
     ):
-        if split not in {"train", "validation"}:
-            raise ValueError(f"Unsupported split: {split}")
-        if request_kind == "jepa" and view_kind not in {"random_k", "all_valid"}:
-            raise ValueError("JEPA requests support only random_k and all_valid views.")
-        if request_kind == "embedding" and view_kind not in {"fixed_k", "all_valid"}:
-            raise ValueError("Embedding requests support only fixed_k and all_valid views.")
-        if view_index < 0:
-            raise ValueError("view_index cannot be negative.")
-
         artifact_lookback = (store.resolved_config.get("dates") or {}).get("lookback_days")
-        if artifact_lookback is not None and config.lookback_days > int(artifact_lookback):
-            raise ValueError(
-                f"Configured lookback_days={config.lookback_days} exceeds "
-                f"artifact lookback_days={artifact_lookback}."
-            )
-
+        validate_request_dataset_options(
+            split=split,
+            request_kind=request_kind,
+            view_kind=view_kind,
+            view_index=view_index,
+            configured_lookback=config.lookback_days,
+            artifact_lookback=artifact_lookback,
+        )
         request_index = store.request_index_for(split).reset_index(drop=True)
-        too_early = request_index["sample_date_idx"] < config.lookback_days - 1
-        if too_early.any():
-            row = request_index.loc[too_early].iloc[0]
-            raise ValueError(
-                f"Request sample_date_idx={int(row['sample_date_idx'])} cannot provide "
-                f"lookback_days={config.lookback_days} without padding."
-            )
+        validate_request_history(request_index, config.lookback_days)
 
         self.nominal_request_count = len(request_index)
         if request_kind == "jepa":

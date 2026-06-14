@@ -12,6 +12,12 @@ if TYPE_CHECKING:
 
 from fi_jepa.model_config import FIJepaModelConfig
 from fi_jepa.model_output import FIJepaOutput
+from fi_jepa.model_validation import (
+    ENCODER_BATCH_TENSOR_NAMES as ENCODER_BATCH_TENSOR_NAMES,
+    JEPA_BATCH_TENSOR_NAMES as JEPA_BATCH_TENSOR_NAMES,
+    validate_model_batch,
+    validate_model_feature_dimensions,
+)
 from fi_jepa.tokenizer import (
     MaskedAttentionAssetPooler,
     MaskedAttentionPatchTokenizer,
@@ -19,30 +25,6 @@ from fi_jepa.tokenizer import (
     masked_mean,
     pack_masked_sequence,
 )
-
-ENCODER_BATCH_TENSOR_NAMES = frozenset(
-    {
-        "asset_patches",
-        "market_patches",
-        "macro_patches",
-        "asset_feature_mask_patched",
-        "market_feature_mask_patched",
-        "macro_feature_mask_patched",
-        "valid_asset_mask_patched",
-        "valid_market_date_mask_patched",
-        "valid_macro_date_mask_patched",
-        "patch_asset_mask",
-        "patch_context_mask",
-    }
-)
-JEPA_BATCH_TENSOR_NAMES = frozenset(
-    {
-        "target_patch_ids",
-        "target_patch_id_mask",
-        "jepa_context_mask",
-    }
-)
-
 
 # ============================================================================
 # CHECKPOINT COMPATIBILITY
@@ -118,13 +100,13 @@ class FIJepaModel(nn.Module):
         macro_feature_dim: int,
     ):
         super().__init__()
-        for name, value in (
-            ("asset_feature_dim", asset_feature_dim),
-            ("market_feature_dim", market_feature_dim),
-            ("macro_feature_dim", macro_feature_dim),
-        ):
-            if value <= 0:
-                raise ValueError(f"{name} must be positive.")
+        validate_model_feature_dimensions(
+            {
+                "asset_feature_dim": asset_feature_dim,
+                "market_feature_dim": market_feature_dim,
+                "macro_feature_dim": macro_feature_dim,
+            }
+        )
 
         self.config = config
         self.asset_feature_dim = asset_feature_dim
@@ -285,206 +267,16 @@ class FIJepaModel(nn.Module):
         *,
         require_jepa_targets: bool = True,
     ) -> dict[str, torch.Tensor]:
-        """Validate the complete patched-batch interface before model computation.
-
-        Shapes, dtypes, devices, configured dimensions, and mask relationships
-        are checked here so dataloader drift fails at the model boundary instead
-        of producing a plausible but semantically incorrect training run.
-        """
-        # First establish the complete interface. Optional or silently ignored
-        # tensors at this boundary would allow loader/model contracts to drift.
-        required = (
-            ENCODER_BATCH_TENSOR_NAMES | JEPA_BATCH_TENSOR_NAMES if require_jepa_targets else ENCODER_BATCH_TENSOR_NAMES
+        """Delegate complete patched-batch interface validation."""
+        return validate_model_batch(
+            batch,
+            num_patches=self.config.num_patches,
+            patch_len=self.config.patch_len,
+            asset_feature_dim=self.asset_feature_dim,
+            market_feature_dim=self.market_feature_dim,
+            macro_feature_dim=self.macro_feature_dim,
+            require_jepa_targets=require_jepa_targets,
         )
-        missing = sorted(required - set(batch))
-        if missing:
-            raise ValueError(f"FI-JEPA batch is missing required keys: {missing}")
-
-        # Narrow all required values to tensors before shape or device access.
-        tensors: dict[str, torch.Tensor] = {}
-        for name in required:
-            value = batch[name]
-            if not isinstance(value, torch.Tensor):
-                raise ValueError(f"{name} must be a Tensor; got {type(value).__name__}.")
-            tensors[name] = value
-
-        # Rank checks produce clearer errors than unpacking malformed shapes.
-        expected_ranks = {
-            "asset_patches": 5,
-            "market_patches": 4,
-            "macro_patches": 4,
-            "asset_feature_mask_patched": 5,
-            "market_feature_mask_patched": 4,
-            "macro_feature_mask_patched": 4,
-            "valid_asset_mask_patched": 4,
-            "valid_market_date_mask_patched": 3,
-            "valid_macro_date_mask_patched": 3,
-            "patch_asset_mask": 3,
-            "patch_context_mask": 2,
-        }
-        if require_jepa_targets:
-            expected_ranks.update(
-                {
-                    "target_patch_ids": 2,
-                    "target_patch_id_mask": 2,
-                    "jepa_context_mask": 2,
-                }
-            )
-        for name, rank in expected_ranks.items():
-            if tensors[name].ndim != rank:
-                raise ValueError(
-                    f"{name} must have rank {rank}; got shape {tuple(tensors[name].shape)}."
-                )
-
-        # The asset stream establishes shared B, P, L, and A dimensions.
-        # Every other stream and mask must align to those axes.
-        asset_shape = tuple(tensors["asset_patches"].shape)
-        batch_size, num_patches, patch_len, num_assets, asset_dim = asset_shape
-        market_dim = self.market_feature_dim
-        macro_dim = self.macro_feature_dim
-        expected_shapes = {
-            "asset_patches": (
-                batch_size,
-                self.config.num_patches,
-                self.config.patch_len,
-                num_assets,
-                self.asset_feature_dim,
-            ),
-            "market_patches": (
-                batch_size,
-                self.config.num_patches,
-                self.config.patch_len,
-                market_dim,
-            ),
-            "macro_patches": (
-                batch_size,
-                self.config.num_patches,
-                self.config.patch_len,
-                macro_dim,
-            ),
-            "asset_feature_mask_patched": asset_shape,
-            "market_feature_mask_patched": (
-                batch_size,
-                num_patches,
-                patch_len,
-                market_dim,
-            ),
-            "macro_feature_mask_patched": (
-                batch_size,
-                num_patches,
-                patch_len,
-                macro_dim,
-            ),
-            "valid_asset_mask_patched": (
-                batch_size,
-                num_patches,
-                patch_len,
-                num_assets,
-            ),
-            "valid_market_date_mask_patched": (batch_size, num_patches, patch_len),
-            "valid_macro_date_mask_patched": (batch_size, num_patches, patch_len),
-            "patch_asset_mask": (batch_size, num_patches, num_assets),
-            "patch_context_mask": (batch_size, num_patches),
-        }
-        if require_jepa_targets:
-            target_count = tensors["target_patch_ids"].shape[1]
-            expected_shapes.update(
-                {
-                    "target_patch_ids": (batch_size, target_count),
-                    "target_patch_id_mask": (batch_size, target_count),
-                    "jepa_context_mask": (batch_size, num_patches),
-                }
-            )
-        for name, expected in expected_shapes.items():
-            actual = tuple(tensors[name].shape)
-            if actual != expected:
-                raise ValueError(f"{name} must have shape {expected}; got {actual}.")
-
-        # Values must remain floating point, masks boolean, and target IDs
-        # integer so later masking and gather operations have exact semantics.
-        for name in ("asset_patches", "market_patches", "macro_patches"):
-            if not tensors[name].is_floating_point():
-                raise ValueError(f"{name} must be floating point; got {tensors[name].dtype}.")
-        mask_names = required - {
-            "asset_patches",
-            "market_patches",
-            "macro_patches",
-            "target_patch_ids",
-        }
-        for name in mask_names:
-            if tensors[name].dtype != torch.bool:
-                raise ValueError(f"{name} must have dtype bool; got {tensors[name].dtype}.")
-        if require_jepa_targets:
-            integer_dtypes = {
-                torch.int8,
-                torch.int16,
-                torch.int32,
-                torch.int64,
-                torch.uint8,
-            }
-            if tensors["target_patch_ids"].dtype not in integer_dtypes:
-                raise ValueError(
-                    "target_patch_ids must have an integer dtype; "
-                    f"got {tensors['target_patch_ids'].dtype}."
-                )
-
-        # Mixed-device batches fail here instead of during a later arithmetic op.
-        devices = {tensor.device for tensor in tensors.values()}
-        if len(devices) != 1:
-            raise ValueError(f"All FI-JEPA batch tensors must share one device; got {devices}.")
-        if batch_size <= 0 or num_assets <= 0:
-            raise ValueError("Batch and asset dimensions must be positive.")
-
-        patch_context = tensors["patch_context_mask"]
-        if not patch_context.any(dim=1).all():
-            raise ValueError("patch_context_mask must enable at least one patch per sample.")
-        if not require_jepa_targets:
-            return tensors
-
-        # Validate the semantic relationship between full context, hidden
-        # targets, and the visible online-encoder context.
-        jepa_context = tensors["jepa_context_mask"]
-        target_ids = tensors["target_patch_ids"]
-        target_mask = tensors["target_patch_id_mask"]
-        target_count = target_ids.shape[1]
-        if target_count <= 0:
-            raise ValueError("Target dimension must be positive.")
-        if not jepa_context.any(dim=1).all():
-            raise ValueError("jepa_context_mask must enable at least one patch per sample.")
-        if (jepa_context & ~patch_context).any():
-            raise ValueError("jepa_context_mask must be a subset of patch_context_mask.")
-        if not target_mask.any(dim=1).all():
-            raise ValueError("target_patch_id_mask must enable at least one target per sample.")
-        if (target_ids[~target_mask] != -1).any():
-            raise ValueError("Disabled target_patch_ids must use the -1 padding sentinel.")
-        enabled_ids = target_ids[target_mask]
-        if ((enabled_ids < 0) | (enabled_ids >= num_patches)).any():
-            raise ValueError(
-                f"Enabled target_patch_ids must be within [0, {num_patches}); "
-                f"got {enabled_ids.tolist()}."
-            )
-        # Replace -1 padding only for gathers; target_mask continues to control
-        # whether the gathered placeholder has any semantic effect.
-        safe_ids = target_ids.clamp_min(0)
-        target_is_context = patch_context.gather(1, safe_ids)
-        target_is_visible = jepa_context.gather(1, safe_ids)
-        if not target_is_context[target_mask].all():
-            raise ValueError("Every enabled target_patch_id must reference a context-valid patch.")
-        if target_is_visible[target_mask].any():
-            raise ValueError("Enabled target patches cannot also appear in jepa_context_mask.")
-        # Reconstruct target positions from IDs to verify exact set equality
-        # with the patches removed from visible JEPA context.
-        target_positions = torch.zeros_like(patch_context)
-        for row_index, (row_ids, row_mask) in enumerate(zip(target_ids, target_mask, strict=True)):
-            selected = row_ids[row_mask]
-            if selected.unique().numel() != selected.numel():
-                raise ValueError("Enabled target_patch_ids must be unique within each sample.")
-            target_positions[row_index, selected] = True
-        if not torch.equal(jepa_context, patch_context & ~target_positions):
-            raise ValueError(
-                "jepa_context_mask must equal patch_context_mask with enabled targets removed."
-            )
-        return tensors
 
     def _tokenize_and_fuse(
         self,

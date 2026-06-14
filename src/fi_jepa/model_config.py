@@ -5,6 +5,8 @@ from pathlib import Path
 
 import yaml
 
+from fi_jepa.model_validation import validate_model_config, validate_model_yaml
+
 
 # ============================================================================
 # MODEL CONFIGURATION
@@ -49,64 +51,47 @@ class FIJepaModelConfig:
 
     def __post_init__(self) -> None:
         """Reject invalid dimensions, attention widths, and dropout rates."""
-        integer_fields = {
-            "patch_len": self.patch_len,
-            "num_patches": self.num_patches,
-            "tokenizer_layers": self.tokenizer_layers,
-            "tokenizer_heads": self.tokenizer_heads,
-            "tokenizer_mlp_ratio": self.tokenizer_mlp_ratio,
-            "asset_pooling_layers": self.asset_pooling_layers,
-            "asset_pooling_heads": self.asset_pooling_heads,
-            "asset_pooling_mlp_ratio": self.asset_pooling_mlp_ratio,
-            "asset_hidden_dim": self.asset_hidden_dim,
-            "asset_token_dim": self.asset_token_dim,
-            "market_hidden_dim": self.market_hidden_dim,
-            "market_token_dim": self.market_token_dim,
-            "macro_hidden_dim": self.macro_hidden_dim,
-            "macro_token_dim": self.macro_token_dim,
-            "d_model": self.d_model,
-            "latent_dim": self.latent_dim,
-            "context_layers": self.context_layers,
-            "context_heads": self.context_heads,
-            "context_mlp_ratio": self.context_mlp_ratio,
-            "predictor_layers": self.predictor_layers,
-            "predictor_heads": self.predictor_heads,
-            "predictor_mlp_ratio": self.predictor_mlp_ratio,
-        }
-        invalid = [name for name, value in integer_fields.items() if value <= 0]
-        if invalid:
-            raise ValueError(f"Model dimensions and counts must be positive: {invalid}")
-        if self.tokenizer_type not in {"mean", "attention"}:
-            raise ValueError("tokenizer_type must be 'mean' or 'attention'.")
-        if self.asset_pooling_type not in {"mean", "attention"}:
-            raise ValueError("asset_pooling_type must be 'mean' or 'attention'.")
-        if self.d_model % self.context_heads:
-            raise ValueError("d_model must be divisible by context_heads.")
-        if self.d_model % self.predictor_heads:
-            raise ValueError("d_model must be divisible by predictor_heads.")
-        if self.tokenizer_type == "attention":
-            incompatible_tokenizers = [
-                name
-                for name, hidden_dim in (
-                    ("asset_hidden_dim", self.asset_hidden_dim),
-                    ("market_hidden_dim", self.market_hidden_dim),
-                    ("macro_hidden_dim", self.macro_hidden_dim),
-                )
-                if hidden_dim % self.tokenizer_heads
-            ]
-            if incompatible_tokenizers:
-                raise ValueError(
-                    "Tokenizer hidden dimensions must be divisible by tokenizer_heads: "
-                    f"{incompatible_tokenizers}"
-                )
-        if self.asset_pooling_type == "attention" and (
-            self.asset_token_dim % self.asset_pooling_heads
-        ):
-            raise ValueError("asset_token_dim must be divisible by asset_pooling_heads.")
-        if not 0.0 <= self.context_dropout < 1.0:
-            raise ValueError("context_dropout must be in [0, 1).")
-        if not 0.0 <= self.predictor_dropout < 1.0:
-            raise ValueError("predictor_dropout must be in [0, 1).")
+        validate_model_config(
+            integer_fields={
+                "patch_len": self.patch_len,
+                "num_patches": self.num_patches,
+                "tokenizer_layers": self.tokenizer_layers,
+                "tokenizer_heads": self.tokenizer_heads,
+                "tokenizer_mlp_ratio": self.tokenizer_mlp_ratio,
+                "asset_pooling_layers": self.asset_pooling_layers,
+                "asset_pooling_heads": self.asset_pooling_heads,
+                "asset_pooling_mlp_ratio": self.asset_pooling_mlp_ratio,
+                "asset_hidden_dim": self.asset_hidden_dim,
+                "asset_token_dim": self.asset_token_dim,
+                "market_hidden_dim": self.market_hidden_dim,
+                "market_token_dim": self.market_token_dim,
+                "macro_hidden_dim": self.macro_hidden_dim,
+                "macro_token_dim": self.macro_token_dim,
+                "d_model": self.d_model,
+                "latent_dim": self.latent_dim,
+                "context_layers": self.context_layers,
+                "context_heads": self.context_heads,
+                "context_mlp_ratio": self.context_mlp_ratio,
+                "predictor_layers": self.predictor_layers,
+                "predictor_heads": self.predictor_heads,
+                "predictor_mlp_ratio": self.predictor_mlp_ratio,
+            },
+            tokenizer_type=self.tokenizer_type,
+            asset_pooling_type=self.asset_pooling_type,
+            d_model=self.d_model,
+            context_heads=self.context_heads,
+            predictor_heads=self.predictor_heads,
+            tokenizer_heads=self.tokenizer_heads,
+            tokenizer_hidden_dims={
+                "asset_hidden_dim": self.asset_hidden_dim,
+                "market_hidden_dim": self.market_hidden_dim,
+                "macro_hidden_dim": self.macro_hidden_dim,
+            },
+            asset_token_dim=self.asset_token_dim,
+            asset_pooling_heads=self.asset_pooling_heads,
+            context_dropout=self.context_dropout,
+            predictor_dropout=self.predictor_dropout,
+        )
 
     @classmethod
     def from_yaml(cls, path: Path | str) -> FIJepaModelConfig:
@@ -116,38 +101,13 @@ class FIJepaModelConfig:
         method converts that nested representation into the immutable runtime
         configuration and enforces dropout-free online and target fusion.
         """
-        values = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
-        if not isinstance(values, dict):
-            raise ValueError("Model configuration must be a YAML mapping.")
-        required_sections = {
-            "input",
-            "tokenizers",
-            "fusion",
-            "context_encoder",
-            "predictor",
-            "state_exporter",
-        }
-        missing = sorted(required_sections - set(values))
-        if missing:
-            raise ValueError(f"Model configuration is missing sections: {missing}")
-
+        values = validate_model_yaml(yaml.safe_load(Path(path).read_text(encoding="utf-8")))
         tokenizers = values["tokenizers"]
         tokenizer_type = str(tokenizers.get("type", "mean"))
         tokenizer_attention = tokenizers.get("attention") or {}
-        if tokenizer_type == "attention" and not tokenizer_attention:
-            raise ValueError("Attention tokenizer configuration is missing tokenizers.attention.")
         asset_pooling = values.get("asset_pooling") or {}
         asset_pooling_type = str(asset_pooling.get("type", "mean"))
         asset_pooling_attention = asset_pooling.get("attention") or {}
-        if asset_pooling_type == "attention" and not asset_pooling_attention:
-            raise ValueError(
-                "Attention asset pooling configuration is missing asset_pooling.attention."
-            )
-        fusion_dropout = float(values["fusion"].get("dropout", 0.0))
-        if fusion_dropout != 0.0:
-            raise ValueError(
-                "Online and target fusion dropout must remain 0.0 for deterministic inputs."
-            )
         return cls(
             patch_len=int(values["input"]["patch_len"]),
             num_patches=int(values["input"]["num_patches"]),

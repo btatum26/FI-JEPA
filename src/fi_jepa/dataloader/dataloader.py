@@ -10,6 +10,7 @@ from fi_jepa.dataloader.batch_assembler import DensePanelBatchAssembler
 from fi_jepa.dataloader.config import FIJepaDataConfig
 from fi_jepa.dataloader.dataset import DensePanelWindowRequestDataset
 from fi_jepa.dataloader.panel_store import DensePanelStore, Split
+from fi_jepa.dataloader.validation import validate_store_artifact_path
 
 AssetView = Literal["all_valid", "fixed_k"]
 
@@ -88,8 +89,8 @@ def _resolve_config_and_store(
         config = FIJepaDataConfig.from_yaml(config)
     if store is None:
         store = DensePanelStore(config.artifact_path, cache_root=config.cache_root)
-    elif store.artifact_path != config.artifact_path.resolve():
-        raise ValueError("The supplied store does not match config.artifact_path.")
+    else:
+        validate_store_artifact_path(store.artifact_path, config.artifact_path)
     return config, store
 
 

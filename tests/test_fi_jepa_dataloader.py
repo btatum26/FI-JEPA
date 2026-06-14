@@ -221,6 +221,32 @@ def test_cache_reuse_strict_invalidation_and_status_output(
     assert manifest["array_dtypes"]["train_asset_x"] == "float32"
 
 
+def test_cache_reuse_does_not_parse_source_metadata_parquets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _write_sparse_artifact(tmp_path / "artifact")
+    first = DensePanelStore(config.artifact_path, cache_root=config.cache_root)
+    first.close()
+    source_metadata = {
+        (config.artifact_path / name).resolve()
+        for name in ("dates.parquet", "assets.parquet", "feature_manifest.parquet")
+    }
+    read_parquet = pd.read_parquet
+
+    def reject_source_metadata(path: Path | str, *args: object, **kwargs: object) -> pd.DataFrame:
+        """Fail if a valid-cache construction parses source metadata Parquets."""
+        if Path(path).resolve() in source_metadata:
+            raise AssertionError(f"Unexpected source metadata read: {path}")
+        return read_parquet(path, *args, **kwargs)
+
+    monkeypatch.setattr(pd, "read_parquet", reject_source_metadata)
+    reused = DensePanelStore(config.artifact_path, cache_root=config.cache_root)
+
+    assert reused.date_count == 16
+    assert reused.asset_count == 4
+    assert reused.feature_names["asset"] == ["asset_a", "asset_b"]
+
+
 def test_worker_pickle_reopens_existing_cache_read_only(tmp_path: Path) -> None:
     config = _write_sparse_artifact(tmp_path / "artifact")
     store = DensePanelStore(config.artifact_path, cache_root=config.cache_root)

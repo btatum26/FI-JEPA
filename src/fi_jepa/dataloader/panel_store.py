@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
-import re
 import shutil
 import tempfile
 from typing import Literal
@@ -13,10 +12,18 @@ import pandas as pd
 import pyarrow.parquet as pq
 import yaml
 
+from fi_jepa.dataloader.validation import (
+    validate_build_id,
+    validate_cache,
+    validate_cache_root,
+    validate_fact_schema,
+    validate_required_artifact_files,
+    validate_source_manifests,
+)
+
 Split = Literal["train", "validation"]
 
 CACHE_FORMAT_VERSION = 1
-FORBIDDEN_FEATURE_PATTERN = re.compile(r"future_|target|label", re.IGNORECASE)
 SOURCE_HASH_FILES = ("manifest.json", "config_resolved.yaml", "feature_manifest.parquet")
 SPARSE_FACT_FILES = tuple(
     f"{split}_{group}_features.parquet"
@@ -95,23 +102,26 @@ class DensePanelStore:
     ):
         self.artifact_path = Path(artifact_path).resolve()
         self.cache_root = Path(cache_root).resolve()
-        if self.cache_root.is_relative_to(self.artifact_path):
-            raise ValueError("cache_root must be outside the immutable artifact directory.")
+        validate_cache_root(self.artifact_path, self.cache_root)
 
         # validate the build_id matches the artifact
-        self._validate_required_artifact_files_exist()
+        validate_required_artifact_files(self.artifact_path, REQUIRED_ARTIFACT_FILES)
         self.manifest = json.loads((self.artifact_path / "manifest.json").read_text(encoding="utf-8"))
-        build_id = self.manifest.get("build_id")
-        if not build_id:
-            raise ValueError("Sparse artifact manifest.json must contain a stable build_id.")
-        self.dataset_version = str(build_id)
+        self.dataset_version = validate_build_id(self.manifest)
+        self.cache_path = (self.cache_root / f"{self.dataset_version}_v{CACHE_FORMAT_VERSION}").resolve()
+        self._source_identity = self._build_source_identity()
 
-        self._source_dates = pd.read_parquet(self.artifact_path / "dates.parquet")
-        self._source_assets = pd.read_parquet(self.artifact_path / "assets.parquet")
-        self.feature_manifest = pd.read_parquet(self.artifact_path / "feature_manifest.parquet")
-        self.resolved_config = yaml.safe_load((self.artifact_path / "config_resolved.yaml").read_text(encoding="utf-8"))
-        self._validate_source_manifests()
+        self.cache_root.mkdir(parents=True, exist_ok=True)
+        print(f"Dense panel cache: checking {self.cache_path}")
+        if self._validate_cache(self.cache_path):
+            print(f"Dense panel cache: reusing {self.cache_path}")
+        else:
+            self._load_source_metadata()
+            self._expected_manifest = self._build_expected_cache_manifest()
+            self._rebuild_cache()
 
+        self.feature_manifest = pd.read_parquet(self.cache_path / "feature_manifest.parquet")
+        self.resolved_config = yaml.safe_load((self.cache_path / "config_resolved.yaml").read_text(encoding="utf-8"))
         self.feature_names = {
             group: (
                 self.feature_manifest.loc[self.feature_manifest["input_group"].eq(group)]
@@ -120,19 +130,15 @@ class DensePanelStore:
             )
             for group in ("asset", "market", "macro")
         }
-        self.date_count = len(self._source_dates)
-        self.asset_count = len(self._source_assets)
-        self.cache_path = (self.cache_root / f"{self.dataset_version}_v{CACHE_FORMAT_VERSION}").resolve()
-        self._expected_manifest = self._build_expected_cache_manifest()
-
-        self.cache_root.mkdir(parents=True, exist_ok=True)
-        self._ensure_cache()
         self._load_request_indexes()
         self._open_cache_arrays()
+        self.date_count = len(self.dates)
+        self.asset_count = len(self.assets)
 
-        # Source DataFrames are not needed after the immutable cache is open.
-        del self._source_dates
-        del self._source_assets
+        # Source DataFrames exist only during a cache rebuild.
+        if hasattr(self, "_source_dates"):
+            del self._source_dates
+            del self._source_assets
 
     def __getstate__(self) -> dict[str, object]:
         """Serialize metadata without copying mapped dense-panel arrays."""
@@ -144,7 +150,7 @@ class DensePanelStore:
     def __setstate__(self, state: dict[str, object]) -> None:
         """Reopen an already-published cache without worker-side mutation."""
         self.__dict__.update(state)
-        self._open_cache_arrays(validate=False)
+        self._open_cache_arrays()
 
     def request_index_for(self, split: Split) -> pd.DataFrame:
         """Return the immutable request index for one split."""
@@ -185,56 +191,23 @@ class DensePanelStore:
     # SOURCE VALIDATION AND CACHE IDENTITY
     # ============================================================================
 
-    def _validate_required_artifact_files_exist(self) -> None:
-        """Require the complete sparse model-artifact input contract."""
-        missing = sorted(name for name in REQUIRED_ARTIFACT_FILES if not (self.artifact_path / name).is_file())
-        if missing:
-            raise FileNotFoundError(f"Sparse artifact is missing required files: {missing}")
-
-    def _validate_source_manifests(self) -> None:
-        """Validate dense-axis manifests and reject target-like input features."""
-        required_dates = {
-            "date_idx",
-            "date",
-            "sample_eligible",
-            "validation_sample",
-            "protected_holdout",
-            "train_fact_allowed",
-            "validation_fact_allowed",
+    def _load_source_metadata(self) -> None:
+        """Parse and validate source metadata only when the dense cache must be rebuilt."""
+        self._source_dates = pd.read_parquet(self.artifact_path / "dates.parquet")
+        self._source_assets = pd.read_parquet(self.artifact_path / "assets.parquet")
+        self.feature_manifest = pd.read_parquet(self.artifact_path / "feature_manifest.parquet")
+        self.resolved_config = yaml.safe_load((self.artifact_path / "config_resolved.yaml").read_text(encoding="utf-8"))
+        validate_source_manifests(self._source_dates, self._source_assets, self.feature_manifest)
+        self.feature_names = {
+            group: (
+                self.feature_manifest.loc[self.feature_manifest["input_group"].eq(group)]
+                .sort_values("feature_index")["feature_name"]
+                .tolist()
+            )
+            for group in ("asset", "market", "macro")
         }
-
-        # checks dates file
-        missing_dates = sorted(required_dates - set(self._source_dates.columns))
-        if missing_dates:
-            raise ValueError(f"dates.parquet is missing columns: {missing_dates}")
-        if self._source_dates["date_idx"].tolist() != list(range(len(self._source_dates))):
-            raise ValueError("dates.parquet date_idx must be contiguous and ordered.")
-        if not self._source_dates["date"].is_monotonic_increasing:
-            raise ValueError("dates.parquet dates must be ordered.")
-
-        # checks assets file
-        required_assets = {"asset_id", "symbol", "trainable"}
-        missing_assets = sorted(required_assets - set(self._source_assets.columns))
-        if missing_assets:
-            raise ValueError(f"assets.parquet is missing columns: {missing_assets}")
-        if self._source_assets["asset_id"].tolist() != list(range(len(self._source_assets))):
-            raise ValueError("assets.parquet asset_id must be contiguous and ordered.")
-
-        # checks features file
-        required_features = {"feature_name", "feature_index", "input_group", "dtype"}
-        missing_features = sorted(required_features - set(self.feature_manifest.columns))
-        if missing_features:
-            raise ValueError(f"feature_manifest.parquet is missing columns: {missing_features}")
-        if set(self.feature_manifest["input_group"]) != {"asset", "market", "macro"}:
-            raise ValueError("Feature manifest must contain asset, market, and macro groups.")
-        forbidden = self.feature_manifest["feature_name"].astype(str).str.contains(FORBIDDEN_FEATURE_PATTERN)
-        if forbidden.any():
-            names = self.feature_manifest.loc[forbidden, "feature_name"].tolist()
-            raise ValueError(f"Forbidden target-like features in artifact: {names}")
-        for group, frame in self.feature_manifest.groupby("input_group"):
-            indices = frame.sort_values("feature_index")["feature_index"].tolist()
-            if indices != list(range(len(indices))):
-                raise ValueError(f"{group} feature indices must be contiguous from zero.")
+        self.date_count = len(self._source_dates)
+        self.asset_count = len(self._source_assets)
 
     @staticmethod
     def _sha256(path: Path) -> str:
@@ -275,13 +248,12 @@ class DensePanelStore:
         specs["train_target_date_mask"] = {"shape": [d], "dtype": "bool"}
         return specs
 
-    def _build_expected_cache_manifest(self) -> dict[str, object]:
-        """Build the strict manifest required for cache reuse."""
+    def _build_source_identity(self) -> dict[str, object]:
+        """Fingerprint every source input without parsing source Parquets."""
         fact_stats = {}
         for name in SPARSE_FACT_FILES:
             stat = (self.artifact_path / name).stat()
             fact_stats[name] = {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
-        specs = self._array_specs()
         return {
             "cache_format_version": CACHE_FORMAT_VERSION,
             "source_artifact_id": self.dataset_version,
@@ -291,55 +263,32 @@ class DensePanelStore:
             "source_dates_sha256": self._sha256(self.artifact_path / "dates.parquet"),
             "source_assets_sha256": self._sha256(self.artifact_path / "assets.parquet"),
             "source_sparse_fact_files": fact_stats,
+        }
+
+    def _build_expected_cache_manifest(self) -> dict[str, object]:
+        """Build the strict manifest required for a newly rebuilt cache."""
+        specs = self._array_specs()
+        return {
+            **self._source_identity,
             "array_shapes": {name: spec["shape"] for name, spec in specs.items()},
             "array_dtypes": {name: spec["dtype"] for name, spec in specs.items()},
         }
 
     def _validate_cache(self, cache_path: Path) -> bool:
         """Return whether a published cache exactly matches the source contract."""
-        try:
-            actual = json.loads((cache_path / "manifest.json").read_text(encoding="utf-8"))
-            if actual != self._expected_manifest:
-                return False
-            for name in CACHE_METADATA_FILES:
-                if not (cache_path / name).is_file():
-                    return False
-
-            specs = self._array_specs()
-            for name, spec in specs.items():
-                array = np.load(cache_path / f"{name}.npy", mmap_mode="r", allow_pickle=False)
-                try:
-                    if list(array.shape) != spec["shape"]:
-                        return False
-                    if array.dtype.str != np.dtype(str(spec["dtype"])).str:
-                        return False
-                finally:
-                    self._close_memmap(array)
-
-        except (
-            AttributeError,
-            EOFError,
-            FileNotFoundError,
-            KeyError,
-            OSError,
-            TypeError,
-            ValueError,
-            json.JSONDecodeError,
-        ):
-            return False
-        return True
+        return validate_cache(
+            cache_path,
+            self._source_identity,
+            CACHE_ARRAY_NAMES,
+            CACHE_METADATA_FILES,
+        )
 
     # ============================================================================
     # CACHE BUILD AND WORKER-SAFE OPEN
     # ============================================================================
 
-    def _ensure_cache(self) -> None:
-        """Validate, build, and atomically publish the cache in the parent."""
-        print(f"Dense panel cache: checking {self.cache_path}")
-        if self._validate_cache(self.cache_path):
-            print(f"Dense panel cache: reusing {self.cache_path}")
-            return
-
+    def _rebuild_cache(self) -> None:
+        """Build and atomically publish a cache already known to be stale or missing."""
         print(f"Dense panel cache: rebuilding {self.cache_path}")
         if self.cache_path.exists():
             if self.cache_path.is_dir():
@@ -380,14 +329,8 @@ class DensePanelStore:
         finally:
             self._close_cache_arrays()
 
-        shutil.copy2(
-            self.artifact_path / "config_resolved.yaml",
-            cache_path / "config_resolved.yaml",
-        )
-        shutil.copy2(
-            self.artifact_path / "feature_manifest.parquet",
-            cache_path / "feature_manifest.parquet",
-        )
+        shutil.copy2(self.artifact_path / "config_resolved.yaml", cache_path / "config_resolved.yaml",)
+        shutil.copy2(self.artifact_path / "feature_manifest.parquet", cache_path / "feature_manifest.parquet",)
         (cache_path / "manifest.json").write_text(
             json.dumps(self._expected_manifest, indent=2, sort_keys=True),
             encoding="utf-8",
@@ -433,45 +376,25 @@ class DensePanelStore:
                 self._close_memmap(array)
                 delattr(self, name)
 
-    def _open_cache_arrays(self, *, validate: bool = True) -> None:
+    def _open_cache_arrays(self) -> None:
         """Open all completed arrays read-only in the current process."""
-        if validate and not self._validate_cache(self.cache_path):
-            raise RuntimeError(f"Dense panel cache is invalid: {self.cache_path}")
+        # loads each dense .npy array as read-only
         for name in CACHE_ARRAY_NAMES:
             setattr(self, name, np.load(self.cache_path / f"{name}.npy", mmap_mode="r", allow_pickle=False))
 
     def _load_request_indexes(self) -> None:
         """Load small request tables once for dataset construction and workers."""
-        self.train_request_index = pd.read_parquet(
-            self.cache_path / "train_request_index.parquet"
-        )
-        self.validation_request_index = pd.read_parquet(
-            self.cache_path / "validation_request_index.parquet"
-        )
+        self.train_request_index = pd.read_parquet(self.cache_path / "train_request_index.parquet")
+        self.validation_request_index = pd.read_parquet(self.cache_path / "validation_request_index.parquet")
 
     # ============================================================================
     # SPARSE FACT IMPORT
     # ============================================================================
 
-    def _validate_fact_schema(self, path: Path, group: str) -> None:
-        """Require values, validity masks, keys, and row-validity fields."""
-        columns = set(pq.read_schema(path).names)
-        required = {"date", "date_idx", *self.feature_names[group]}
-        required.update(f"{name}__valid" for name in self.feature_names[group])
-        required.add("valid_asset" if group == "asset" else "valid_date")
-        if group == "asset":
-            required.add("asset_id")
-        missing = sorted(required - columns)
-        if missing:
-            raise ValueError(f"{path.name} is missing columns: {missing}")
-        forbidden = sorted(name for name in columns if FORBIDDEN_FEATURE_PATTERN.search(name))
-        if forbidden:
-            raise ValueError(f"{path.name} contains forbidden target-like columns: {forbidden}")
-
     def _load_asset_facts(self, split: Split) -> None:
         """Stream sparse asset rows into one split-specific dense panel."""
         path = self.artifact_path / f"{split}_asset_features.parquet"
-        self._validate_fact_schema(path, "asset")
+        validate_fact_schema(path, "asset", self.feature_names["asset"])
         features = self.feature_names["asset"]
         columns = ["date_idx", "asset_id", "valid_asset", *features]
         columns.extend(f"{name}__valid" for name in features)
@@ -505,7 +428,7 @@ class DensePanelStore:
     def _load_date_facts(self, split: Split, group: Literal["market", "macro"]) -> None:
         """Stream sparse date rows into one split-specific dense stream."""
         path = self.artifact_path / f"{split}_{group}_features.parquet"
-        self._validate_fact_schema(path, group)
+        validate_fact_schema(path, group, self.feature_names[group])
         features = self.feature_names[group]
         columns = ["date_idx", "valid_date", *features]
         columns.extend(f"{name}__valid" for name in features)

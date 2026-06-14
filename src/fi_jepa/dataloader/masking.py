@@ -4,6 +4,11 @@ from functools import lru_cache
 
 import numpy as np
 
+from fi_jepa.dataloader.validation import (
+    validate_batched_patch_mask_inputs,
+    validate_jepa_mask_inputs,
+)
+
 
 # ============================================================================
 # PATCH VALIDITY MASKING
@@ -35,14 +40,9 @@ def compute_batched_patch_masks(
     valid_assets = np.asarray(valid_asset_mask, dtype=bool)
     valid_dates = np.asarray(valid_date_mask, dtype=bool)
     target_dates = np.asarray(target_date_mask, dtype=bool)
-    if valid_assets.ndim != 3:
-        raise ValueError("valid_asset_mask must have shape [batch, dates, assets].")
-    batch_size, n_dates, n_assets = valid_assets.shape
-    if n_dates % patch_len:
-        raise ValueError("Window length must be divisible by patch_len.")
-    for name, mask in (("valid_date_mask", valid_dates), ("target_date_mask", target_dates)):
-        if mask.shape != (batch_size, n_dates):
-            raise ValueError(f"{name} must have shape [batch, dates].")
+    batch_size, n_dates, n_assets = validate_batched_patch_mask_inputs(
+        valid_assets, valid_dates, target_dates, patch_len
+    )
 
     n_patches = n_dates // patch_len
     asset_patches = valid_assets.reshape(batch_size, n_patches, patch_len, n_assets)
@@ -240,10 +240,7 @@ def sample_jepa_target_mask(
     """
     eligible = np.asarray(patch_target_eligible, dtype=bool)
     context = np.asarray(patch_context_mask, dtype=bool)
-    if eligible.ndim != 1 or context.shape != eligible.shape:
-        raise ValueError("Patch target and context masks must be one-dimensional and aligned.")
-    if np.any(eligible & ~context):
-        raise ValueError("Target-eligible patches must also be context-valid.")
+    validate_jepa_mask_inputs(eligible, context)
 
     eligible_ids = np.flatnonzero(eligible)
     max_target_count = min(eligible_ids.size, int(context.sum()) - 1, max_masked_patches)

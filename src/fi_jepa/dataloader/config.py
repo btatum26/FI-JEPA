@@ -5,6 +5,8 @@ from pathlib import Path
 
 import yaml
 
+from fi_jepa.dataloader.validation import validate_data_config, validate_data_yaml
+
 
 # ============================================================================
 # DATALOADER CONFIGURATION
@@ -38,34 +40,23 @@ class FIJepaDataConfig:
 
     def __post_init__(self) -> None:
         """Reject invalid dimensions, target bounds, and loader settings."""
-        if self.lookback_days <= 0 or self.patch_len <= 0:
-            raise ValueError("lookback_days and patch_len must be positive.")
-        if self.lookback_days % self.patch_len:
-            raise ValueError("lookback_days must be divisible by patch_len.")
-        if not 0.0 < self.mask_ratio <= 1.0:
-            raise ValueError("mask_ratio must be in (0, 1].")
-        if not 0.0 <= self.min_valid_asset_fraction <= 1.0:
-            raise ValueError("min_valid_asset_fraction must be in [0, 1].")
-        if not 1 <= self.min_masked_patches <= self.max_masked_patches:
-            raise ValueError("Masked patch bounds are invalid.")
-        if self.max_masked_patches > self.num_patches:
-            raise ValueError("max_masked_patches exceeds the number of patches.")
-        if not 1 <= self.min_target_blocks <= self.max_target_blocks:
-            raise ValueError("Target block bounds are invalid.")
-        if self.min_target_blocks > self.min_masked_patches:
-            raise ValueError("min_target_blocks cannot exceed min_masked_patches.")
-        if self.max_target_blocks > self.max_masked_patches:
-            raise ValueError("max_target_blocks cannot exceed max_masked_patches.")
-        if not 1 <= self.min_valid_days_per_asset_patch <= self.patch_len:
-            raise ValueError("min_valid_days_per_asset_patch must be within one patch.")
-        if not 1 <= self.min_valid_dates_in_patch <= self.patch_len:
-            raise ValueError("min_valid_dates_in_patch must be within one patch.")
-        if self.train_k_assets <= 0 or self.fixed_k_assets <= 0:
-            raise ValueError("Asset view sizes must be positive.")
-        if self.batch_size <= 0 or self.validation_batch_size <= 0:
-            raise ValueError("Batch sizes must be positive.")
-        if self.num_workers < 0:
-            raise ValueError("num_workers cannot be negative.")
+        validate_data_config(
+            lookback_days=self.lookback_days,
+            patch_len=self.patch_len,
+            mask_ratio=self.mask_ratio,
+            min_masked_patches=self.min_masked_patches,
+            max_masked_patches=self.max_masked_patches,
+            min_target_blocks=self.min_target_blocks,
+            max_target_blocks=self.max_target_blocks,
+            min_valid_days_per_asset_patch=self.min_valid_days_per_asset_patch,
+            min_valid_dates_in_patch=self.min_valid_dates_in_patch,
+            min_valid_asset_fraction=self.min_valid_asset_fraction,
+            train_k_assets=self.train_k_assets,
+            fixed_k_assets=self.fixed_k_assets,
+            batch_size=self.batch_size,
+            validation_batch_size=self.validation_batch_size,
+            num_workers=self.num_workers,
+        )
 
     @property
     def num_patches(self) -> int:
@@ -75,9 +66,7 @@ class FIJepaDataConfig:
     @classmethod
     def from_yaml(cls, path: Path | str) -> FIJepaDataConfig:
         """Load and normalize a dataloader YAML file."""
-        values = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
-        if not isinstance(values, dict):
-            raise ValueError("Dataloader configuration must be a YAML mapping.")
+        values = validate_data_yaml(yaml.safe_load(Path(path).read_text(encoding="utf-8")))
         values["artifact_path"] = Path(values["artifact_path"])
         values["cache_root"] = Path(values.get("cache_root", "data/cache/dense_panel"))
         return cls(**values)

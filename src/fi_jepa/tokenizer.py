@@ -3,6 +3,14 @@ from __future__ import annotations
 import torch
 from torch import nn
 
+from fi_jepa.model_validation import (
+    validate_asset_pooler_config,
+    validate_asset_pooler_inputs,
+    validate_attention_tokenizer_config,
+    validate_attention_tokenizer_inputs,
+    validate_model_feature_dimensions,
+)
+
 
 # ============================================================================
 # MASKED TENSOR OPERATIONS
@@ -74,8 +82,7 @@ class MaskedPatchTokenizer(nn.Module):
 
     def __init__(self, feature_dim: int, hidden_dim: int, output_dim: int):
         super().__init__()
-        if feature_dim <= 0:
-            raise ValueError("feature_dim must be positive.")
+        validate_model_feature_dimensions({"feature_dim": feature_dim})
         self.feature_dim = feature_dim
         self.daily_projection = nn.Sequential(
             nn.Linear(feature_dim * 2, hidden_dim),
@@ -177,11 +184,7 @@ class MaskedAttentionPatchTokenizer(nn.Module):
             "heads": heads,
             "mlp_ratio": mlp_ratio,
         }
-        invalid = [name for name, value in dimensions.items() if value <= 0]
-        if invalid:
-            raise ValueError(f"Tokenizer dimensions and counts must be positive: {invalid}")
-        if hidden_dim % heads:
-            raise ValueError("Tokenizer hidden_dim must be divisible by heads.")
+        validate_attention_tokenizer_config(dimensions, hidden_dim, heads)
 
         self.feature_dim = feature_dim
         self.patch_len = patch_len
@@ -220,30 +223,13 @@ class MaskedAttentionPatchTokenizer(nn.Module):
             day_mask: ``[..., L]``.
             return: ``[..., D_token]``.
         """
-        expected_feature_shape = (*values.shape[:-1], self.feature_dim)
-        expected_day_shape = values.shape[:-1]
-        if tuple(values.shape) != expected_feature_shape:
-            raise ValueError(
-                f"Tokenizer values must end in feature_dim={self.feature_dim}; "
-                f"got shape {tuple(values.shape)}."
-            )
-        if values.shape[-2] != self.patch_len:
-            raise ValueError(
-                f"Tokenizer values must use patch_len={self.patch_len}; "
-                f"got shape {tuple(values.shape)}."
-            )
-        if tuple(feature_mask.shape) != tuple(values.shape):
-            raise ValueError(
-                "Tokenizer feature_mask must match values; "
-                f"got {tuple(feature_mask.shape)} and {tuple(values.shape)}."
-            )
-        if tuple(day_mask.shape) != expected_day_shape:
-            raise ValueError(
-                f"Tokenizer day_mask must have shape {expected_day_shape}; "
-                f"got {tuple(day_mask.shape)}."
-            )
-        if feature_mask.dtype != torch.bool or day_mask.dtype != torch.bool:
-            raise ValueError("Tokenizer feature_mask and day_mask must have dtype bool.")
+        validate_attention_tokenizer_inputs(
+            values,
+            feature_mask,
+            day_mask,
+            feature_dim=self.feature_dim,
+            patch_len=self.patch_len,
+        )
 
         # Invalid feature values are forced to zero before any learned layer.
         valid_values = torch.where(feature_mask, values, torch.zeros_like(values))
@@ -351,11 +337,7 @@ class MaskedAttentionAssetPooler(nn.Module):
             "heads": heads,
             "mlp_ratio": mlp_ratio,
         }
-        invalid = [name for name, value in dimensions.items() if value <= 0]
-        if invalid:
-            raise ValueError(f"Asset pooler dimensions and counts must be positive: {invalid}")
-        if token_dim % heads:
-            raise ValueError("Asset pooler token_dim must be divisible by heads.")
+        validate_asset_pooler_config(dimensions, token_dim, heads)
 
         self.token_dim = token_dim
         self.summary_token = nn.Parameter(torch.empty(1, 1, token_dim))
@@ -373,18 +355,7 @@ class MaskedAttentionAssetPooler(nn.Module):
             asset_mask: ``[..., A]``.
             return: ``[..., D]``.
         """
-        if asset_tokens.shape[-1] != self.token_dim:
-            raise ValueError(
-                f"Asset tokens must end in token_dim={self.token_dim}; "
-                f"got shape {tuple(asset_tokens.shape)}."
-            )
-        if tuple(asset_mask.shape) != tuple(asset_tokens.shape[:-1]):
-            raise ValueError(
-                f"Asset mask must have shape {tuple(asset_tokens.shape[:-1])}; "
-                f"got {tuple(asset_mask.shape)}."
-            )
-        if asset_mask.dtype != torch.bool:
-            raise ValueError("Asset mask must have dtype bool.")
+        validate_asset_pooler_inputs(asset_tokens, asset_mask, token_dim=self.token_dim)
 
         # [..., A, D] -> [N, A, D], one independent asset set per patch.
         leading_shape = asset_tokens.shape[:-2]
