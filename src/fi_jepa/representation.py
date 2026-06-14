@@ -380,10 +380,18 @@ def run_representation_evaluation(
     output_dir.mkdir(parents=True, exist_ok=False)
 
     train_loader = build_fi_jepa_embedding_dataloader(
-        data_config, "train", asset_view="all_valid", store=store
+        data_config,
+        "train",
+        asset_view="all_valid",
+        store=store,
+        num_workers=0,
     )
     validation_loader = build_fi_jepa_embedding_dataloader(
-        data_config, "validation", asset_view="all_valid", store=store
+        data_config,
+        "validation",
+        asset_view="all_valid",
+        store=store,
+        num_workers=0,
     )
     train_metadata, train_raw = collect_pooled_states(
         model,
@@ -415,6 +423,7 @@ def run_representation_evaluation(
             asset_view="fixed_k",
             store=store,
             view_index=view_index,
+            num_workers=0,
         )
         metadata, raw = collect_pooled_states(
             model,

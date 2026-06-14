@@ -1,6 +1,6 @@
 input:
-  patch_len: 5
-  num_patches: 50
+  patch_len: 6
+  num_patches: 42
 
 tokenizers:
   type: mean

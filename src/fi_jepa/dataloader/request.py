@@ -24,6 +24,7 @@ class DensePanelWindowRequest:
     request_kind: RequestKind
     view_kind: ViewKind
     view_index: int
+    epoch: int
     seed: int
     n_endpoint_valid_assets: int
     validation_window_name: str

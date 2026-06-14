@@ -31,6 +31,7 @@ class FIJepaDataConfig:
     min_valid_days_per_asset_patch: int = 10
     min_valid_dates_in_patch: int = 10
     min_valid_asset_fraction: float = 0.25
+    feature_dropout_rate: float = 0.0
     batch_size: int = 32
     validation_batch_size: int = 8
     num_workers: int = 0
@@ -51,6 +52,7 @@ class FIJepaDataConfig:
             min_valid_days_per_asset_patch=self.min_valid_days_per_asset_patch,
             min_valid_dates_in_patch=self.min_valid_dates_in_patch,
             min_valid_asset_fraction=self.min_valid_asset_fraction,
+            feature_dropout_rate=self.feature_dropout_rate,
             train_k_assets=self.train_k_assets,
             fixed_k_assets=self.fixed_k_assets,
             batch_size=self.batch_size,

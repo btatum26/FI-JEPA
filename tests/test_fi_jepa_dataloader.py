@@ -16,6 +16,7 @@ from fi_jepa.dataloader import (
     build_fi_jepa_dataloader,
     build_fi_jepa_embedding_dataloader,
 )
+from fi_jepa.dataloader.batch_assembler import DensePanelBatchAssembler
 from fi_jepa.dataloader.masking import sample_jepa_target_mask
 from fi_jepa.dataloader.panel_store import CACHE_FORMAT_VERSION
 
@@ -316,6 +317,44 @@ def test_random_k_changes_by_epoch_and_fixed_k_is_deterministic(tmp_path: Path) 
     assert fixed_first["patch_context_mask"][:, -1].all()
 
 
+def test_feature_dropout_is_epoch_scoped_and_training_only(tmp_path: Path) -> None:
+    config = _write_sparse_artifact(tmp_path / "artifact")
+    dropout_config = FIJepaDataConfig(**{**config.__dict__, "feature_dropout_rate": 0.5})
+    store = DensePanelStore(config.artifact_path, cache_root=config.cache_root)
+    train = build_fi_jepa_dataloader(dropout_config, "train", store=store, shuffle=False)
+    validation = build_fi_jepa_dataloader(
+        dropout_config, "validation", store=store, shuffle=False
+    )
+
+    train.dataset.set_epoch(0)
+    epoch_zero = list(train)
+    train.dataset.set_epoch(1)
+    epoch_one = list(train)
+    train.dataset.set_epoch(1)
+    epoch_one_repeat = list(train)
+    validation_batch = next(iter(validation))
+
+    for batches, epoch in ((epoch_zero, 0), (epoch_one, 1)):
+        expected_keep = batches[0]["asset_feature_keep_mask"]
+        assert expected_keep.sum().item() == 1
+        for batch in batches:
+            assert batch["feature_dropout_epoch"] == epoch
+            assert torch.equal(batch["asset_feature_keep_mask"], expected_keep)
+            dropped = ~expected_keep
+            assert not batch["asset_patches"][..., dropped].any()
+            assert not batch["asset_feature_mask_patched"][..., dropped].any()
+
+    assert not torch.equal(
+        epoch_zero[0]["asset_feature_keep_mask"],
+        epoch_one[0]["asset_feature_keep_mask"],
+    )
+    for first, second in zip(epoch_one, epoch_one_repeat, strict=True):
+        _assert_batches_equal(first, second)
+    assert validation_batch["asset_feature_keep_mask"].all()
+    assert validation_batch["market_feature_keep_mask"].all()
+    assert validation_batch["macro_feature_keep_mask"].all()
+
+
 def test_jepa_targets_are_random_contiguous_blocks_within_configured_bounds() -> None:
     eligible = np.ones(50, dtype=bool)
     context = np.ones(50, dtype=bool)
@@ -468,6 +507,44 @@ def test_worker_loader_matches_serial_across_repeated_iterators(tmp_path: Path) 
         assert len(actual) == len(expected)
         for first, second in zip(expected, actual, strict=True):
             _assert_batches_equal(first, second)
+
+
+def test_persistent_workers_observe_shared_epoch_updates(tmp_path: Path) -> None:
+    config = _write_sparse_artifact(tmp_path / "artifact")
+    worker_config = FIJepaDataConfig(
+        **{**config.__dict__, "num_workers": 2, "feature_dropout_rate": 0.5}
+    )
+    store = DensePanelStore(config.artifact_path, cache_root=config.cache_root)
+    parent_loader = build_fi_jepa_dataloader(worker_config, "train", store=store, shuffle=False)
+    loader = torch.utils.data.DataLoader(
+        parent_loader.dataset,
+        batch_size=worker_config.batch_size,
+        shuffle=False,
+        num_workers=worker_config.num_workers,
+        collate_fn=DensePanelBatchAssembler(store, worker_config),
+        persistent_workers=True,
+    )
+
+    loader.dataset.set_epoch(0)
+    epoch_zero = list(loader)
+    loader.dataset.set_epoch(1)
+    epoch_one = list(loader)
+    loader.dataset.set_epoch(1)
+    epoch_one_repeat = list(loader)
+
+    assert loader.dataset.epoch == 1
+    assert epoch_zero[0]["request_seed"] != epoch_one[0]["request_seed"]
+    assert not torch.equal(epoch_zero[0]["asset_ids"], epoch_one[0]["asset_ids"])
+    assert not torch.equal(
+        epoch_zero[0]["asset_feature_keep_mask"],
+        epoch_one[0]["asset_feature_keep_mask"],
+    )
+    assert any(
+        not torch.equal(first["jepa_target_mask"], second["jepa_target_mask"])
+        for first, second in zip(epoch_zero, epoch_one, strict=True)
+    )
+    for first, second in zip(epoch_one, epoch_one_repeat, strict=True):
+        _assert_batches_equal(first, second)
 
 
 # ============================================================================

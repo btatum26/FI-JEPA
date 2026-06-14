@@ -37,6 +37,7 @@ def test_dataloader_validators_reject_invalid_boundaries(tmp_path: Path) -> None
             min_valid_days_per_asset_patch=1,
             min_valid_dates_in_patch=1,
             min_valid_asset_fraction=0.5,
+            feature_dropout_rate=0.0,
             train_k_assets=1,
             fixed_k_assets=1,
             batch_size=1,
@@ -49,8 +50,10 @@ def test_dataloader_validators_reject_invalid_boundaries(tmp_path: Path) -> None
 
 
 def test_request_and_patch_mask_validators_reject_malformed_inputs() -> None:
-    first = SimpleNamespace(split="train", request_kind="jepa", view_kind="random_k")
-    second = SimpleNamespace(split="validation", request_kind="jepa", view_kind="random_k")
+    first = SimpleNamespace(split="train", request_kind="jepa", view_kind="random_k", epoch=0)
+    second = SimpleNamespace(
+        split="validation", request_kind="jepa", view_kind="random_k", epoch=0
+    )
     with pytest.raises(ValueError, match="homogeneous"):
         validate_request_batch([first, second], SimpleNamespace)
     with pytest.raises(ValueError, match="valid_date_mask"):

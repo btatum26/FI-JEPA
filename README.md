@@ -205,26 +205,10 @@ uv run train-fi-jepa --resume runs/pretraining/<run>/checkpoints/latest.pt --dev
 
 The resumed checkpoint's resolved configuration is authoritative.
 
-Capture a bounded training-only PyTorch profiler trace:
-
-```bash
-uv run train-fi-jepa --config configs/pretraining.yaml --device cuda --profile
-```
-
-The profiler waits for 5 steps, warms up for 5, records 20, then stops without
-validation or checkpoints. It writes a TensorBoard-compatible Chrome trace and
-device-first `summary.txt` plus exhaustive CPU-sorted `cpu_summary.txt` under
-`runs/pretraining/<run>/profiler/`. Override the schedule with
-`--profile-wait-steps`, `--profile-warmup-steps`, and `--profile-active-steps`.
-Pass `--profile-python-stacks` to additionally write `cpu_stacks.txt`; stack
-capture materially increases profiler overhead and trace size. Stack sampling
-covers the main training process. Set dataloader `num_workers: 0` when profiling
-if the stack output must include dataloader assembly internals.
-
-Every training run also prints and records epoch warm-up and boundary timings.
+Every training run prints and records epoch warm-up and boundary timings.
 `runs/pretraining/<run>/runtime_summary.txt` separates dataset epoch updates,
 dataloader iterator/worker startup, validation, representation evaluation, and
-checkpoint writes. Profiler summaries append the same wall-clock timing section.
+checkpoint writes.
 
 ## Evaluate Representations
 

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import multiprocessing as mp
+
 import numpy as np
 import pandas as pd
 from torch.utils.data import Dataset
@@ -59,17 +61,22 @@ class DensePanelWindowRequestDataset(Dataset[DensePanelWindowRequest]):
         self.view_kind = view_kind
         self.view_index = view_index
         self.request_index = request_index
-        self.epoch = 0
+        self._epoch = mp.Value("q", 0)
 
     def __len__(self) -> int:
         """Return the number of runtime-viable request endpoints."""
         return len(self.request_index)
 
+    @property
+    def epoch(self) -> int:
+        """Return the epoch shared by the parent and persistent worker copies."""
+        return int(self._epoch.value)
+
     def set_epoch(self, epoch: int) -> None:
-        """Set the epoch encoded into deterministic training request seeds."""
+        """Set the shared epoch encoded into deterministic training request seeds."""
         if epoch < 0:
             raise ValueError("epoch cannot be negative.")
-        self.epoch = epoch
+        self._epoch.value = epoch
 
     def __getitem__(self, index: int) -> DensePanelWindowRequest:
         """Return one request without gathering panel arrays."""
@@ -86,6 +93,7 @@ class DensePanelWindowRequestDataset(Dataset[DensePanelWindowRequest]):
             request_kind=self.request_kind,
             view_kind=self.view_kind,
             view_index=self.view_index,
+            epoch=epoch,
             seed=int(seed),
             n_endpoint_valid_assets=int(row["n_endpoint_valid_assets"]),
             validation_window_name=str(row["validation_window_name"]),

@@ -29,6 +29,7 @@ def validate_data_config(
     min_valid_days_per_asset_patch: int,
     min_valid_dates_in_patch: int,
     min_valid_asset_fraction: float,
+    feature_dropout_rate: float,
     train_k_assets: int,
     fixed_k_assets: int,
     batch_size: int,
@@ -44,6 +45,8 @@ def validate_data_config(
         raise ValueError("mask_ratio must be in (0, 1].")
     if not 0.0 <= min_valid_asset_fraction <= 1.0:
         raise ValueError("min_valid_asset_fraction must be in [0, 1].")
+    if not 0.0 <= feature_dropout_rate < 1.0:
+        raise ValueError("feature_dropout_rate must be in [0, 1).")
     if not 1 <= min_masked_patches <= max_masked_patches:
         raise ValueError("Masked patch bounds are invalid.")
     if max_masked_patches > lookback_days // patch_len:
@@ -221,6 +224,7 @@ def validate_request_batch(requests: list[object], request_type: type) -> None:
             request.split != first.split
             or request.request_kind != first.request_kind
             or request.view_kind != first.view_kind
+            or request.epoch != first.epoch
         ):
             raise ValueError("Dense panel request batches must be homogeneous.")
 

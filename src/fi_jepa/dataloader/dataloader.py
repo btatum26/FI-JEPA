@@ -59,6 +59,7 @@ def build_fi_jepa_embedding_dataloader(
     asset_view: AssetView,
     store: DensePanelStore | None = None,
     view_index: int = 0,
+    num_workers: int | None = None,
 ) -> DataLoader:
     """Build an unmasked embedding loader over the dense panel cache."""
     config, store = _resolve_config_and_store(config, store)
@@ -77,6 +78,7 @@ def build_fi_jepa_embedding_dataloader(
         batch_size=config.validation_batch_size,
         shuffle=False,
         drop_last=False,
+        num_workers=num_workers,
     )
 
 
@@ -102,18 +104,21 @@ def _build_loader(
     batch_size: int,
     shuffle: bool,
     drop_last: bool,
+    num_workers: int | None = None,
 ) -> DataLoader:
     """Construct a worker-safe loader after the parent has opened the cache."""
     generator = torch.Generator()
     generator.manual_seed(config.seed)
+    if num_workers is None:
+        num_workers = config.num_workers
     return DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=shuffle,
-        num_workers=config.num_workers,
+        num_workers=num_workers,
         pin_memory=config.pin_memory,
         drop_last=drop_last,
         collate_fn=DensePanelBatchAssembler(store, config),
         generator=generator,
-        persistent_workers=False,
+        persistent_workers=num_workers > 0,
     )

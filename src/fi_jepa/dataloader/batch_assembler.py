@@ -71,6 +71,15 @@ class DensePanelBatchAssembler:
         macro_feature_mask = np.take(
             arrays["macro_feature_mask"], date_indices, axis=0
         )
+        feature_keep_masks = self._apply_feature_dropout(
+            requests,
+            asset_x,
+            asset_feature_mask,
+            market_x,
+            market_feature_mask,
+            macro_x,
+            macro_feature_mask,
+        )
         valid_macro_date = np.take(arrays["valid_macro_date"], date_indices, axis=0)
         valid_date = valid_market_date | valid_macro_date | valid_asset_mask.any(axis=2)
         target_date = (
@@ -141,6 +150,10 @@ class DensePanelBatchAssembler:
             "macro_feature_mask_patched": macro_feature_daily.view(
                 batch_size, n_patches, patch_len, macro_x.shape[-1]
             ),
+            "asset_feature_keep_mask": torch.from_numpy(feature_keep_masks["asset"]),
+            "market_feature_keep_mask": torch.from_numpy(feature_keep_masks["market"]),
+            "macro_feature_keep_mask": torch.from_numpy(feature_keep_masks["macro"]),
+            "feature_dropout_epoch": requests[0].epoch,
             "valid_asset_mask_patched": valid_asset_daily.view(
                 batch_size, n_patches, patch_len, n_assets
             ),
@@ -178,6 +191,65 @@ class DensePanelBatchAssembler:
         if requests[0].request_kind == "jepa":
             batch.update(self._sample_jepa_masks(requests, patch_masks))
         return batch
+
+    def _apply_feature_dropout(
+        self,
+        requests: list[DensePanelWindowRequest],
+        asset_x: np.ndarray,
+        asset_feature_mask: np.ndarray,
+        market_x: np.ndarray,
+        market_feature_mask: np.ndarray,
+        macro_x: np.ndarray,
+        macro_feature_mask: np.ndarray,
+    ) -> dict[str, np.ndarray]:
+        """Apply one deterministic whole-feature mask to every sample in a training epoch.
+
+        Feature dropout is limited to training JEPA requests. A fixed count is
+        selected independently per input group, and at least one feature in
+        every group remains available. Values are zeroed alongside validity
+        masks so the emitted batch remains safe outside the model tokenizer.
+        """
+        groups = {
+            "asset": (asset_x, asset_feature_mask),
+            "market": (market_x, market_feature_mask),
+            "macro": (macro_x, macro_feature_mask),
+        }
+        keep_masks = {
+            group: np.ones(values.shape[-1], dtype=bool)
+            for group, (values, _) in groups.items()
+        }
+        first = requests[0]
+        if (
+            first.split != "train"
+            or first.request_kind != "jepa"
+            or self.config.feature_dropout_rate == 0.0
+        ):
+            return keep_masks
+
+        for group_index, (group, (values, feature_mask)) in enumerate(groups.items()):
+            feature_count = values.shape[-1]
+            drop_count = min(
+                int(np.floor(feature_count * self.config.feature_dropout_rate)),
+                feature_count - 1,
+            )
+            if drop_count == 0:
+                continue
+
+            # A seeded feature order plus an epoch offset guarantees adjacent
+            # epochs use different masks while balancing dropout across features.
+            rng = np.random.default_rng(
+                np.random.SeedSequence([self.config.seed, group_index, 2])
+            )
+            feature_order = rng.permutation(feature_count)
+            dropped = np.take(
+                feature_order,
+                np.arange(first.epoch, first.epoch + drop_count),
+                mode="wrap",
+            )
+            keep_masks[group][dropped] = False
+            values[..., dropped] = 0.0
+            feature_mask[..., dropped] = False
+        return keep_masks
 
     def _select_asset_ids(self, request: DensePanelWindowRequest) -> np.ndarray:
         """Select the global axis, a random K view, or a deterministic fixed-K view."""

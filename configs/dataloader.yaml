@@ -1,8 +1,8 @@
 artifact_path: data/model_ready/fi_jepa_sparse_v1/OCHLV_ONLY
 cache_root: data/cache/dense_panel
 
-lookback_days: 250
-patch_len: 5
+lookback_days: 252
+patch_len: 6
 
 train_k_assets: 128
 fixed_k_assets: 256
@@ -10,15 +10,16 @@ fixed_k_assets: 256
 mask_ratio: 0.35
 min_masked_patches: 5
 max_masked_patches: 15
-min_target_blocks: 2
-max_target_blocks: 4
+min_target_blocks: 1
+max_target_blocks: 2
 min_valid_days_per_asset_patch: 4
 min_valid_dates_in_patch: 4
 min_valid_asset_fraction: 0.25
+feature_dropout_rate: 0.20
 
 batch_size: 32
 validation_batch_size: 16
-num_workers: 0
+num_workers: 4
 pin_memory: false
 drop_last: false
 
