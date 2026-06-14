@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import nullcontext
+from copy import deepcopy
 from dataclasses import asdict, replace
 from datetime import datetime, timezone
 import json
@@ -167,6 +168,42 @@ def _write_resolved_config(path: Path, resolved_config: dict[str, Any]) -> None:
     os.replace(temporary, path)
 
 
+def _apply_branch_overrides(
+    training_config: FIJepaTrainingConfig,
+    overrides: dict[str, Any],
+) -> tuple[FIJepaTrainingConfig, dict[str, int | float]]:
+    """Apply the strict branch-time training override whitelist.
+
+    ``lr_scale`` is a multiplier applied to the source checkpoint's existing
+    scale. Every other override replaces the corresponding active training
+    value while architecture, data, optimizer type, run length, and scheduler
+    lengths remain inherited from the source checkpoint.
+    """
+    allowed = {
+        "lr_scale",
+        "weight_decay",
+        "anti_collapse_variance_weight",
+        "anti_collapse_covariance_weight",
+        "grad_clip_norm",
+        "ema_momentum_start",
+        "ema_momentum_end",
+        "validation_every_epochs",
+        "representation_evaluation_every_epochs",
+        "checkpoint_every_steps",
+        "logging_every_steps",
+    }
+    unknown = sorted(set(overrides) - allowed)
+    if unknown:
+        raise ValueError(f"Unsupported branch overrides: {unknown}")
+
+    supplied = {name: value for name, value in overrides.items() if value is not None}
+    replacements = dict(supplied)
+    if "lr_scale" in replacements:
+        replacements["lr_scale"] = training_config.lr_scale * float(replacements["lr_scale"])
+    branched = replace(training_config, **replacements)
+    return branched, supplied
+
+
 # ============================================================================
 # OPTIMIZER, BATCHES, AND METRICS
 # ============================================================================
@@ -185,6 +222,55 @@ def build_adamw(model: FIJepaModel, config: FIJepaTrainingConfig) -> AdamW:
         if parameter.requires_grad and id(parameter) not in target_ids
     ]
     return AdamW(parameters, lr=config.lr, weight_decay=config.weight_decay)
+
+
+def _load_adamw_state(
+    optimizer: AdamW,
+    state_dict: dict[str, Any],
+    model_state: dict[str, torch.Tensor],
+) -> None:
+    """Load AdamW state, removing only trailing parameters from the legacy exporter.
+
+    The removed state exporter was appended after every active online
+    parameter and never received gradients, so its optimizer parameter IDs
+    have no state. Any other parameter-group mismatch remains an error.
+    """
+    current = optimizer.state_dict()
+    saved_groups = state_dict["param_groups"]
+    current_groups = current["param_groups"]
+    if [len(group["params"]) for group in saved_groups] == [
+        len(group["params"]) for group in current_groups
+    ]:
+        optimizer.load_state_dict(state_dict)
+        return
+
+    legacy_exporter_parameters = [
+        name for name in model_state if name.startswith("state_exporter.")
+    ]
+    if len(saved_groups) != 1 or len(current_groups) != 1 or not legacy_exporter_parameters:
+        optimizer.load_state_dict(state_dict)
+        return
+
+    current_count = len(current_groups[0]["params"])
+    saved_parameters = saved_groups[0]["params"]
+    discarded_parameters = saved_parameters[current_count:]
+    if (
+        len(saved_parameters) - current_count != len(legacy_exporter_parameters)
+        or any(parameter_id in state_dict["state"] for parameter_id in discarded_parameters)
+    ):
+        optimizer.load_state_dict(state_dict)
+        return
+
+    migrated = {
+        "state": dict(state_dict["state"]),
+        "param_groups": [
+            {
+                **saved_groups[0],
+                "params": saved_parameters[:current_count],
+            }
+        ],
+    }
+    optimizer.load_state_dict(migrated)
 
 
 def _move_batch(batch: dict[str, object], device: torch.device) -> dict[str, object]:
@@ -463,37 +549,84 @@ def train_fi_jepa(
     config: FIJepaTrainingConfig | Path | str | None = None,
     *,
     resume: Path | str | None = None,
+    branch_from: Path | str | None = None,
+    branch_name: str | None = None,
+    branch_overrides: dict[str, Any] | None = None,
     device_override: str | None = None,
 ) -> Path:
-    """Run or resume FI-JEPA pretraining and return its self-contained run folder.
+    """Run, resume, or branch FI-JEPA pretraining and return its run folder.
 
     Periodic checkpoints resume from the beginning of their saved epoch.
     Epoch-end and best-validation checkpoints resume from the following epoch.
-    No batch cursor, sampler state, or processed-batch list is stored.
+    A branch is an exact continuation written to a named new run. It inherits
+    checkpoint configuration and all training state, then applies only the
+    explicit branch override whitelist. No batch cursor, sampler state, or
+    processed-batch list is stored.
     """
+    if resume is not None and branch_from is not None:
+        raise ValueError("resume and branch_from are mutually exclusive.")
+    if branch_from is None and branch_name is not None:
+        raise ValueError("branch_name requires branch_from.")
+    if branch_from is not None and branch_name is None:
+        raise ValueError("branch_from requires branch_name.")
+    if branch_from is None and branch_overrides:
+        raise ValueError("branch_overrides require branch_from.")
+    if branch_from is not None and config is not None:
+        raise ValueError("Checkpoint branches do not accept a pretraining config.")
+
     # =========================================
-    # Is this a resumed run or a new run?
+    # Is this a resumed, branched, or new run?
     # =========================================
 
     checkpoint: dict[str, Any] | None = None
+    checkpoint_path: Path | None = None
+    source_run_dir: Path | None = None
+    supplied_branch_overrides: dict[str, int | float] = {}
+    run_mode = "new"
     if resume is not None:
+        run_mode = "resume"
         # Resume training from an existing checkpoint, ignoring any provided config. The
         checkpoint_path, run_dir = _resolve_resume_checkpoint(Path(resume))
         checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
 
-        resolved_config = checkpoint["resolved_config"]
+        resolved_config = deepcopy(checkpoint["resolved_config"])
         training_config = FIJepaTrainingConfig.from_dict(resolved_config["training"])
         if device_override is not None:
             training_config = replace(training_config, device=device_override)
-        model_config = FIJepaModelConfig(**resolved_config["model"])
+        model_config = FIJepaModelConfig.from_dict(resolved_config["model"])
+        # Persist the current config contract into all resumed-run artifacts
+        # and future checkpoints instead of carrying legacy fields forward.
+        resolved_config["model"] = _serialized_dataclass(model_config)
 
         data_values = dict(resolved_config["dataloader"])
         data_values["artifact_path"] = Path(data_values["artifact_path"])
         data_values["cache_root"] = Path(data_values["cache_root"])
         data_config = FIJepaDataConfig(**data_values)
 
+    elif branch_from is not None:
+        run_mode = "branch"
+        checkpoint_path, source_run_dir = _resolve_resume_checkpoint(Path(branch_from))
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        resolved_config = deepcopy(checkpoint["resolved_config"])
+        training_config = FIJepaTrainingConfig.from_dict(resolved_config["training"])
+        training_config = replace(training_config, run_name=branch_name)
+        training_config, supplied_branch_overrides = _apply_branch_overrides(
+            training_config,
+            branch_overrides or {},
+        )
+        if device_override is not None:
+            training_config = replace(training_config, device=device_override)
+        model_config = FIJepaModelConfig.from_dict(resolved_config["model"])
+        resolved_config["model"] = _serialized_dataclass(model_config)
+
+        data_values = dict(resolved_config["dataloader"])
+        data_values["artifact_path"] = Path(data_values["artifact_path"])
+        data_values["cache_root"] = Path(data_values["cache_root"])
+        data_config = FIJepaDataConfig(**data_values)
+        run_dir = _create_run_directory(training_config.output_root, training_config.run_name)
+
     else:
-        # start a new training run with the provided config or its default path.
+        # Start a new training run with the provided config or its default path.
         if config is None:
             config = Path("configs/pretraining.yaml")
         training_config = (
@@ -543,6 +676,7 @@ def train_fi_jepa(
         min_lr=training_config.min_lr,
         warmup_steps=len(train_loader) * training_config.warmup_epochs,
         total_steps=total_steps,
+        lr_scale=training_config.lr_scale,
     )
     ema_schedule = LinearEMAMomentumSchedule(
         start=training_config.ema_momentum_start,
@@ -551,7 +685,7 @@ def train_fi_jepa(
     )
     scaler = torch.amp.GradScaler(device.type, enabled=amp_dtype == torch.float16)
 
-    if checkpoint is None:          # if this is a new run
+    if run_mode == "new":
         resolved_config = _build_resolved_config(
             training_config,
             model_config,
@@ -567,8 +701,9 @@ def train_fi_jepa(
         start_epoch = 0
         global_step = 0
         best_validation_loss: float | None = None
-        
-    else:                           # if this is a resumed run
+
+    elif run_mode == "resume":
+        assert checkpoint is not None
         runtime = resolved_config["runtime"]
         current_manifest = json.loads(
             (store.artifact_path / "manifest.json").read_text(encoding="utf-8")
@@ -594,7 +729,7 @@ def train_fi_jepa(
         
         _write_resolved_config(run_dir / "resolved_config.yaml", resolved_config)
         load_fi_jepa_model_state(model, checkpoint["model"])
-        optimizer.load_state_dict(checkpoint["optimizer"])
+        _load_adamw_state(optimizer, checkpoint["optimizer"], checkpoint["model"])
         lr_schedule.load_state_dict(checkpoint["lr_scheduler"])
         ema_schedule.load_state_dict(checkpoint["ema_scheduler"])
         scaler.load_state_dict(checkpoint["scaler"])
@@ -613,6 +748,77 @@ def train_fi_jepa(
             },
         )
 
+    else:
+        assert checkpoint is not None
+        assert checkpoint_path is not None
+        assert source_run_dir is not None
+        source_resolved = checkpoint["resolved_config"]
+        runtime = resolved_config["runtime"]
+        current_manifest = json.loads(
+            (store.artifact_path / "manifest.json").read_text(encoding="utf-8")
+        )
+        if str(store.artifact_path.resolve()) != source_resolved["dataset_artifact"]["path"]:
+            raise ValueError("Branch dataset artifact path must match the source checkpoint.")
+        if current_manifest != source_resolved["dataset_artifact"]["manifest"]:
+            raise ValueError("Branch dataset artifact manifest must match the source checkpoint.")
+        if int(runtime["steps_per_epoch"]) != len(train_loader):
+            raise ValueError("Current training loader length differs from the branched run.")
+        if int(runtime["planned_optimizer_steps"]) != total_steps:
+            raise ValueError("Current planned optimizer steps differ from the branched run.")
+        if int(runtime["train_sample_count"]) != len(train_loader.dataset):
+            raise ValueError("Current training sample count differs from the branched run.")
+        if int(runtime["validation_sample_count"]) != len(validation_loader.dataset):
+            raise ValueError("Current validation sample count differs from the branched run.")
+
+        load_fi_jepa_model_state(model, checkpoint["model"])
+        _load_adamw_state(optimizer, checkpoint["optimizer"], checkpoint["model"])
+        # Optimizer loading restores saved group hyperparameters. The scheduler
+        # owns LR, while weight decay is an explicitly overridable active value.
+        for group in optimizer.param_groups:
+            group["weight_decay"] = training_config.weight_decay
+
+        lr_state = dict(checkpoint["lr_scheduler"])
+        lr_state["lr_scale"] = training_config.lr_scale
+        lr_schedule.load_state_dict(lr_state)
+        ema_state = dict(checkpoint["ema_scheduler"])
+        ema_state["start"] = training_config.ema_momentum_start
+        ema_state["end"] = training_config.ema_momentum_end
+        ema_schedule.load_state_dict(ema_state)
+        scaler.load_state_dict(checkpoint["scaler"])
+        start_epoch = int(checkpoint["resume_epoch"])
+        global_step = int(checkpoint["global_step"])
+        best_validation_loss = checkpoint["best_validation_loss"]
+        _restore_rng_state(checkpoint["rng_state"])
+
+        resolved_config["training"] = training_config.to_dict()
+        runtime["device"] = str(device)
+        runtime["amp_dtype"] = (None if amp_dtype is None else str(amp_dtype).removeprefix("torch."))
+        recorded_overrides = dict(supplied_branch_overrides)
+        if device_override is not None:
+            recorded_overrides["device"] = device_override
+        resolved_config["branch"] = {
+            "source_checkpoint": str(checkpoint_path.resolve()),
+            "source_run": str(source_run_dir.resolve()),
+            "source_run_name": source_resolved["training"]["run_name"],
+            "source_checkpoint_kind": checkpoint["kind"],
+            "source_checkpoint_format_version": checkpoint["format_version"],
+            "source_global_step": checkpoint["global_step"],
+            "source_resume_epoch": checkpoint["resume_epoch"],
+            "source_model_state_hash": model_state_hash(model),
+            "overrides": recorded_overrides,
+        }
+        _write_resolved_config(run_dir / "resolved_config.yaml", resolved_config)
+        _append_jsonl(
+            run_dir / "train_log.jsonl",
+            {
+                "event": "branch",
+                "timestamp": _utc_timestamp(),
+                "epoch": start_epoch,
+                "step": global_step,
+                **resolved_config["branch"],
+            },
+        )
+
     # pathing and logging setup
     checkpoints_dir = run_dir / "checkpoints"
     checkpoints_dir.mkdir(exist_ok=True)
@@ -627,6 +833,8 @@ def train_fi_jepa(
         f"device={device} | train_samples={len(train_loader.dataset)} | "
         f"batch_size={data_config.batch_size} | steps_per_epoch={len(train_loader)} | "
         f"epochs={training_config.epochs} | total_steps={total_steps} | "
+        f"lr_scale={lr_schedule.lr_scale:.6g} | next_lr={lr_schedule.value_at(global_step):.6g} | "
+        f"next_ema_momentum={ema_schedule.value_at(global_step):.6g} | "
         f"validation_samples={len(validation_loader.dataset)} | "
         f"validation_batches={len(validation_loader)}"
     )
@@ -665,12 +873,12 @@ def train_fi_jepa(
             },
         )
         write_runtime_timing_summary(runtime_summary_path, warmup_timing_records, boundary_timing_records)
-        print(
-            "Epoch warm-up: "
-            f"dataset_epoch_update={dataset_epoch_update_seconds:.3f}s | "
-            f"dataloader_iterator_startup={dataloader_iterator_startup_seconds:.3f}s | "
-            f"total={float(warmup_record['total_seconds']):.3f}s"
-        )
+        # print(
+        #     "Epoch warm-up: "
+        #     f"dataset_epoch_update={dataset_epoch_update_seconds:.3f}s | "
+        #     f"dataloader_iterator_startup={dataloader_iterator_startup_seconds:.3f}s | "
+        #     f"total={float(warmup_record['total_seconds']):.3f}s"
+        # )
 
         interval_start = time.perf_counter()
         interval_samples = 0
@@ -979,12 +1187,83 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def parse_branch_args() -> argparse.Namespace:
+    """Parse the exact-continuation checkpoint-branch CLI."""
+    parser = argparse.ArgumentParser(
+        description="Branch an exact FI-JEPA continuation with explicit active-parameter overrides."
+    )
+    parser.add_argument(
+        "--checkpoint",
+        type=Path,
+        required=True,
+        help="Source run directory or checkpoint.",
+    )
+    parser.add_argument(
+        "--name",
+        required=True,
+        help="Name of the new branch run directory.",
+    )
+    parser.add_argument("--lr-scale", type=float, help="Multiply the source branch's active LR curve.")
+    parser.add_argument("--weight-decay", type=float, help="Override active AdamW weight decay.")
+    parser.add_argument(
+        "--anti-collapse-variance-weight",
+        type=float,
+        help="Override the anti-collapse variance-loss weight.",
+    )
+    parser.add_argument(
+        "--anti-collapse-covariance-weight",
+        type=float,
+        help="Override the anti-collapse covariance-loss weight.",
+    )
+    parser.add_argument("--grad-clip-norm", type=float, help="Override gradient clipping norm.")
+    parser.add_argument("--ema-momentum-start", type=float, help="Override EMA schedule start.")
+    parser.add_argument("--ema-momentum-end", type=float, help="Override EMA schedule end.")
+    parser.add_argument(
+        "--validation-every-epochs",
+        type=int,
+        help="Override validation cadence.",
+    )
+    parser.add_argument(
+        "--representation-evaluation-every-epochs",
+        type=int,
+        help="Override representation-evaluation cadence.",
+    )
+    parser.add_argument("--checkpoint-every-steps", type=int, help="Override checkpoint cadence.")
+    parser.add_argument("--logging-every-steps", type=int, help="Override training-log cadence.")
+    parser.add_argument("--device", choices=("auto", "cpu", "cuda"), help="Override branch device.")
+    return parser.parse_args()
+
+
 def main() -> None:
     """Run the FI-JEPA pretraining CLI."""
     args = parse_args()
     train_fi_jepa(
         args.config,
         resume=args.resume,
+        device_override=args.device,
+    )
+
+
+def branch_main() -> None:
+    """Run the named FI-JEPA checkpoint-branch CLI."""
+    args = parse_branch_args()
+    overrides = {
+        "lr_scale": args.lr_scale,
+        "weight_decay": args.weight_decay,
+        "anti_collapse_variance_weight": args.anti_collapse_variance_weight,
+        "anti_collapse_covariance_weight": args.anti_collapse_covariance_weight,
+        "grad_clip_norm": args.grad_clip_norm,
+        "ema_momentum_start": args.ema_momentum_start,
+        "ema_momentum_end": args.ema_momentum_end,
+        "validation_every_epochs": args.validation_every_epochs,
+        "representation_evaluation_every_epochs": args.representation_evaluation_every_epochs,
+        "checkpoint_every_steps": args.checkpoint_every_steps,
+        "logging_every_steps": args.logging_every_steps,
+    }
+    train_fi_jepa(
+        branch_from=args.checkpoint,
+        branch_name=args.name,
+        branch_overrides=overrides,
         device_override=args.device,
     )
 

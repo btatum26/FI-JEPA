@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, Mapping
 
 import yaml
 
@@ -90,6 +91,19 @@ class FIJepaModelConfig:
             context_dropout=self.context_dropout,
             predictor_dropout=self.predictor_dropout,
         )
+
+    @classmethod
+    def from_dict(cls, values: Mapping[str, Any]) -> FIJepaModelConfig:
+        """Load a flattened runtime config, discarding the removed legacy exporter width.
+
+        Checkpoints written before the untrained state exporter was removed
+        contain ``latent_dim``. It never affected the JEPA training path, so
+        current code drops that one known legacy field while continuing to
+        reject every other unknown configuration key.
+        """
+        migrated = dict(values)
+        migrated.pop("latent_dim", None)
+        return cls(**migrated)
 
     @classmethod
     def from_yaml(cls, path: Path | str) -> FIJepaModelConfig:

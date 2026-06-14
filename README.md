@@ -208,7 +208,79 @@ uv run train-fi-jepa --resume runs/pretraining/<run>/checkpoints/latest.pt --dev
 
 The resumed checkpoint's resolved configuration is authoritative.
 
-Every training run prints and records epoch warm-up and boundary timings.
+To branch a named exact continuation from a checkpoint while turning down the
+active learning-rate curve:
+
+```bash
+uv run branch-fi-jepa \
+  --checkpoint runs/pretraining/<run>/checkpoints/step_000005000.pt \
+  --name v2-slower-lr \
+  --lr-scale 0.1 \
+  --device auto
+```
+
+A branch creates a new run directory but otherwise continues the checkpoint
+exactly: model, optimizer moments, scaler, RNG, epoch, global step, best
+validation loss, and LR/EMA scheduler positions are inherited. `--lr-scale`
+multiplies the source branch's complete remaining cosine curve without
+restarting warmup or decay. Branch provenance and every supplied override are
+stored in `resolved_config.yaml`.
+
+The strict branch override flags are `--lr-scale`, `--weight-decay`,
+`--anti-collapse-variance-weight`, `--anti-collapse-covariance-weight`,
+`--grad-clip-norm`, `--ema-momentum-start`, `--ema-momentum-end`,
+`--validation-every-epochs`, `--representation-evaluation-every-epochs`,
+`--checkpoint-every-steps`, `--logging-every-steps`, and `--device`.
+Architecture, dataset, dataloader geometry, optimizer type, epoch count, and
+scheduler lengths remain checkpoint-authoritative.
+
+### EMA Momentum During Training
+
+The target encoder is updated after each successful optimizer step using:
+
+```text
+target = momentum * target + (1 - momentum) * online
+```
+
+The active momentum increases linearly from `ema.momentum_start` to
+`ema.momentum_end` over the checkpoint's planned optimizer steps:
+
+```text
+progress = min(step / (total_steps - 1), 1)
+momentum = momentum_start + (momentum_end - momentum_start) * progress
+```
+
+A lower momentum gives the online encoder more weight on every update. For
+example, momentum `0.99` moves the target 1% toward the online encoder per step,
+while `0.999` moves it only 0.1%. Lower values make the teacher respond faster
+to current model changes but also make its targets less stable. Higher values
+make the teacher smoother and slower to follow the online encoder.
+As a rough intuition, the teacher's effective averaging horizon is
+`1 / (1 - momentum)`: momentum `0.99` averages on the order of 100 recent
+updates, while `0.999` averages on the order of 1,000. The exact influence of
+older online states decays exponentially rather than disappearing at that
+horizon.
+
+`momentum_start` controls teacher responsiveness earlier in training.
+`momentum_end` controls the eventual late-training stability. Increasing from a
+lower start to a higher end lets the teacher adapt relatively quickly early,
+then become progressively more stable as training converges.
+
+Branch overrides preserve the source scheduler's current step and progress
+fraction. Changing `--ema-momentum-start` or `--ema-momentum-end` therefore
+changes the active momentum immediately at the same point in training; it does
+not restart the EMA schedule. The target encoder weights themselves are also
+inherited unchanged. The new bounds only change how strongly future online
+encoder updates move those inherited target weights.
+
+For example, step 5,000 of a 55,200-step schedule is about 9.06% through the
+EMA curve. Bounds `0.996 -> 0.999` produce an active momentum near `0.996272`.
+Branching at that step with EMA start `0.990` and end `0.997` immediately
+changes the active momentum to about `0.990634`, then continues increasing
+toward `0.997` over the original remaining schedule. That makes the inherited
+teacher follow the online encoder substantially faster after the branch.
+
+Every training run records epoch warm-up timings and prints and records boundary timings.
 `runs/pretraining/<run>/runtime_summary.txt` separates dataset epoch updates,
 dataloader iterator/worker startup, validation, representation evaluation, and
 checkpoint writes.

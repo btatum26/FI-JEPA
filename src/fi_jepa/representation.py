@@ -558,7 +558,7 @@ def evaluate_checkpoint(
     checkpoint_path = checkpoint_path.resolve()
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     resolved = checkpoint["resolved_config"]
-    model_config = FIJepaModelConfig(**resolved["model"])
+    model_config = FIJepaModelConfig.from_dict(resolved["model"])
     data_values = dict(resolved["dataloader"])
     data_values["artifact_path"] = Path(data_values["artifact_path"])
     data_values["cache_root"] = Path(data_values["cache_root"])

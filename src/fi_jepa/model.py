@@ -44,14 +44,20 @@ def load_fi_jepa_model_state(
     which exactly reproduces the old target input at resume time. A partially
     written current-format teacher remains an error instead of being repaired.
     """
+    # The removed exporter was never part of the JEPA objective and had no
+    # effect on training. Discard only that known legacy parameter prefix.
+    migrated = {
+        name: value
+        for name, value in state_dict.items()
+        if not name.startswith("state_exporter.")
+    }
     if (
-        "target_patch_position_embedding" in state_dict
-        or "patch_position_embedding" not in state_dict
+        "target_patch_position_embedding" in migrated
+        or "patch_position_embedding" not in migrated
     ):
-        model.load_state_dict(state_dict)
+        model.load_state_dict(migrated)
         return
 
-    migrated = dict(state_dict)
     prefix_pairs = (
         ("asset_tokenizer.", "target_asset_tokenizer."),
         ("market_tokenizer.", "target_market_tokenizer."),
@@ -60,10 +66,10 @@ def load_fi_jepa_model_state(
         ("fusion.", "target_fusion."),
     )
     for online_prefix, target_prefix in prefix_pairs:
-        for name, value in state_dict.items():
+        for name, value in migrated.copy().items():
             if name.startswith(online_prefix):
                 migrated[f"{target_prefix}{name.removeprefix(online_prefix)}"] = value
-    migrated["target_patch_position_embedding"] = state_dict["patch_position_embedding"]
+    migrated["target_patch_position_embedding"] = migrated["patch_position_embedding"]
     model.load_state_dict(migrated)
 
 

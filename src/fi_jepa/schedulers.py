@@ -19,33 +19,37 @@ class WarmupCosineLRSchedule:
         min_lr: float,
         warmup_steps: int,
         total_steps: int,
+        lr_scale: float = 1.0,
     ):
         if not 0 <= warmup_steps < total_steps:
             raise ValueError("warmup_steps must be in [0, total_steps).")
         if not 0.0 <= min_lr <= base_lr:
             raise ValueError("Learning rates must satisfy 0 <= min_lr <= base_lr.")
+        if lr_scale <= 0.0:
+            raise ValueError("lr_scale must be positive.")
         self.optimizer = optimizer
         self.base_lr = base_lr
         self.min_lr = min_lr
         self.warmup_steps = warmup_steps
         self.total_steps = total_steps
+        self.lr_scale = lr_scale
         self.last_step = -1
 
     def value_at(self, step: int) -> float:
-        """Return the clamped learning rate for a zero-based optimizer step."""
+        """Return the scaled, clamped learning rate for a zero-based optimizer step."""
         if step < 0:
             raise ValueError("Schedule step cannot be negative.")
         if step >= self.total_steps:
-            return self.min_lr
+            return self.min_lr * self.lr_scale
         if self.warmup_steps and step < self.warmup_steps:
-            return self.base_lr * float(step + 1) / float(self.warmup_steps)
+            return self.base_lr * float(step + 1) / float(self.warmup_steps) * self.lr_scale
 
         decay_steps = self.total_steps - self.warmup_steps
         if decay_steps <= 1:
-            return self.min_lr
+            return self.min_lr * self.lr_scale
         progress = float(step - self.warmup_steps) / float(decay_steps - 1)
         cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
-        return self.min_lr + (self.base_lr - self.min_lr) * cosine
+        return (self.min_lr + (self.base_lr - self.min_lr) * cosine) * self.lr_scale
 
     def apply(self, step: int, *, commit: bool) -> float:
         """Apply one step's LR, optionally recording that the step succeeded."""
@@ -63,15 +67,18 @@ class WarmupCosineLRSchedule:
             "min_lr": self.min_lr,
             "warmup_steps": self.warmup_steps,
             "total_steps": self.total_steps,
+            "lr_scale": self.lr_scale,
             "last_step": self.last_step,
         }
 
     def load_state_dict(self, state: dict[str, int | float]) -> None:
-        """Restore state while rejecting a schedule with different bounds."""
+        """Restore state while rejecting different bounds or an LR scale mismatch."""
         expected = self.state_dict()
         for name in ("base_lr", "min_lr", "warmup_steps", "total_steps"):
             if state[name] != expected[name]:
                 raise ValueError(f"Checkpoint LR schedule disagrees on {name}.")
+        if float(state.get("lr_scale", 1.0)) != self.lr_scale:
+            raise ValueError("Checkpoint LR schedule disagrees on lr_scale.")
         self.last_step = int(state["last_step"])
 
 

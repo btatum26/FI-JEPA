@@ -433,6 +433,18 @@ def test_legacy_checkpoint_initializes_full_target_preprocessing_from_online_sta
     )
 
 
+def test_legacy_checkpoint_discards_removed_state_exporter() -> None:
+    source = _model()
+    legacy_state = dict(source.state_dict())
+    legacy_state["state_exporter.0.weight"] = torch.ones(4)
+
+    restored = _model()
+    load_fi_jepa_model_state(restored, legacy_state)
+
+    for name, expected in source.state_dict().items():
+        assert torch.equal(restored.state_dict()[name], expected)
+
+
 def test_encode_pooled_state_is_only_representation_path_and_requires_endpoint_patch() -> None:
     model = _model()
     model.eval()

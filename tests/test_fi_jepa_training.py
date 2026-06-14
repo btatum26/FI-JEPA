@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timezone
 import json
 from pathlib import Path
@@ -18,6 +19,7 @@ from fi_jepa.training import (
     CHECKPOINT_FORMAT_VERSION,
     LinearEMAMomentumSchedule,
     WarmupCosineLRSchedule,
+    _apply_branch_overrides,
     _create_run_directory,
     _training_objective,
     build_adamw,
@@ -247,6 +249,7 @@ def test_training_config_and_schedules_validate_endpoints_and_clamp() -> None:
 
     legacy_checkpoint_config = FIJepaTrainingConfig(epochs=2, warmup_epochs=0).to_dict()
     for name in (
+        "lr_scale",
         "anti_collapse_variance_weight",
         "anti_collapse_covariance_weight",
         "anti_collapse_variance_floor",
@@ -256,21 +259,52 @@ def test_training_config_and_schedules_validate_endpoints_and_clamp() -> None:
     restored_legacy = FIJepaTrainingConfig.from_dict(legacy_checkpoint_config)
     assert restored_legacy.anti_collapse_variance_weight == 0.0
     assert restored_legacy.anti_collapse_covariance_weight == 0.0
+    assert restored_legacy.lr_scale == 1.0
 
     parameter = torch.nn.Parameter(torch.tensor(1.0))
     optimizer = torch.optim.AdamW([parameter], lr=1.0)
     lr_schedule = WarmupCosineLRSchedule(
-        optimizer, base_lr=1.0, min_lr=0.1, warmup_steps=2, total_steps=6
+        optimizer, base_lr=1.0, min_lr=0.1, warmup_steps=2, total_steps=6, lr_scale=0.1
     )
     ema_schedule = LinearEMAMomentumSchedule(start=0.99, end=0.999, total_steps=6)
 
-    assert lr_schedule.value_at(0) == pytest.approx(0.5)
-    assert lr_schedule.value_at(1) == pytest.approx(1.0)
-    assert lr_schedule.value_at(5) == pytest.approx(0.1)
-    assert lr_schedule.value_at(9) == pytest.approx(0.1)
+    assert lr_schedule.value_at(0) == pytest.approx(0.05)
+    assert lr_schedule.value_at(1) == pytest.approx(0.1)
+    assert lr_schedule.value_at(5) == pytest.approx(0.01)
+    assert lr_schedule.value_at(9) == pytest.approx(0.01)
+    assert lr_schedule.state_dict()["lr_scale"] == pytest.approx(0.1)
     assert ema_schedule.value_at(0) == pytest.approx(0.99)
     assert ema_schedule.value_at(5) == pytest.approx(0.999)
     assert ema_schedule.value_at(9) == pytest.approx(0.999)
+
+    legacy_lr_state = lr_schedule.state_dict()
+    legacy_lr_state.pop("lr_scale")
+    unscaled_schedule = WarmupCosineLRSchedule(
+        optimizer, base_lr=1.0, min_lr=0.1, warmup_steps=2, total_steps=6
+    )
+    unscaled_schedule.load_state_dict(legacy_lr_state)
+    assert unscaled_schedule.lr_scale == 1.0
+
+
+def test_branch_override_whitelist_scales_existing_lr_and_rejects_unknowns() -> None:
+    source = FIJepaTrainingConfig(epochs=2, warmup_epochs=0, lr_scale=0.5)
+    branched, supplied = _apply_branch_overrides(
+        source,
+        {
+            "lr_scale": 0.1,
+            "weight_decay": 0.2,
+            "ema_momentum_start": 0.99,
+            "ema_momentum_end": 0.995,
+        },
+    )
+
+    assert branched.lr_scale == pytest.approx(0.05)
+    assert branched.weight_decay == pytest.approx(0.2)
+    assert supplied["lr_scale"] == pytest.approx(0.1)
+    with pytest.raises(ValueError, match="Unsupported branch overrides"):
+        _apply_branch_overrides(source, {"epochs": 10})
+    with pytest.raises(ValueError, match="lr_scale"):
+        _apply_branch_overrides(source, {"lr_scale": 0.0})
 
 
 def test_same_name_run_directories_append_readable_timestamp(tmp_path: Path) -> None:
@@ -440,6 +474,115 @@ def test_smoke_training_and_basic_epoch_resume(
     assert (checkpoints / "step_000000006.pt").is_file()
     terminal_output = capsys.readouterr()
     assert "Training plan:" in terminal_output.out
-    assert "Epoch warm-up:" in terminal_output.out
     assert "Epoch boundary:" in terminal_output.out
     assert "rank=" in terminal_output.err
+
+
+def test_resume_migrates_removed_state_exporter(tmp_path: Path) -> None:
+    config = _write_run_configs(tmp_path)
+    run_dir = train_fi_jepa(config)
+    checkpoint_path = run_dir / "checkpoints" / "step_000000001.pt"
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+
+    checkpoint["resolved_config"]["model"]["latent_dim"] = 8
+    exporter_parameters = {
+        "state_exporter.0.weight": torch.ones(4),
+        "state_exporter.0.bias": torch.ones(4),
+    }
+    checkpoint["model"].update(exporter_parameters)
+    optimizer_group = checkpoint["optimizer"]["param_groups"][0]["params"]
+    next_parameter_id = max(optimizer_group) + 1
+    optimizer_group.extend(range(next_parameter_id, next_parameter_id + len(exporter_parameters)))
+    checkpoint["resolved_config"]["training"].pop("lr_scale")
+    checkpoint["lr_scheduler"].pop("lr_scale")
+    torch.save(checkpoint, checkpoint_path)
+
+    train_fi_jepa(resume=checkpoint_path)
+
+    resumed = torch.load(run_dir / "checkpoints" / "latest.pt", map_location="cpu", weights_only=False)
+    assert "latent_dim" not in resumed["resolved_config"]["model"]
+    assert not any(name.startswith("state_exporter.") for name in resumed["model"])
+    assert resumed["resolved_config"]["training"]["lr_scale"] == 1.0
+    assert resumed["lr_scheduler"]["lr_scale"] == 1.0
+
+
+def test_named_branch_exactly_continues_checkpoint_with_active_overrides(tmp_path: Path) -> None:
+    source_config = replace(_write_run_configs(tmp_path), epochs=3)
+    source_run = train_fi_jepa(source_config)
+    source_checkpoint = source_run / "checkpoints" / "step_000000004.pt"
+    source = torch.load(source_checkpoint, map_location="cpu", weights_only=False)
+    source["resolved_config"]["training"].pop("lr_scale")
+    source["lr_scheduler"].pop("lr_scale")
+    torch.save(source, source_checkpoint)
+    expected_first_lr = WarmupCosineLRSchedule(
+        torch.optim.AdamW([torch.nn.Parameter(torch.tensor(1.0))], lr=source_config.lr),
+        base_lr=source_config.lr,
+        min_lr=source_config.min_lr,
+        warmup_steps=0,
+        total_steps=9,
+        lr_scale=0.1,
+    ).value_at(source["global_step"])
+    expected_first_ema = LinearEMAMomentumSchedule(
+        start=0.99,
+        end=0.995,
+        total_steps=9,
+    ).value_at(source["global_step"])
+
+    branch_run = train_fi_jepa(
+        branch_from=source_checkpoint,
+        branch_name="slow-lr-branch",
+        branch_overrides={
+            "lr_scale": 0.1,
+            "weight_decay": 0.2,
+            "ema_momentum_start": 0.99,
+            "ema_momentum_end": 0.995,
+        },
+    )
+
+    assert branch_run == source_config.output_root / "slow-lr-branch"
+    resolved = yaml.safe_load((branch_run / "resolved_config.yaml").read_text(encoding="utf-8"))
+    branched = torch.load(branch_run / "checkpoints" / "latest.pt", map_location="cpu", weights_only=False)
+    records = [
+        json.loads(line)
+        for line in (branch_run / "train_log.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+
+    assert resolved["training"]["run_name"] == "slow-lr-branch"
+    assert resolved["training"]["lr"] == pytest.approx(source_config.lr)
+    assert resolved["training"]["lr_scale"] == pytest.approx(0.1)
+    assert resolved["training"]["weight_decay"] == pytest.approx(0.2)
+    assert resolved["training"]["epochs"] == source_config.epochs
+    assert resolved["branch"]["source_checkpoint"] == str(source_checkpoint.resolve())
+    assert resolved["branch"]["source_global_step"] == source["global_step"]
+    assert resolved["branch"]["overrides"]["lr_scale"] == pytest.approx(0.1)
+    assert records[0]["event"] == "branch"
+    assert records[0]["step"] == source["global_step"]
+    assert records[0]["epoch"] == source["resume_epoch"]
+    first_train = next(record for record in records if record["event"] == "train")
+    assert first_train["learning_rate"] == pytest.approx(expected_first_lr)
+    assert first_train["ema_momentum"] == pytest.approx(expected_first_ema)
+    assert branched["global_step"] == 10
+    assert branched["resume_epoch"] == 3
+    assert branched["best_validation_loss"] <= source["best_validation_loss"]
+    assert branched["lr_scheduler"]["total_steps"] == source["lr_scheduler"]["total_steps"]
+    assert branched["lr_scheduler"]["lr_scale"] == pytest.approx(0.1)
+    assert branched["lr_scheduler"]["last_step"] == 9
+    assert branched["ema_scheduler"]["total_steps"] == source["ema_scheduler"]["total_steps"]
+    assert branched["ema_scheduler"]["start"] == pytest.approx(0.99)
+    assert branched["ema_scheduler"]["end"] == pytest.approx(0.995)
+    assert branched["ema_scheduler"]["last_step"] == 9
+    assert branched["optimizer"]["param_groups"][0]["weight_decay"] == pytest.approx(0.2)
+
+    train_fi_jepa(resume=branch_run / "checkpoints" / "latest.pt")
+    resumed = torch.load(branch_run / "checkpoints" / "latest.pt", map_location="cpu", weights_only=False)
+    assert resumed["lr_scheduler"]["lr_scale"] == pytest.approx(0.1)
+
+
+def test_branch_requires_name_and_cannot_resume_at_the_same_time(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "checkpoint.pt"
+    with pytest.raises(ValueError, match="requires branch_name"):
+        train_fi_jepa(branch_from=checkpoint)
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        train_fi_jepa(resume=checkpoint, branch_from=checkpoint, branch_name="branch")
+    with pytest.raises(ValueError, match="do not accept a pretraining config"):
+        train_fi_jepa(FIJepaTrainingConfig(), branch_from=checkpoint, branch_name="branch")

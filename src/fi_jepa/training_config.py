@@ -30,6 +30,7 @@ class FIJepaTrainingConfig:
     optimizer: str = "adamw"
     lr: float = 0.0001
     min_lr: float = 0.0
+    lr_scale: float = 1.0
     weight_decay: float = 0.01
     epochs: int = 100
     warmup_epochs: int = 5
@@ -60,6 +61,8 @@ class FIJepaTrainingConfig:
             raise ValueError("Only the adamw optimizer is supported.")
         if self.lr <= 0.0 or self.min_lr < 0.0 or self.min_lr > self.lr:
             raise ValueError("Learning rates must satisfy 0 <= min_lr <= lr and lr > 0.")
+        if self.lr_scale <= 0.0:
+            raise ValueError("lr_scale must be positive.")
         if self.weight_decay < 0.0:
             raise ValueError("weight_decay cannot be negative.")
         if self.epochs <= 0 or not 0 <= self.warmup_epochs < self.epochs:
@@ -112,6 +115,7 @@ class FIJepaTrainingConfig:
             optimizer=str(optimization.get("optimizer", "adamw")).lower(),
             lr=float(optimization["lr"]),
             min_lr=float(optimization.get("min_lr", 0.0)),
+            lr_scale=float(optimization.get("lr_scale", 1.0)),
             weight_decay=float(optimization["weight_decay"]),
             epochs=int(optimization["epochs"]),
             warmup_epochs=int(optimization["warmup_epochs"]),
