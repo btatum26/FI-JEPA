@@ -1152,14 +1152,6 @@ def train_fi_jepa(
             warmup_timing_records,
             boundary_timing_records,
         )
-        print(
-            "Epoch boundary: "
-            f"validation={validation_seconds:.3f}s | "
-            f"representation_evaluation={representation_evaluation_seconds:.3f}s | "
-            f"best_checkpoint={best_checkpoint_seconds:.3f}s | "
-            f"latest_checkpoint={latest_checkpoint_seconds:.3f}s | "
-            f"total={float(boundary_record['total_seconds']):.3f}s"
-        )
 
     return run_dir
 
