@@ -16,8 +16,8 @@ class FIJepaModelConfig:
     """Configure tokenizer, Transformer, predictor, and exporter dimensions.
 
     All dimensions used by the model are represented here so construction can
-    validate attention divisibility and deterministic shared-path constraints
-    before allocating modules.
+    validate attention divisibility and deterministic preprocessing constraints
+    before allocating the online and EMA target copies.
     """
 
     patch_len: int = 21
@@ -114,7 +114,7 @@ class FIJepaModelConfig:
 
         The YAML is organized by architecture component for readability. This
         method converts that nested representation into the immutable runtime
-        configuration and enforces the dropout-free shared fusion contract.
+        configuration and enforces dropout-free online and target fusion.
         """
         values = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
         if not isinstance(values, dict):
@@ -146,7 +146,7 @@ class FIJepaModelConfig:
         fusion_dropout = float(values["fusion"].get("dropout", 0.0))
         if fusion_dropout != 0.0:
             raise ValueError(
-                "Shared fusion dropout must remain 0.0 for a deterministic target input."
+                "Online and target fusion dropout must remain 0.0 for deterministic inputs."
             )
         return cls(
             patch_len=int(values["input"]["patch_len"]),

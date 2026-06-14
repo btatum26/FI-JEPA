@@ -12,7 +12,7 @@ import torch
 
 @dataclass(frozen=True)
 class FIJepaOutput:
-    """Expose JEPA prediction loss, representations, masks, and shared tokens."""
+    """Expose JEPA prediction loss, representations, masks, and online fused tokens."""
 
     loss: torch.Tensor
     predicted_targets: torch.Tensor

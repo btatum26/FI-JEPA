@@ -61,15 +61,19 @@ flowchart TD
     XT --> FU
 
     FU --> ON[Online context encoder]
-    FU --> EMA[EMA target encoder]
+    A --> ETF[EMA target tokenizers, pooling, fusion, and positions]
+    M --> ETF
+    X --> ETF
+    ETF --> EMA[EMA target encoder]
     ON --> PR[Predictor]
     PR --> LOSS[Masked latent prediction loss]
     EMA --> LOSS
 ```
 
-The online encoder sees only visible patches. The exponential-moving-average
-target encoder sees the complete valid sequence, and the predictor estimates
-the target encoder's representations at masked patch positions.
+The online encoder sees only visible patches. A complete exponential-moving-
+average target branch independently tokenizes, pools, fuses, position-embeds,
+and encodes the complete valid sequence. The predictor estimates its
+representations at masked patch positions.
 
 See [FI_JEPA_MODEL_ARCHITECTURE_PLAN.md](FI_JEPA_MODEL_ARCHITECTURE_PLAN.md) for
 the complete tensor and model contract.

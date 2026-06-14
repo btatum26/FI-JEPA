@@ -10,7 +10,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from fi_jepa.model import FIJepaModel
+from fi_jepa.model import FIJepaModel, load_fi_jepa_model_state
 from fi_jepa.model_config import FIJepaModelConfig
 from fi_jepa.tokenizer import (
     MaskedAttentionAssetPooler,
@@ -215,31 +215,40 @@ def test_forward_shapes_loss_masking_and_target_gradient_boundary() -> None:
 
     output.loss.backward()
     assert any(parameter.grad is not None for parameter in model.context_encoder.parameters())
-    assert all(parameter.grad is None for parameter in model.target_encoder.parameters())
+    assert all(parameter.grad is None for parameter in model.target_parameters())
 
 
-def test_shared_tokenizers_and_fusion_are_dropout_free_and_deterministic() -> None:
+def test_online_and_target_preprocessing_are_dropout_free_and_deterministic() -> None:
     model = _model()
     model.train()
     batch = _batch()
     tensors = model._validate_batch(batch)
 
-    shared_modules = [
+    deterministic_modules = [
         model.asset_tokenizer,
         model.market_tokenizer,
         model.macro_tokenizer,
         model.asset_pooler,
         model.fusion,
+        model.target_asset_tokenizer,
+        model.target_market_tokenizer,
+        model.target_macro_tokenizer,
+        model.target_asset_pooler,
+        model.target_fusion,
     ]
     assert not any(
         isinstance(module, nn.Dropout)
-        for shared in shared_modules
-        if shared is not None
-        for module in shared.modules()
+        for deterministic in deterministic_modules
+        if deterministic is not None
+        for module in deterministic.modules()
     )
     first = model._tokenize_and_fuse(tensors)
     second = model._tokenize_and_fuse(tensors)
     assert torch.equal(first, second)
+    target_first = model._tokenize_and_fuse(tensors, use_target_branch=True)
+    target_second = model._tokenize_and_fuse(tensors, use_target_branch=True)
+    assert torch.equal(target_first, target_second)
+    assert torch.allclose(first, target_first, atol=1e-6)
 
 
 def test_invalid_feature_and_padded_asset_values_cannot_change_fused_tokens() -> None:
@@ -315,27 +324,114 @@ def test_target_representation_uses_full_context_sequence() -> None:
     assert not torch.allclose(original_target, changed_target)
 
 
+def test_target_preprocessing_changes_only_after_ema_update() -> None:
+    model = _model()
+    model.eval()
+    batch = _batch()
+    original_target = model(batch).target_representations.detach().clone()
+
+    with torch.no_grad():
+        next(model.asset_tokenizer.parameters()).add_(3.0)
+        model.patch_position_embedding.add_(1.0)
+    before_ema = model(batch).target_representations.detach().clone()
+    model.update_target_encoder(0.0)
+    after_ema = model(batch).target_representations.detach().clone()
+
+    assert torch.equal(original_target, before_ema)
+    assert not torch.equal(original_target, after_ema)
+
+
 # ============================================================================
 # EMA AND STATE EXPORT
 # ============================================================================
 
 
-def test_target_encoder_stays_frozen_in_eval_mode_and_updates_by_ema() -> None:
+def test_full_target_branch_stays_frozen_in_eval_mode_and_updates_by_ema() -> None:
     model = _model()
     model.train()
-    target_parameter = next(model.target_encoder.parameters())
-    online_parameter = next(model.context_encoder.parameters())
-    original_target = target_parameter.detach().clone()
+    target_online_pairs = [
+        (
+            next(target_module.parameters()),
+            next(online_module.parameters()),
+        )
+        for target_module, online_module in model._target_online_module_pairs()
+    ]
+    original_targets = [
+        target_parameter.detach().clone()
+        for target_parameter, _ in target_online_pairs
+    ]
+    original_target_position = model.target_patch_position_embedding.detach().clone()
 
-    assert not model.target_encoder.training
-    assert all(not parameter.requires_grad for parameter in model.target_encoder.parameters())
+    assert all(not target_module.training for target_module, _ in model._target_online_module_pairs())
+    assert all(not parameter.requires_grad for parameter in model.target_parameters())
+    for target_module, _ in model._target_online_module_pairs():
+        target_module.train()
+    model(_batch())
+    assert all(not target_module.training for target_module, _ in model._target_online_module_pairs())
     with torch.no_grad():
-        online_parameter.add_(2.0)
-    expected = original_target * 0.25 + online_parameter.detach() * 0.75
+        for _, online_parameter in target_online_pairs:
+            online_parameter.add_(2.0)
+        model.patch_position_embedding.add_(2.0)
+    expected_parameters = [
+        original_target * 0.25 + online_parameter.detach() * 0.75
+        for original_target, (_, online_parameter) in zip(
+            original_targets,
+            target_online_pairs,
+            strict=True,
+        )
+    ]
+    expected_position = (
+        original_target_position * 0.25
+        + model.patch_position_embedding.detach() * 0.75
+    )
     model.update_target_encoder(0.25)
 
-    assert torch.allclose(target_parameter, expected)
-    assert not model.target_encoder.training
+    for (target_parameter, _), expected in zip(
+        target_online_pairs,
+        expected_parameters,
+        strict=True,
+    ):
+        assert torch.allclose(target_parameter, expected)
+    assert torch.allclose(model.target_patch_position_embedding, expected_position)
+    assert all(not target_module.training for target_module, _ in model._target_online_module_pairs())
+
+
+def test_legacy_checkpoint_initializes_full_target_preprocessing_from_online_state() -> None:
+    source = _model()
+    with torch.no_grad():
+        next(source.asset_tokenizer.parameters()).fill_(1.5)
+        next(source.target_encoder.parameters()).fill_(2.5)
+        source.patch_position_embedding.fill_(3.5)
+    legacy_state = {
+        name: value
+        for name, value in source.state_dict().items()
+        if not name.startswith(
+            (
+                "target_asset_tokenizer.",
+                "target_market_tokenizer.",
+                "target_macro_tokenizer.",
+                "target_asset_pooler.",
+                "target_fusion.",
+            )
+        )
+        and name != "target_patch_position_embedding"
+    }
+
+    restored = _model()
+    load_fi_jepa_model_state(restored, legacy_state)
+
+    assert torch.equal(
+        next(restored.target_asset_tokenizer.parameters()),
+        next(restored.asset_tokenizer.parameters()),
+    )
+    assert torch.equal(
+        next(restored.target_encoder.parameters()),
+        next(source.target_encoder.parameters()),
+    )
+    assert torch.equal(
+        restored.target_patch_position_embedding,
+        restored.patch_position_embedding,
+    )
 
 
 def test_encode_pooled_state_is_source_of_truth_and_requires_endpoint_patch() -> None:

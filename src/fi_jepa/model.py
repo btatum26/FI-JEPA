@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Mapping
 
 import torch
 from torch import nn
@@ -45,6 +45,47 @@ JEPA_BATCH_TENSOR_NAMES = frozenset(
 
 
 # ============================================================================
+# CHECKPOINT COMPATIBILITY
+# ============================================================================
+
+
+def load_fi_jepa_model_state(
+    model: FIJepaModel,
+    state_dict: Mapping[str, torch.Tensor],
+) -> None:
+    """Load current or legacy model state into a full-EMA FI-JEPA model.
+
+    Legacy checkpoints contain an EMA temporal encoder but no target tokenizer,
+    asset-pooler, fusion, or positional-embedding state because those modules
+    were shared with the online branch. For those checkpoints, the missing
+    teacher preprocessing state is initialized from the saved online modules,
+    which exactly reproduces the old target input at resume time. A partially
+    written current-format teacher remains an error instead of being repaired.
+    """
+    if (
+        "target_patch_position_embedding" in state_dict
+        or "patch_position_embedding" not in state_dict
+    ):
+        model.load_state_dict(state_dict)
+        return
+
+    migrated = dict(state_dict)
+    prefix_pairs = (
+        ("asset_tokenizer.", "target_asset_tokenizer."),
+        ("market_tokenizer.", "target_market_tokenizer."),
+        ("macro_tokenizer.", "target_macro_tokenizer."),
+        ("asset_pooler.", "target_asset_pooler."),
+        ("fusion.", "target_fusion."),
+    )
+    for online_prefix, target_prefix in prefix_pairs:
+        for name, value in state_dict.items():
+            if name.startswith(online_prefix):
+                migrated[f"{target_prefix}{name.removeprefix(online_prefix)}"] = value
+    migrated["target_patch_position_embedding"] = state_dict["patch_position_embedding"]
+    model.load_state_dict(migrated)
+
+
+# ============================================================================
 # FI-JEPA MODEL
 # ============================================================================
 
@@ -53,11 +94,11 @@ class FIJepaModel(nn.Module):
     """Configurable patch-tokenized variable-asset temporal FI-JEPA core model.
 
     The model consumes the patched batch dictionary emitted by the dense-panel
-    dataloader. Shared tokenizers,
-    asset pooling, and fusion are deterministic; the online temporal encoder
-    and predictor may use dropout. The target temporal encoder is a frozen EMA
-    copy that always evaluates the full valid patch sequence before target
-    positions are gathered.
+    dataloader. Online tokenizers, asset pooling, fusion, positional embeddings,
+    and temporal encoding are mirrored by a frozen full-EMA target branch. The
+    online temporal encoder and predictor may use dropout, while every target
+    module remains deterministic and evaluates the full valid patch sequence
+    before target positions are gathered.
 
     Shape symbols used throughout this module:
         ``B``: batch size.
@@ -143,6 +184,7 @@ class FIJepaModel(nn.Module):
         self.patch_position_embedding = nn.Parameter(
             torch.empty(config.num_patches, config.d_model)
         )
+        nn.init.normal_(self.patch_position_embedding, std=0.02)
 
         context_layer = nn.TransformerEncoderLayer(
             d_model=config.d_model,
@@ -154,11 +196,23 @@ class FIJepaModel(nn.Module):
             norm_first=True,
         )
         self.context_encoder = nn.TransformerEncoder(context_layer, num_layers=config.context_layers, enable_nested_tensor=False)
-        # The target encoder starts as an exact online-encoder copy and remains gradient-free.
-        # training code advances it only through EMA updates.
+
+        # The teacher owns every learned transformation from raw patches through
+        # temporal encoding. It starts as an exact online copy and advances only
+        # through EMA updates after successful optimizer steps.
+        self.target_asset_tokenizer = deepcopy(self.asset_tokenizer)
+        self.target_market_tokenizer = deepcopy(self.market_tokenizer)
+        self.target_macro_tokenizer = deepcopy(self.macro_tokenizer)
+        self.target_asset_pooler = deepcopy(self.asset_pooler)
+        self.target_fusion = deepcopy(self.fusion)
+        self.target_patch_position_embedding = nn.Parameter(
+            self.patch_position_embedding.detach().clone(),
+            requires_grad=False,
+        )
         self.target_encoder = deepcopy(self.context_encoder)
-        self.target_encoder.requires_grad_(False)
-        self.target_encoder.eval()
+        for target_module, _ in self._target_online_module_pairs():
+            target_module.requires_grad_(False)
+        self._set_target_branch_eval()
 
         predictor_layer = nn.TransformerDecoderLayer(
             d_model=config.d_model,
@@ -182,7 +236,6 @@ class FIJepaModel(nn.Module):
             nn.Linear(config.d_model, config.latent_dim),
         )
 
-        nn.init.normal_(self.patch_position_embedding, std=0.02)
         nn.init.normal_(self.target_mask_token, std=0.02)
 
     @classmethod
@@ -198,8 +251,33 @@ class FIJepaModel(nn.Module):
     def train(self, mode: bool = True) -> FIJepaModel:
         """Set online modules to training mode while keeping the EMA target deterministic."""
         super().train(mode)
-        self.target_encoder.eval()
+        self._set_target_branch_eval()
         return self
+
+    def _target_online_module_pairs(self) -> tuple[tuple[nn.Module, nn.Module], ...]:
+        """Return aligned target/online module pairs that define the full EMA branch."""
+        pairs = [
+            (self.target_asset_tokenizer, self.asset_tokenizer),
+            (self.target_market_tokenizer, self.market_tokenizer),
+            (self.target_macro_tokenizer, self.macro_tokenizer),
+            (self.target_fusion, self.fusion),
+            (self.target_encoder, self.context_encoder),
+        ]
+        if self.target_asset_pooler is not None and self.asset_pooler is not None:
+            pairs.insert(3, (self.target_asset_pooler, self.asset_pooler))
+        return tuple(pairs)
+
+    def _set_target_branch_eval(self) -> None:
+        """Keep every full-EMA target module deterministic regardless of parent mode."""
+        for target_module, _ in self._target_online_module_pairs():
+            target_module.eval()
+
+    def target_parameters(self) -> tuple[nn.Parameter, ...]:
+        """Return every frozen parameter owned by the complete EMA target branch."""
+        parameters = [self.target_patch_position_embedding]
+        for target_module, _ in self._target_online_module_pairs():
+            parameters.extend(target_module.parameters())
+        return tuple(parameters)
 
     def _validate_batch(
         self,
@@ -408,8 +486,13 @@ class FIJepaModel(nn.Module):
             )
         return tensors
 
-    def _tokenize_and_fuse(self, tensors: dict[str, torch.Tensor]) -> torch.Tensor:
-        """Create one deterministic shared token per temporal patch.
+    def _tokenize_and_fuse(
+        self,
+        tensors: dict[str, torch.Tensor],
+        *,
+        use_target_branch: bool = False,
+    ) -> torch.Tensor:
+        """Create one online or EMA target token per temporal patch.
 
         Asset patches are tokenized per asset and pooled across only valid
         asset slots. Market and macro patches are tokenized directly. The
@@ -419,38 +502,50 @@ class FIJepaModel(nn.Module):
         Returns:
             Fused patch tokens shaped ``[B, P, D]``.
         """
+        asset_tokenizer = (
+            self.target_asset_tokenizer if use_target_branch else self.asset_tokenizer
+        )
+        market_tokenizer = (
+            self.target_market_tokenizer if use_target_branch else self.market_tokenizer
+        )
+        macro_tokenizer = (
+            self.target_macro_tokenizer if use_target_branch else self.macro_tokenizer
+        )
+        asset_pooler = self.target_asset_pooler if use_target_branch else self.asset_pooler
+        fusion = self.target_fusion if use_target_branch else self.fusion
+
         # [B, P, L, A, F_asset] -> [B, P, A, L, F_asset].
         asset_values = tensors["asset_patches"].permute(0, 1, 3, 2, 4)
         asset_features = tensors["asset_feature_mask_patched"].permute(0, 1, 3, 2, 4)
         asset_days = tensors["valid_asset_mask_patched"].permute(0, 1, 3, 2)
         asset_days = asset_days & asset_features.any(dim=-1)
-        asset_tokens = self.asset_tokenizer(
+        asset_tokens = asset_tokenizer(
             asset_values, asset_features, asset_days
         )  # [B, P, A, D_asset].
-        if self.asset_pooler is None:
+        if asset_pooler is None:
             panel_tokens = masked_mean(
                 asset_tokens, tensors["patch_asset_mask"], dimension=2
             )  # [B, P, D_asset].
         else:
-            panel_tokens = self.asset_pooler(
+            panel_tokens = asset_pooler(
                 asset_tokens, tensors["patch_asset_mask"]
             )  # [B, P, D_asset].
 
         market_features = tensors["market_feature_mask_patched"]
         market_days = tensors["valid_market_date_mask_patched"] & market_features.any(dim=-1)
-        market_tokens = self.market_tokenizer(
+        market_tokens = market_tokenizer(
             tensors["market_patches"], market_features, market_days
         )  # [B, P, D_market].
 
         macro_features = tensors["macro_feature_mask_patched"]
         macro_days = tensors["valid_macro_date_mask_patched"] & macro_features.any(dim=-1)
-        macro_tokens = self.macro_tokenizer(
+        macro_tokens = macro_tokenizer(
             tensors["macro_patches"], macro_features, macro_days
         )  # [B, P, D_macro].
 
         # [B, P, D_asset + D_market + D_macro] -> [B, P, D].
         combined_tokens = torch.cat((panel_tokens, market_tokens, macro_tokens), dim=-1)
-        return self.fusion(combined_tokens)
+        return fusion(combined_tokens)
 
     def forward(self, batch: dict[str, object]) -> FIJepaOutput:
         """Predict EMA target representations for masked patch positions.
@@ -469,10 +564,20 @@ class FIJepaModel(nn.Module):
         context_encoded = self.context_encoder(context_tokens, src_key_padding_mask=~context_mask)  # [B, C, D].
 
         patch_context = tensors["patch_context_mask"]
-        self.target_encoder.eval()
+        self._set_target_branch_eval()
         with torch.no_grad():
-            # The EMA branch encodes the full valid sequence: [B, P, D].
-            target_full = self.target_encoder(positioned_tokens.detach(), src_key_padding_mask=~patch_context)
+            target_fused_tokens = self._tokenize_and_fuse(
+                tensors,
+                use_target_branch=True,
+            )  # [B, P, D].
+            target_positioned_tokens = (
+                target_fused_tokens + self.target_patch_position_embedding.unsqueeze(0)
+            )  # [B, P, D].
+            # The full EMA branch encodes the complete valid sequence: [B, P, D].
+            target_full = self.target_encoder(
+                target_positioned_tokens,
+                src_key_padding_mask=~patch_context,
+            )
 
         target_ids = tensors["target_patch_ids"]
         target_mask = tensors["target_patch_id_mask"]
@@ -543,16 +648,30 @@ class FIJepaModel(nn.Module):
 
     @torch.no_grad()
     def update_target_encoder(self, momentum: float) -> None:
-        """Move target encoder parameters toward online parameters by EMA.
+        """Move the complete target branch toward the online encoder path by EMA.
 
         ``momentum=1`` leaves the target unchanged, while ``momentum=0`` copies
-        the online encoder exactly. Buffers are unaffected because the current
-        Transformer encoder does not use running-statistic buffers.
+        the online path exactly. Floating-point parameters use EMA; module
+        buffers are copied directly because they represent state rather than
+        trainable weights.
         """
         if not 0.0 <= momentum <= 1.0:
             raise ValueError("EMA momentum must be in [0, 1].")
-        for target_parameter, online_parameter in zip(
-            self.target_encoder.parameters(), self.context_encoder.parameters(), strict=True
-        ):
-            target_parameter.mul_(momentum).add_(online_parameter, alpha=1.0 - momentum)
-        self.target_encoder.eval()
+        for target_module, online_module in self._target_online_module_pairs():
+            for target_parameter, online_parameter in zip(
+                target_module.parameters(),
+                online_module.parameters(),
+                strict=True,
+            ):
+                target_parameter.mul_(momentum).add_(online_parameter, alpha=1.0 - momentum)
+            for target_buffer, online_buffer in zip(
+                target_module.buffers(),
+                online_module.buffers(),
+                strict=True,
+            ):
+                target_buffer.copy_(online_buffer)
+        self.target_patch_position_embedding.mul_(momentum).add_(
+            self.patch_position_embedding,
+            alpha=1.0 - momentum,
+        )
+        self._set_target_branch_eval()

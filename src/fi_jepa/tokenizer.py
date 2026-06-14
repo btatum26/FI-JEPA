@@ -68,8 +68,8 @@ class MaskedPatchTokenizer(nn.Module):
     The tokenizer accepts arbitrary leading dimensions followed by ``[L, F]``.
     It concatenates feature-validity bits to zero-filled values, projects each
     day independently, averages only valid days, and projects the pooled patch
-    representation. No dropout is used because this shared path feeds both the
-    online and EMA target branches.
+    representation. No dropout is used so the independently parameterized
+    online and EMA target copies remain deterministic.
     """
 
     def __init__(self, feature_dim: int, hidden_dim: int, output_dim: int):
@@ -152,8 +152,8 @@ class MaskedAttentionPatchTokenizer(nn.Module):
     It concatenates feature-validity bits to zero-filled values, projects each
     day independently, prepends a learned summary token, and applies masked
     self-attention across the ordered days. The encoded summary becomes the
-    patch representation. No dropout is used because this shared path feeds
-    both the online and EMA target branches.
+    patch representation. No dropout is used so the independently parameterized
+    online and EMA target copies remain deterministic.
     """
 
     def __init__(
@@ -339,8 +339,8 @@ class MaskedAttentionAssetPooler(nn.Module):
     A learned summary query applies masked cross-attention over asset tokens
     with no asset positional embeddings, preserving invariance to asset
     ordering while scaling linearly with asset count. Invalid asset slots
-    cannot contribute keys or values. No dropout is used because the pooled
-    panel token feeds both online and EMA target branches.
+    cannot contribute keys or values. No dropout is used so the independently
+    parameterized online and EMA target copies remain deterministic.
     """
 
     def __init__(self, token_dim: int, *, layers: int, heads: int, mlp_ratio: int):

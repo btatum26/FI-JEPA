@@ -70,8 +70,9 @@ The current model:
 3. Tokenizes asset, market, and macro streams separately.
 4. Pools valid assets inside each patch and fuses the three streams.
 5. Encodes visible patches with an online context encoder.
-6. Encodes the complete valid positioned patch sequence with an EMA target
-   encoder.
+6. Builds and encodes the complete valid patch sequence with a full EMA target
+   branch covering tokenization, asset pooling, fusion, position embeddings,
+   and temporal encoding.
 7. Predicts gathered target-position representations from visible context.
 8. Trains with normalized latent prediction loss plus a weak variance and
    covariance guardrail on pooled visible-context states.

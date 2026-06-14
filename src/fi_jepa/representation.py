@@ -17,7 +17,7 @@ from fi_jepa.dataloader import (
     DensePanelStore,
     build_fi_jepa_embedding_dataloader,
 )
-from fi_jepa.model import ENCODER_BATCH_TENSOR_NAMES, FIJepaModel
+from fi_jepa.model import ENCODER_BATCH_TENSOR_NAMES, FIJepaModel, load_fi_jepa_model_state
 from fi_jepa.model_config import FIJepaModelConfig
 
 EMBEDDING_SCHEMA_VERSION = 1
@@ -558,7 +558,7 @@ def evaluate_checkpoint(
     data_config = FIJepaDataConfig(**data_values)
     store = DensePanelStore(data_config.artifact_path, cache_root=data_config.cache_root)
     model = FIJepaModel.from_store(model_config, store)
-    model.load_state_dict(checkpoint["model"])
+    load_fi_jepa_model_state(model, checkpoint["model"])
 
     device = torch.device(
         "cuda" if device_name == "auto" and torch.cuda.is_available() else

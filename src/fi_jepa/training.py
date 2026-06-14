@@ -21,7 +21,12 @@ import yaml
 
 from fi_jepa.dataloader import DensePanelStore, FIJepaDataConfig, build_fi_jepa_dataloader
 from fi_jepa.losses import pooled_variance_covariance_loss
-from fi_jepa.model import ENCODER_BATCH_TENSOR_NAMES, JEPA_BATCH_TENSOR_NAMES, FIJepaModel
+from fi_jepa.model import (
+    ENCODER_BATCH_TENSOR_NAMES,
+    JEPA_BATCH_TENSOR_NAMES,
+    FIJepaModel,
+    load_fi_jepa_model_state,
+)
 from fi_jepa.model_config import FIJepaModelConfig
 from fi_jepa.model_output import FIJepaOutput
 from fi_jepa.representation import (
@@ -41,6 +46,8 @@ from fi_jepa.training_profiler import (
 from fi_jepa.tokenizer import masked_mean
 
 from fi_jepa.schedulers import WarmupCosineLRSchedule, LinearEMAMomentumSchedule
+
+CHECKPOINT_FORMAT_VERSION = 2
 
 
 # ============================================================================
@@ -142,10 +149,10 @@ def _write_resolved_config(path: Path, resolved_config: dict[str, Any]) -> None:
 def build_adamw(model: FIJepaModel, config: FIJepaTrainingConfig) -> AdamW:
     """Build AdamW over trainable online parameters only.
 
-    The EMA target encoder is frozen by the model contract and is also
+    The complete EMA target branch is frozen by the model contract and is also
     explicitly excluded here so optimizer state cannot silently grow around it.
     """
-    target_ids = {id(parameter) for parameter in model.target_encoder.parameters()}
+    target_ids = {id(parameter) for parameter in model.target_parameters()}
     parameters = [
         parameter
         for parameter in model.parameters()
@@ -354,7 +361,7 @@ def _checkpoint_state(
 ) -> dict[str, object]:
     """Build a complete checkpoint without any batch or sampler position."""
     return {
-        "format_version": 1,
+        "format_version": CHECKPOINT_FORMAT_VERSION,
         "kind": kind,
         "model": model.state_dict(),
         "optimizer": optimizer.state_dict(),
@@ -578,7 +585,7 @@ def train_fi_jepa(
         runtime["amp_dtype"] = (None if amp_dtype is None else str(amp_dtype).removeprefix("torch."))
         
         _write_resolved_config(run_dir / "resolved_config.yaml", resolved_config)
-        model.load_state_dict(checkpoint["model"])
+        load_fi_jepa_model_state(model, checkpoint["model"])
         optimizer.load_state_dict(checkpoint["optimizer"])
         lr_schedule.load_state_dict(checkpoint["lr_scheduler"])
         ema_schedule.load_state_dict(checkpoint["ema_scheduler"])
@@ -783,7 +790,7 @@ def train_fi_jepa(
                     break
                 continue
 
-            # update EMA target encoder
+            # Update the complete EMA target branch after a successful online step.
             with profile_range("ema_update", enabled=training_profiler is not None):
                 lr_schedule.apply(step_index, commit=True)
                 ema_momentum = ema_schedule.commit(step_index)
@@ -914,7 +921,7 @@ def train_fi_jepa(
                         ),
                         checkpoint_id=checkpoint_id,
                         checkpoint_step=global_step,
-                        checkpoint_format_version=1,
+                        checkpoint_format_version=CHECKPOINT_FORMAT_VERSION,
                         model_version=canonical_version_hash(resolved_config["model"]),
                         export_embeddings=training_config.representation_export_embeddings,
                     )

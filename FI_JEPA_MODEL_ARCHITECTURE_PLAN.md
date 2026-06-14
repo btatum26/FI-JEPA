@@ -71,8 +71,10 @@ The model tokenizes each stream independently:
 5. A dropout-free fusion projection maps the combined stream to width 128.
 6. Learned temporal position embeddings are added after fusion.
 
-Shared tokenizers and fusion are deterministic. Branch-specific stochasticity
-begins in the online context encoder and predictor.
+The online and EMA target branches own separate tokenizer, asset-pooling,
+fusion, positional-embedding, and temporal-encoder parameters. Tokenizers,
+pooling, and fusion remain dropout-free in both branches. Branch-specific
+stochasticity begins in the online context encoder and predictor.
 
 ## JEPA Branches
 
@@ -95,15 +97,19 @@ the complete valid positioned patch sequence, then target positions are
 gathered from that encoded sequence:
 
 ```text
-positioned full tokens [B, P, D]
+raw patched streams
+    -> EMA target tokenizers and asset pooling
+    -> EMA target fusion and position embeddings
+    -> positioned full tokens [B, P, D]
     -> EMA target encoder with invalid-patch padding mask
     -> full target sequence [B, P, D]
     -> gather requested target IDs
     -> target representations [B, T, D]
 ```
 
-The target branch runs under `torch.no_grad()`, remains in evaluation mode, and
-is updated only by exponential moving average from the online context encoder.
+The complete target branch runs under `torch.no_grad()`, remains in evaluation
+mode, and is updated only by exponential moving average from the corresponding
+online tokenizer, pooler, fusion, position-embedding, and context-encoder state.
 
 ### Predictor And Loss
 
@@ -171,7 +177,7 @@ exports, nor probes use it.
 `train-fi-jepa`:
 
 - Uses AdamW on trainable online-model parameters only.
-- Excludes the frozen target encoder from optimization.
+- Excludes the complete frozen target branch from optimization.
 - Applies warmup plus cosine learning-rate scheduling.
 - Increases EMA momentum linearly over training.
 - Supports mixed precision where available.
@@ -181,6 +187,8 @@ exports, nor probes use it.
   `best_validation.pt`.
 - Resumes from the checkpoint's resolved config and validates runtime
   compatibility.
+- Writes full-EMA checkpoint format version 2. Version-1 checkpoints initialize
+  missing target preprocessing state from their saved online modules.
 
 Validation JEPA loss is weighted by the number of real target patches rather
 than averaging batch means equally.
@@ -226,7 +234,6 @@ uv run pytest -q
 
 - Broader patch-state or target-path anti-collapse regularization if the weak
   pooled visible-context guardrail proves insufficient.
-- Full EMA copies of tokenizers and fusion instead of only the temporal encoder.
 - Alternative target-block sampling strategies.
 - Learned or attention-based asset pooling.
 - Broader representation baselines and residualized volatility diagnostics.

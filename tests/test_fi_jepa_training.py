@@ -14,6 +14,7 @@ from fi_jepa.model import FIJepaModel
 from fi_jepa.model_config import FIJepaModelConfig
 from fi_jepa.model_output import FIJepaOutput
 from fi_jepa.training import (
+    CHECKPOINT_FORMAT_VERSION,
     LinearEMAMomentumSchedule,
     WarmupCosineLRSchedule,
     _training_objective,
@@ -272,14 +273,12 @@ def test_training_config_and_schedules_validate_endpoints_and_clamp() -> None:
     assert ema_schedule.value_at(9) == pytest.approx(0.999)
 
 
-def test_adamw_excludes_frozen_target_encoder() -> None:
+def test_adamw_excludes_complete_frozen_target_branch() -> None:
     model = FIJepaModel(_small_model_config(), 1, 1, 1)
     optimizer = build_adamw(model, FIJepaTrainingConfig(epochs=2, warmup_epochs=0))
     optimized = {id(parameter) for group in optimizer.param_groups for parameter in group["params"]}
 
-    assert not optimized.intersection(
-        id(parameter) for parameter in model.target_encoder.parameters()
-    )
+    assert not optimized.intersection(id(parameter) for parameter in model.target_parameters())
     assert optimized == {
         id(parameter) for parameter in model.parameters() if parameter.requires_grad
     }
@@ -407,6 +406,7 @@ def test_smoke_training_and_basic_epoch_resume(
     } <= set(embeddings.columns)
     assert not any(name.startswith("future_") for name in embeddings.columns)
     assert latest["kind"] == "epoch_end"
+    assert latest["format_version"] == CHECKPOINT_FORMAT_VERSION
     assert latest["resume_epoch"] == 2
     assert periodic["kind"] == "periodic"
     assert periodic["resume_epoch"] == 0
