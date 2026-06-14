@@ -82,17 +82,27 @@ def validate_model_yaml(values: object) -> dict[str, object]:
     """Validate the top-level model YAML contract and return its mapping."""
     if not isinstance(values, dict):
         raise ValueError("Model configuration must be a YAML mapping.")
+    allowed_sections = {
+        "input",
+        "tokenizers",
+        "asset_pooling",
+        "fusion",
+        "context_encoder",
+        "predictor",
+    }
     required_sections = {
         "input",
         "tokenizers",
         "fusion",
         "context_encoder",
         "predictor",
-        "state_exporter",
     }
     missing = sorted(required_sections - set(values))
     if missing:
         raise ValueError(f"Model configuration is missing sections: {missing}")
+    unknown = sorted(set(values) - allowed_sections)
+    if unknown:
+        raise ValueError(f"Model configuration contains unknown sections: {unknown}")
 
     tokenizers = values["tokenizers"]
     tokenizer_type = str(tokenizers.get("type", "mean"))

@@ -43,7 +43,6 @@ def _small_config() -> FIJepaModelConfig:
         macro_hidden_dim=5,
         macro_token_dim=4,
         d_model=8,
-        latent_dim=3,
         context_layers=1,
         context_heads=2,
         context_mlp_ratio=2,
@@ -434,7 +433,7 @@ def test_legacy_checkpoint_initializes_full_target_preprocessing_from_online_sta
     )
 
 
-def test_encode_pooled_state_is_source_of_truth_and_requires_endpoint_patch() -> None:
+def test_encode_pooled_state_is_only_representation_path_and_requires_endpoint_patch() -> None:
     model = _model()
     model.eval()
     batch = _batch()
@@ -454,9 +453,3 @@ def test_encode_pooled_state_is_source_of_truth_and_requires_endpoint_patch() ->
     actual = model.encode_pooled_state(batch)
     assert actual.shape == (2, 16)
     assert torch.allclose(actual, expected)
-
-    with torch.no_grad():
-        for parameter in model.state_exporter.parameters():
-            parameter.fill_(1000.0)
-    assert torch.allclose(model.encode_pooled_state(batch), expected)
-    assert model.encode(batch).shape == (2, 3)

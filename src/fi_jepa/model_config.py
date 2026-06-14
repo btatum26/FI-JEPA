@@ -15,7 +15,7 @@ from fi_jepa.model_validation import validate_model_config, validate_model_yaml
 
 @dataclass(frozen=True)
 class FIJepaModelConfig:
-    """Configure tokenizer, Transformer, predictor, and exporter dimensions.
+    """Configure tokenizer, Transformer, and predictor dimensions.
 
     All dimensions used by the model are represented here so construction can
     validate attention divisibility and deterministic preprocessing constraints
@@ -39,7 +39,6 @@ class FIJepaModelConfig:
     macro_hidden_dim: int = 64
     macro_token_dim: int = 64
     d_model: int = 128
-    latent_dim: int = 8
     context_layers: int = 2
     context_heads: int = 4
     context_mlp_ratio: int = 4
@@ -68,7 +67,6 @@ class FIJepaModelConfig:
                 "macro_hidden_dim": self.macro_hidden_dim,
                 "macro_token_dim": self.macro_token_dim,
                 "d_model": self.d_model,
-                "latent_dim": self.latent_dim,
                 "context_layers": self.context_layers,
                 "context_heads": self.context_heads,
                 "context_mlp_ratio": self.context_mlp_ratio,
@@ -126,7 +124,6 @@ class FIJepaModelConfig:
             macro_hidden_dim=int(tokenizers["macro"]["hidden_dim"]),
             macro_token_dim=int(tokenizers["macro"]["output_dim"]),
             d_model=int(values["fusion"]["output_dim"]),
-            latent_dim=int(values["state_exporter"]["latent_dim"]),
             context_layers=int(values["context_encoder"]["layers"]),
             context_heads=int(values["context_encoder"]["heads"]),
             context_mlp_ratio=int(values["context_encoder"]["mlp_ratio"]),

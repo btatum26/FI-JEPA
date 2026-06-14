@@ -577,7 +577,7 @@ def evaluate_checkpoint(
         raise RuntimeError("CUDA was requested but is not available.")
     model.to(device)
     training = resolved["training"]
-    components = int(training.get("representation_pca_components", model_config.latent_dim))
+    components = int(training["representation_pca_components"])
     views = int(training.get("representation_views_per_date", 3))
     checkpoint_sha = _file_sha256(checkpoint_path)
     checkpoint_id = f"step_{int(checkpoint['global_step']):09d}_{checkpoint_sha[:12]}"

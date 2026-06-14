@@ -24,9 +24,6 @@ The workflow uses three immutable artifact types:
 4. Fit PCA only on train pooled states.
 5. Apply the train-fit PCA transform to validation states.
 
-The legacy `state_exporter` and `encode()` path is not used. The JEPA loss does
-not train `state_exporter`.
-
 ## Export Embeddings
 
 ```bash

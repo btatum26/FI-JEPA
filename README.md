@@ -196,8 +196,11 @@ constructed at runtime.
 uv run train-fi-jepa --config configs/pretraining.yaml --device auto
 ```
 
-Runs are written under `runs/pretraining/`. To resume from a run directory or a
-specific checkpoint:
+The `run.name` field in `configs/pretraining.yaml` is the exact run-directory
+name. For example, `name: fi_jepa_v1` writes to `runs/pretraining/fi_jepa_v1`.
+Later runs with the same name append a readable UTC timestamp, such as
+`fi_jepa_v1-2026-06-14-17-23-45`. To resume from a run directory or a specific
+checkpoint:
 
 ```bash
 uv run train-fi-jepa --resume runs/pretraining/<run>/checkpoints/latest.pt --device auto

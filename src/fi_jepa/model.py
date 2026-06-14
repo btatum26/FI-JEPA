@@ -208,16 +208,6 @@ class FIJepaModel(nn.Module):
         self.predictor = nn.TransformerDecoder(predictor_layer, num_layers=config.predictor_layers)
         # One learned query is combined with each target patch's positional embedding.
         self.target_mask_token = nn.Parameter(torch.empty(1, 1, config.d_model))
-        # Checkpoint compatibility only. The JEPA loss does not train this projection, 
-        # so evaluation uses encode_pooled_state() plus train-fit PCA.
-        self.state_exporter = nn.Sequential(
-            nn.LayerNorm(config.d_model * 2),
-            nn.Linear(config.d_model * 2, config.d_model),
-            nn.GELU(),
-            nn.LayerNorm(config.d_model),
-            nn.Linear(config.d_model, config.latent_dim),
-        )
-
         nn.init.normal_(self.target_mask_token, std=0.02)
 
     @classmethod
@@ -433,10 +423,6 @@ class FIJepaModel(nn.Module):
         mean_state = masked_mean(full_encoded, patch_context, dimension=1)  # [B, D].
         endpoint_state = full_encoded[:, -1]  # [B, D].
         return torch.cat((mean_state, endpoint_state), dim=-1)  # [B, 2D].
-
-    def encode(self, batch: dict[str, object]) -> torch.Tensor:
-        """Apply the legacy untrained state exporter for checkpoint compatibility only."""
-        return self.state_exporter(self.encode_pooled_state(batch))
 
     @torch.no_grad()
     def update_target_encoder(self, momentum: float) -> None:

@@ -168,10 +168,6 @@ targets.
 Evaluation fits PCA only on train pooled states, canonicalizes component signs,
 and applies the same transform to validation states.
 
-`state_exporter` and `encode()` remain only for legacy checkpoint compatibility.
-The JEPA loss does not train `state_exporter`; neither diagnostics, embedding
-exports, nor probes use it.
-
 ## Training Contract
 
 `train-fi-jepa`:
@@ -212,7 +208,7 @@ probe evaluation are documented in [docs/probes.md](docs/probes.md).
 | Config | Owns |
 |---|---|
 | `configs/dataloader.yaml` | Runtime artifact path, windows, asset views, patch validity, and temporal masking |
-| `configs/model.yaml` | Tokenizer, fusion, encoder, predictor, and legacy exporter dimensions |
+| `configs/model.yaml` | Tokenizer, fusion, encoder, and predictor dimensions |
 | `configs/pretraining.yaml` | Optimization, EMA, validation, representation evaluation, checkpointing, and logging |
 
 ## Tests

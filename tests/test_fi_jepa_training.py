@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import json
 from pathlib import Path
 
@@ -17,6 +18,7 @@ from fi_jepa.training import (
     CHECKPOINT_FORMAT_VERSION,
     LinearEMAMomentumSchedule,
     WarmupCosineLRSchedule,
+    _create_run_directory,
     _training_objective,
     build_adamw,
     train_fi_jepa,
@@ -164,7 +166,6 @@ def _small_model_config() -> FIJepaModelConfig:
         macro_hidden_dim=4,
         macro_token_dim=2,
         d_model=4,
-        latent_dim=2,
         context_layers=1,
         context_heads=2,
         context_mlp_ratio=2,
@@ -197,7 +198,6 @@ def _write_run_configs(root: Path) -> FIJepaTrainingConfig:
                 "fusion": {"output_dim": 4, "dropout": 0.0},
                 "context_encoder": {"layers": 1, "heads": 2, "mlp_ratio": 2, "dropout": 0.0},
                 "predictor": {"layers": 1, "heads": 2, "mlp_ratio": 2, "dropout": 0.0},
-                "state_exporter": {"latent_dim": 2},
             },
             sort_keys=False,
         ),
@@ -271,6 +271,18 @@ def test_training_config_and_schedules_validate_endpoints_and_clamp() -> None:
     assert ema_schedule.value_at(0) == pytest.approx(0.99)
     assert ema_schedule.value_at(5) == pytest.approx(0.999)
     assert ema_schedule.value_at(9) == pytest.approx(0.999)
+
+
+def test_same_name_run_directories_append_readable_timestamp(tmp_path: Path) -> None:
+    created_at = datetime(2026, 6, 14, 17, 23, 45, tzinfo=timezone.utc)
+
+    first = _create_run_directory(tmp_path, "experiment", created_at=created_at)
+    second = _create_run_directory(tmp_path, "experiment", created_at=created_at)
+    third = _create_run_directory(tmp_path, "experiment", created_at=created_at)
+
+    assert first.name == "experiment"
+    assert second.name == "experiment-2026-06-14-17-23-45"
+    assert third.name == "experiment-2026-06-14-17-23-45-2"
 
 
 def test_adamw_excludes_complete_frozen_target_branch() -> None:
@@ -353,6 +365,8 @@ def test_smoke_training_and_basic_epoch_resume(
     latest = torch.load(checkpoints / "latest.pt", map_location="cpu", weights_only=False)
     periodic = torch.load(checkpoints / "step_000000001.pt", map_location="cpu", weights_only=False)
 
+    assert run_dir == config.output_root / config.run_name
+    assert run_dir.name == "smoke"
     assert (run_dir / "resolved_config.yaml").is_file()
     assert (run_dir / "train_log.jsonl").is_file()
     assert (checkpoints / "best_validation.pt").is_file()
@@ -424,7 +438,6 @@ def test_smoke_training_and_basic_epoch_resume(
     assert sum(record["event"] == "epoch_boundary" for record in records) == 4
     assert "EPOCH BOUNDARY" in (run_dir / "runtime_summary.txt").read_text(encoding="utf-8")
     assert (checkpoints / "step_000000006.pt").is_file()
-
     terminal_output = capsys.readouterr()
     assert "Training plan:" in terminal_output.out
     assert "Epoch warm-up:" in terminal_output.out

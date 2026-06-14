@@ -53,6 +53,39 @@ def _utc_timestamp() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _create_run_directory(
+    output_root: Path,
+    run_name: str,
+    *,
+    created_at: datetime | None = None,
+) -> Path:
+    """Create a named run directory, appending a readable UTC timestamp on collision.
+
+    The first run uses ``<output_root>/<run_name>``. Later runs with the same
+    name use ``<run_name>-YYYY-MM-DD-HH-MM-SS``. A numeric suffix handles the
+    unlikely case where multiple same-name runs start within one second.
+    """
+    run_dir = output_root / run_name
+    try:
+        run_dir.mkdir(parents=True, exist_ok=False)
+        return run_dir
+    except FileExistsError:
+        pass
+
+    timestamp = (created_at or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    timestamped_name = f"{run_name}-{timestamp.strftime('%Y-%m-%d-%H-%M-%S')}"
+    suffix = 1
+    while True:
+        candidate = output_root / (
+            timestamped_name if suffix == 1 else f"{timestamped_name}-{suffix}"
+        )
+        try:
+            candidate.mkdir(parents=True, exist_ok=False)
+            return candidate
+        except FileExistsError:
+            suffix += 1
+
+
 def _seed_everything(seed: int) -> None:
     """Seed Python, NumPy, and Torch before model and loader construction."""
     random.seed(seed)
@@ -472,9 +505,10 @@ def train_fi_jepa(
         data_config = FIJepaDataConfig.from_yaml(training_config.dataloader_config_path)
         data_config = replace(data_config, artifact_path=data_config.artifact_path.resolve())
 
-        run_stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-        run_dir = training_config.output_root / f"{run_stamp}_{training_config.run_name}"
-        run_dir.mkdir(parents=True, exist_ok=False)
+        run_dir = _create_run_directory(
+            training_config.output_root,
+            training_config.run_name,
+        )
 
 
 
@@ -910,14 +944,14 @@ def train_fi_jepa(
             warmup_timing_records,
             boundary_timing_records,
         )
-        # print(
-        #     "Epoch boundary: "
-        #     f"validation={validation_seconds:.3f}s | "
-        #     f"representation_evaluation={representation_evaluation_seconds:.3f}s | "
-        #     f"best_checkpoint={best_checkpoint_seconds:.3f}s | "
-        #     f"latest_checkpoint={latest_checkpoint_seconds:.3f}s | "
-        #     f"total={float(boundary_record['total_seconds']):.3f}s"
-        # )
+        print(
+            "Epoch boundary: "
+            f"validation={validation_seconds:.3f}s | "
+            f"representation_evaluation={representation_evaluation_seconds:.3f}s | "
+            f"best_checkpoint={best_checkpoint_seconds:.3f}s | "
+            f"latest_checkpoint={latest_checkpoint_seconds:.3f}s | "
+            f"total={float(boundary_record['total_seconds']):.3f}s"
+        )
 
     return run_dir
 
