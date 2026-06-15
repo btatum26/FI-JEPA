@@ -6,13 +6,14 @@ Representation evaluation and future-target probes are separate from
 pretraining. This prevents target columns from entering model-ready data,
 runtime batches, checkpoints, or embedding artifacts.
 
-The workflow uses three immutable artifact types:
+The workflow uses four immutable artifact types:
 
 | Artifact | Default root | Contains future targets |
 |---|---|---:|
 | Representation evaluation | `runs/evaluation/` | No |
 | Probe-target export | `data/probe_targets/` | Yes |
-| Frozen probe report | `runs/probes/` | Joined only for evaluation |
+| Reusable probe dataset | `runs/probe_datasets/` | Joined only for evaluation |
+| Frozen probe report | `runs/probes/` | Joined evaluation data and predictions |
 
 ## Representation Source
 
@@ -75,24 +76,51 @@ data/probe_targets/<timestamp>_<artifact_id>/
 
 The manifest records the canonical database SHA-256 and target columns.
 
-## Run Frozen Ridge Probes
+## Build Probe Dataset
 
 ```bash
-uv run run-fi-jepa-probes \
+uv run build-probe-dataset \
   --embeddings runs/evaluation/<evaluation_artifact> \
-  --targets data/probe_targets/<target_artifact> \
-  --alpha 1.0
+  --targets data/probe_targets/<target_artifact>
 ```
 
-For each named validation window and target, the probe runner:
+The builder:
 
 1. Verifies that embedding and target artifacts came from the same canonical
    database version.
 2. Rejects embeddings containing `future_*` columns.
 3. Joins embeddings and targets one-to-one by date.
-4. Fits a standardized ridge model only on train dates before the validation
+4. Adds an explicit availability mask for every target.
+5. Records named validation-window boundaries and train cutoffs in the
+   dataset manifest.
+
+Outputs:
+
+```text
+runs/probe_datasets/<timestamp>_<artifact_id>/
+    manifest.json
+    probe_dataset.parquet
+```
+
+The joined dataset is an evaluation-only artifact. Future targets remain
+physically separate from pretraining data, runtime batches, checkpoints, and
+embedding artifacts.
+
+## Run Frozen Ridge Probes
+
+```bash
+uv run run-fi-jepa-probes \
+  --probe-dataset runs/probe_datasets/<probe_dataset_artifact> \
+  --alpha 1.0
+```
+
+For each named validation window and target, the probe runner:
+
+1. Fits a standardized ridge model only on train dates before the validation
    window begins.
-5. Scores the validation window against a train-mean baseline.
+2. Scores both ridge and the train-mean baseline on the held-out window.
+3. Reports distribution, calibration, rank-correlation, invalid-prediction,
+   and baseline-relative diagnostics.
 
 Outputs:
 
@@ -103,8 +131,16 @@ runs/probes/<timestamp>_<run_id>/
     report.json
 ```
 
-`report.json` contains per-fold and aggregate out-of-fold RMSE, MAE, R-squared,
-Pearson correlation, baseline metrics, and ridge coefficients.
+`predictions.parquet` is long-form with one row per date, target, validation
+window, and predictor. It records invalid-prediction flags and reasons.
+
+`report.json` contains per-window/per-target result rows, aggregate
+out-of-fold results, window summaries, and ridge coefficients. Every result
+includes RMSE, MAE, R-squared, Pearson and Spearman correlation, prediction
+and actual distributions, bias, scale ratio, ratios against the train-mean
+baseline, invalid-prediction counts, and diagnostic-only validation
+recalibration. Recalibration uses validation labels and is never a final
+score.
 
 ## Interpret Latent Coordinates
 
@@ -151,7 +187,9 @@ Future targets are joined only into this analysis artifact.
 
 ## Current Limits
 
-- Probes are continuous-target ridge regressions only.
+- Probes are continuous-target ridge regressions with a train-mean baseline only.
+- Target transforms, alpha selection, stronger baselines, and classification
+  heads remain later rebuild phases.
 - Logistic, nonlinear, bucket, and regime-label probes are not implemented.
 - Probe results measure representation association, not tradability.
 - Good future-volatility probes can still indicate a volatility-dominated
@@ -160,8 +198,9 @@ Future targets are joined only into this analysis artifact.
 ## Tests
 
 `tests/test_fi_jepa_representation_probes.py` covers train-fit PCA,
-representation diagnostics, target separation, database-version matching,
-future-column rejection, and walk-forward probe fitting.
+representation diagnostics, target separation, reusable probe datasets,
+database-version matching, Phase 1 report diagnostics, and walk-forward probe
+fitting.
 
 ```bash
 uv run pytest -q tests/test_fi_jepa_representation_probes.py

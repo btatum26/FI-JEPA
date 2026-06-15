@@ -306,12 +306,19 @@ Export future probe targets from the canonical database:
 uv run export-probe-targets
 ```
 
-Run leakage-separated walk-forward ridge probes:
+Build the reusable leakage-separated probe dataset:
+
+```bash
+uv run build-probe-dataset \
+  --embeddings runs/evaluation/<evaluation_artifact> \
+  --targets data/probe_targets/<target_artifact>
+```
+
+Run walk-forward ridge probes and Phase 1 diagnostics:
 
 ```bash
 uv run run-fi-jepa-probes \
-  --embeddings runs/evaluation/<evaluation_artifact> \
-  --targets data/probe_targets/<target_artifact>
+  --probe-dataset runs/probe_datasets/<probe_dataset_artifact>
 ```
 
 Interpret all exported PCA coordinates against selected numeric columns from

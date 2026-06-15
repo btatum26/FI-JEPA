@@ -13,7 +13,7 @@ import pytest
 import fi_jepa.representation as representation_module
 from fi_jepa.dataloader import FIJepaDataConfig
 from fi_jepa.model_config import FIJepaModelConfig
-from fi_jepa.probes import export_probe_targets, run_frozen_probes
+from fi_jepa.probes import build_probe_dataset, export_probe_targets, run_frozen_probes
 from fi_jepa.representation import fit_pca_exporter, representation_diagnostics
 
 
@@ -162,6 +162,7 @@ def _write_probe_database(path: Path) -> pd.DatetimeIndex:
             "symbol": "ETF_SPY",
             "future_return_21d": np.linspace(-0.2, 0.3, len(dates)),
             "future_realized_vol_21d": np.linspace(0.1, 0.5, len(dates)),
+            "future_max_drawdown_21d": np.linspace(-0.4, -0.05, len(dates)),
             "uses_future_data": True,
         }
     )
@@ -221,22 +222,75 @@ def test_probe_targets_stay_separate_and_probes_are_walk_forward(tmp_path: Path)
         target_manifest["source_database_sha256"],
     )
 
-    output = run_frozen_probes(
+    dataset_artifact = build_probe_dataset(
         embedding_artifact,
         target_artifact,
+        output_root=tmp_path / "probe_datasets",
+    )
+    output = run_frozen_probes(
+        probe_dataset_artifact=dataset_artifact,
         output_root=tmp_path / "probe_runs",
     )
     exported_targets = pd.read_parquet(target_artifact / "targets.parquet")
-    probe_dataset = pd.read_parquet(output / "probe_dataset.parquet")
+    probe_dataset = pd.read_parquet(dataset_artifact / "probe_dataset.parquet")
+    predictions = pd.read_parquet(output / "predictions.parquet")
+    dataset_manifest = json.loads(
+        (dataset_artifact / "manifest.json").read_text(encoding="utf-8")
+    )
     report = json.loads((output / "report.json").read_text(encoding="utf-8"))
 
     assert all(name.startswith("future_") for name in target_manifest["target_columns"])
     assert not any(name.startswith("z_") for name in exported_targets.columns)
     assert any(name.startswith("z_") for name in probe_dataset.columns)
     assert any(name.startswith("future_") for name in probe_dataset.columns)
+    assert all(
+        f"target_available__{name}" in probe_dataset.columns
+        for name in target_manifest["target_columns"]
+    )
+    assert len(dataset_manifest["validation_windows"]) == 2
+    assert set(predictions["predictor_name"]) == {"ridge", "train_mean"}
+    assert {
+        "prediction",
+        "invalid_prediction",
+        "invalid_prediction_reason",
+    }.issubset(predictions.columns)
+    assert report["format_version"] == 2
+    assert report["probe_dataset_artifact"] == str(dataset_artifact.resolve())
     assert report["targets_joined_into_pretraining_artifact"] is False
-    for fold in report["folds"]:
-        assert pd.Timestamp(fold["train_end"]) < pd.Timestamp(fold["validation_start"])
+    assert report["recalibration_is_diagnostic_only"] is True
+    assert report["window_summaries"]
+
+    required_metrics = {
+        "rmse",
+        "mae",
+        "r2",
+        "pearson_correlation",
+        "spearman_correlation",
+        "rmse_ratio_vs_baseline",
+        "mae_ratio_vs_baseline",
+        "actual_mean",
+        "actual_std",
+        "prediction_mean",
+        "prediction_std",
+        "bias",
+        "std_ratio",
+        "invalid_prediction_count",
+        "invalid_prediction_rate",
+        "validation_recalibration",
+    }
+    for result in report["results"]:
+        assert required_metrics.issubset(result)
+        assert result["validation_recalibration"]["uses_validation_labels"] is True
+        assert pd.Timestamp(result["train_end"]) < pd.Timestamp(result["validation_start"])
+
+    ridge_results = [
+        result for result in report["results"] if result["predictor_name"] == "ridge"
+    ]
+    baseline_results = [
+        result for result in report["results"] if result["predictor_name"] == "train_mean"
+    ]
+    assert all(result["rmse_ratio_vs_baseline"] >= 0.0 for result in ridge_results)
+    assert all(result["rmse_ratio_vs_baseline"] == 1.0 for result in baseline_results)
 
 
 def test_probes_reject_mismatched_database_versions(tmp_path: Path) -> None:

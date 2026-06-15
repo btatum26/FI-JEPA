@@ -33,6 +33,7 @@ train-fi-jepa = "fi_jepa.training:main"
 branch-fi-jepa = "fi_jepa.training:branch_main"
 evaluate-fi-jepa = "fi_jepa.representation:main"
 export-probe-targets = "fi_jepa.probes:export_targets_main"
+build-probe-dataset = "fi_jepa.probes:build_probe_dataset_main"
 run-fi-jepa-probes = "fi_jepa.probes:run_probes_main"
 
 [build-system]
