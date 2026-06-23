@@ -156,6 +156,34 @@ def test_evaluation_cli_parses_batch_size_override(monkeypatch: pytest.MonkeyPat
 
 def _write_probe_database(path: Path) -> pd.DatetimeIndex:
     dates = pd.bdate_range("2024-01-01", periods=12)
+    feature_axis = np.linspace(0.0, 1.0, len(dates))
+    features = pd.DataFrame(
+        {
+            "date": dates,
+            "xs_dispersion_1d": 0.1 + feature_axis,
+            "breadth_1d": 0.4 + 0.2 * feature_axis,
+            "pct_above_ma_63d": 0.3 + 0.3 * feature_axis,
+            "vix_level": 15.0 + feature_axis,
+            "uses_future_data": False,
+        }
+    )
+    ticker_features = pd.DataFrame(
+        {
+            "date": dates,
+            "symbol": "ETF_SPY",
+            "valid_observation": True,
+            "return_21d": np.linspace(-0.1, 0.2, len(dates)),
+            "return_63d": np.linspace(-0.2, 0.3, len(dates)),
+            "return_126d": np.linspace(-0.3, 0.4, len(dates)),
+            "realized_vol_21d": np.linspace(0.1, 0.5, len(dates)),
+            "realized_vol_63d": np.linspace(0.2, 0.6, len(dates)),
+            "realized_vol_126d": np.linspace(0.3, 0.7, len(dates)),
+            "drawdown_21d": np.linspace(-0.3, -0.01, len(dates)),
+            "drawdown_63d": np.linspace(-0.4, -0.02, len(dates)),
+            "drawdown_126d": np.linspace(-0.5, -0.03, len(dates)),
+            "uses_future_data": False,
+        }
+    )
     targets = pd.DataFrame(
         {
             "date": dates,
@@ -167,7 +195,11 @@ def _write_probe_database(path: Path) -> pd.DatetimeIndex:
         }
     )
     with duckdb.connect(str(path)) as connection:
+        connection.register("feature_frame", features)
+        connection.register("ticker_feature_frame", ticker_features)
         connection.register("target_frame", targets)
+        connection.execute("CREATE TABLE features AS SELECT * FROM feature_frame")
+        connection.execute("CREATE TABLE ticker_features AS SELECT * FROM ticker_feature_frame")
         connection.execute("CREATE TABLE targets AS SELECT * FROM target_frame")
     return dates
 
@@ -225,7 +257,7 @@ def test_probe_targets_stay_separate_and_probes_are_walk_forward(tmp_path: Path)
     dataset_artifact = build_probe_dataset(
         embedding_artifact,
         target_artifact,
-        output_root=tmp_path / "probe_datasets",
+        output_root=tmp_path / "probe_targets",
     )
     output = run_frozen_probes(
         probe_dataset_artifact=dataset_artifact,
@@ -239,26 +271,58 @@ def test_probe_targets_stay_separate_and_probes_are_walk_forward(tmp_path: Path)
     )
     report = json.loads((output / "report.json").read_text(encoding="utf-8"))
 
+    assert target_artifact == tmp_path / "probe_targets" / "market_targets"
+    assert dataset_artifact == tmp_path / "probe_targets" / "embeddings_probe_dataset"
     assert all(name.startswith("future_") for name in target_manifest["target_columns"])
+    assert target_manifest["baseline_feature_columns"]
     assert not any(name.startswith("z_") for name in exported_targets.columns)
     assert any(name.startswith("z_") for name in probe_dataset.columns)
     assert any(name.startswith("future_") for name in probe_dataset.columns)
+    assert any(name.startswith("baseline__") for name in probe_dataset.columns)
     assert all(
         f"target_available__{name}" in probe_dataset.columns
         for name in target_manifest["target_columns"]
     )
     assert len(dataset_manifest["validation_windows"]) == 2
-    assert set(predictions["predictor_name"]) == {"ridge", "train_mean"}
+    assert {
+        "train_mean",
+        "trailing_target_proxy",
+        "ridge__z_only",
+        "huber__z_only",
+        "elastic_net__z_only",
+        "ridge__hand_market_features",
+        "ridge__hand_market_pca",
+        "ridge__hand_market_features_plus_z",
+        "class_prior",
+        "logistic__z_only",
+        "logistic__hand_market_features",
+    }.issubset(set(predictions["predictor_name"]))
     assert {
         "prediction",
         "invalid_prediction",
         "invalid_prediction_reason",
+        "selected_alpha",
+        "alpha_selection",
+        "task_type",
+        "model_name",
+        "feature_family",
     }.issubset(predictions.columns)
-    assert report["format_version"] == 2
+    assert "format_version" not in target_manifest
+    assert "format_version" not in dataset_manifest
+    assert "format_version" not in report
     assert report["probe_dataset_artifact"] == str(dataset_artifact.resolve())
+    assert report["alpha_selection"] == "inner_walk_forward"
+    assert 1.0 in report["alpha_grid"]
+    assert report["baseline_feature_columns"]
+    assert "hand_market_features" in report["feature_families"]
+    assert "huber" in report["regression_heads"]
+    assert "logistic" in report["classification_heads"]
     assert report["targets_joined_into_pretraining_artifact"] is False
     assert report["recalibration_is_diagnostic_only"] is True
     assert report["window_summaries"]
+    assert "future_realized_vol_21d__log_realized_vol" in report["transformed_target_columns"]
+    assert "future_max_drawdown_21d__log_drawdown_magnitude" in report["transformed_target_columns"]
+    assert report["alpha_selection_by_fold"]
 
     required_metrics = {
         "rmse",
@@ -278,28 +342,37 @@ def test_probe_targets_stay_separate_and_probes_are_walk_forward(tmp_path: Path)
         "invalid_prediction_rate",
         "validation_recalibration",
     }
-    for result in report["results"]:
+    regression_results = [
+        result for result in report["results"] if result["task_type"] == "regression"
+    ]
+    for result in regression_results:
         assert required_metrics.issubset(result)
         assert result["validation_recalibration"]["uses_validation_labels"] is True
         assert pd.Timestamp(result["train_end"]) < pd.Timestamp(result["validation_start"])
 
     ridge_results = [
-        result for result in report["results"] if result["predictor_name"] == "ridge"
+        result for result in regression_results if result["model_name"] == "ridge"
     ]
     baseline_results = [
-        result for result in report["results"] if result["predictor_name"] == "train_mean"
+        result for result in regression_results if result["predictor_name"] == "train_mean"
+    ]
+    classification_results = [
+        result for result in report["results"] if result["task_type"] == "classification"
     ]
     assert all(result["rmse_ratio_vs_baseline"] >= 0.0 for result in ridge_results)
+    assert all(result["selected_alpha"] > 0.0 for result in ridge_results)
     assert all(result["rmse_ratio_vs_baseline"] == 1.0 for result in baseline_results)
+    assert classification_results
+    assert all("roc_auc" in result for result in classification_results)
 
 
-def test_probes_reject_mismatched_database_versions(tmp_path: Path) -> None:
+def test_probes_reject_mismatched_source_database_hashes(tmp_path: Path) -> None:
     database = tmp_path / "market.duckdb"
     dates = _write_probe_database(database)
     target_artifact = export_probe_targets(database, output_root=tmp_path / "probe_targets")
     embedding_artifact = _write_embedding_artifact(tmp_path / "embeddings", dates, "wrong")
 
-    with pytest.raises(ValueError, match="different database versions"):
+    with pytest.raises(ValueError, match="different source database hashes"):
         run_frozen_probes(
             embedding_artifact,
             target_artifact,

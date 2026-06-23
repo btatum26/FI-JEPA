@@ -578,12 +578,12 @@ Split the probe flow into separate commands.
 uv run build-probe-dataset \
   --embeddings runs/evaluation/<artifact> \
   --targets data/probe_targets/<artifact> \
-  --output-root runs/probe_datasets
+  --output-root data/probe_targets
 ```
 
 ```bash
 uv run run-fi-jepa-probes-v2 \
-  --probe-dataset runs/probe_datasets/<artifact> \
+  --probe-dataset data/probe_targets/<artifact> \
   --config configs/probes.yaml
 ```
 

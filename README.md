@@ -300,7 +300,8 @@ Evaluation artifacts are written under `runs/evaluation/`. `--batch-size`
 overrides the checkpoint's validation batch size for every representation
 loader and is useful when all-valid asset views exceed GPU memory.
 
-Export future probe targets from the canonical database:
+Export future probe targets and past-only baseline features from the canonical
+database:
 
 ```bash
 uv run export-probe-targets
@@ -311,14 +312,16 @@ Build the reusable leakage-separated probe dataset:
 ```bash
 uv run build-probe-dataset \
   --embeddings runs/evaluation/<evaluation_artifact> \
-  --targets data/probe_targets/<target_artifact>
+  --targets data/probe_targets/market_data_targets
 ```
 
-Run walk-forward ridge probes and Phase 1 diagnostics:
+Run walk-forward probes with transformed targets, inner alpha selection, strong
+baseline feature families, linear regression heads, and binary regime
+classification heads:
 
 ```bash
 uv run run-fi-jepa-probes \
-  --probe-dataset runs/probe_datasets/<probe_dataset_artifact>
+  --probe-dataset data/probe_targets/<evaluation_artifact>_probe_dataset
 ```
 
 Interpret all exported PCA coordinates against selected numeric columns from

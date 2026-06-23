@@ -13,7 +13,7 @@ The source-of-truth modules are:
 - `src/fi_jepa/training.py` for optimization, EMA updates, validation, and
   checkpointing.
 - `src/fi_jepa/representation.py` for representation evaluation and export.
-- `src/fi_jepa/probes.py` for frozen downstream probes.
+- `src/fi_jepa/probes/` for frozen downstream probes.
 
 ## Fixed V1 Contract
 

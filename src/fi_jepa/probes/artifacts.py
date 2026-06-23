@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 import hashlib
 import json
 from pathlib import Path
+import re
 import uuid
 
 
@@ -34,6 +35,20 @@ def artifact_destination(output_root: Path, artifact_id: str) -> tuple[Path, Pat
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     destination = output_root / f"{timestamp}_{artifact_id}"
     temporary = output_root / f".tmp-{artifact_id}-{uuid.uuid4().hex}"
+    output_root.mkdir(parents=True, exist_ok=True)
+    temporary.mkdir()
+    return destination, temporary
+
+
+def readable_artifact_destination(output_root: Path, name: str) -> tuple[Path, Path]:
+    """Create a readable artifact destination and a temporary sibling directory."""
+    safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", name).strip("._-")
+    if not safe_name:
+        raise ValueError("Artifact name must contain at least one letter or number.")
+    destination = output_root / safe_name
+    if destination.exists():
+        raise FileExistsError(f"Artifact already exists: {destination}")
+    temporary = output_root / f".tmp-{safe_name}-{uuid.uuid4().hex}"
     output_root.mkdir(parents=True, exist_ok=True)
     temporary.mkdir()
     return destination, temporary

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict, dataclass
+from dataclasses import asdict
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -18,128 +18,52 @@ from fi_jepa.probes.artifacts import (
 )
 from fi_jepa.probes.dataset import assemble_probe_dataset, build_probe_dataset, load_probe_dataset
 from fi_jepa.probes.targets import export_probe_targets
+from fi_jepa.probes.target_transforms import (
+    TARGET_TRANSFORM_EPSILON,
+    inverse_transform_predictions,
+    target_transform_specs,
+    transform_target_values,
+)
 
-PROBE_REPORT_VERSION = 3
+DEFAULT_RIDGE_ALPHAS = (0.0001, 0.001, 0.01, 0.1, 1.0, 10.0, 100.0, 1000.0, 10000.0)
 TRAIN_MEAN_BASELINE = "train_mean"
-TARGET_TRANSFORM_EPSILON = 1.0e-12
-
-
-# ============================================================================
-# TARGET TRANSFORMS
-# ============================================================================
-
-
-@dataclass(frozen=True)
-class TargetTransformSpec:
-    """One leakage-safe target variant for a raw future target column."""
-
-    raw_target: str
-    target: str
-    transform: str
-    description: str
-    inverse_clips_to_target_support: bool
-
-
-def _target_transform_specs(
-    target_columns: list[str], *, mode: str = "phase2"
-) -> list[TargetTransformSpec]:
-    """Return target variants to probe.
-
-    Phase 2 keeps the original raw target probes and adds target-space variants for
-    constrained/skewed targets. All transforms are deterministic and fitted only from
-    the target values available inside each outer training fold.
-    """
-    if mode not in {"raw", "phase2"}:
-        raise ValueError("target transform mode must be 'raw' or 'phase2'.")
-
-    specs: list[TargetTransformSpec] = []
-    for target_name in target_columns:
-        specs.append(
-            TargetTransformSpec(
-                raw_target=target_name,
-                target=target_name,
-                transform="raw",
-                description="Original target values.",
-                inverse_clips_to_target_support=False,
-            )
-        )
-        if mode == "raw":
-            continue
-
-        if "future_realized_vol" in target_name:
-            specs.append(
-                TargetTransformSpec(
-                    raw_target=target_name,
-                    target=f"{target_name}__log_realized_vol",
-                    transform="log_realized_vol",
-                    description="log(max(realized_volatility, epsilon)); inverse is exp(prediction).",
-                    inverse_clips_to_target_support=False,
-                )
-            )
-        elif "future_max_drawdown" in target_name:
-            specs.append(
-                TargetTransformSpec(
-                    raw_target=target_name,
-                    target=f"{target_name}__drawdown_magnitude",
-                    transform="drawdown_magnitude",
-                    description="clip(-max_drawdown, 0, inf); inverse is -clip(prediction, 0, inf).",
-                    inverse_clips_to_target_support=True,
-                )
-            )
-            specs.append(
-                TargetTransformSpec(
-                    raw_target=target_name,
-                    target=f"{target_name}__log_drawdown_magnitude",
-                    transform="log_drawdown_magnitude",
-                    description="log1p(clip(-max_drawdown, 0, inf)); inverse is -expm1(clip(prediction, 0, inf)).",
-                    inverse_clips_to_target_support=True,
-                )
-            )
-    return specs
-
-
-def _transform_target_values(raw_values: np.ndarray, spec: TargetTransformSpec) -> np.ndarray:
-    """Map raw target values into the model-fitting target space."""
-    values = np.asarray(raw_values, dtype=np.float64)
-    if spec.transform == "raw":
-        return values
-    if spec.transform == "log_realized_vol":
-        return np.log(np.maximum(values, TARGET_TRANSFORM_EPSILON))
-    if spec.transform == "drawdown_magnitude":
-        return np.maximum(-values, 0.0)
-    if spec.transform == "log_drawdown_magnitude":
-        return np.log1p(np.maximum(-values, 0.0))
-    raise ValueError(f"Unknown target transform: {spec.transform}")
-
-
-def _inverse_transform_predictions(
-    transformed_predictions: np.ndarray, spec: TargetTransformSpec
-) -> tuple[np.ndarray, np.ndarray]:
-    """Map model-space predictions back to the original raw target units.
-
-    Returns the raw-space prediction and a boolean mask indicating whether the inverse
-    had to clip the prediction to stay inside the transformed target support.
-    """
-    predicted = np.asarray(transformed_predictions, dtype=np.float64)
-    clipped = np.zeros(len(predicted), dtype=bool)
-    if spec.transform == "raw":
-        return predicted, clipped
-    if spec.transform == "log_realized_vol":
-        return np.exp(predicted), clipped
-    if spec.transform == "drawdown_magnitude":
-        clipped = np.isfinite(predicted) & (predicted < 0.0)
-        magnitude = np.maximum(predicted, 0.0)
-        return -magnitude, clipped
-    if spec.transform == "log_drawdown_magnitude":
-        clipped = np.isfinite(predicted) & (predicted < 0.0)
-        log_magnitude = np.maximum(predicted, 0.0)
-        return -np.expm1(log_magnitude), clipped
-    raise ValueError(f"Unknown target transform: {spec.transform}")
+TRAILING_TARGET_PROXY_BASELINE = "trailing_target_proxy"
+Z_ONLY_FAMILY = "z_only"
+HAND_FEATURE_FAMILY = "hand_market_features"
+HAND_PCA_FAMILY = "hand_market_pca"
+HAND_PLUS_Z_FAMILY = "hand_market_features_plus_z"
+REGRESSION_HEADS = ("ridge", "huber", "elastic_net")
+CLASSIFICATION_QUANTILE = 0.8
 
 
 # ============================================================================
 # REGRESSION AND DIAGNOSTIC METRICS
 # ============================================================================
+
+
+def _standardized_train_validation(
+    train_x: np.ndarray,
+    validation_x: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Impute and standardize feature matrices using train-only statistics."""
+    train = np.asarray(train_x, dtype=np.float64)
+    validation = np.asarray(validation_x, dtype=np.float64)
+    finite_train = np.isfinite(train)
+    usable = finite_train.any(axis=0)
+    if not usable.any():
+        raise ValueError("No usable finite features are available for this fold.")
+
+    train = train[:, usable]
+    validation = validation[:, usable]
+    medians = np.nanmedian(np.where(np.isfinite(train), train, np.nan), axis=0)
+    medians = np.where(np.isfinite(medians), medians, 0.0)
+    train = np.where(np.isfinite(train), train, medians)
+    validation = np.where(np.isfinite(validation), validation, medians)
+
+    x_mean = train.mean(axis=0)
+    x_std = train.std(axis=0)
+    x_std[x_std == 0.0] = 1.0
+    return (train - x_mean) / x_std, (validation - x_mean) / x_std, x_mean, x_std
 
 
 def _ridge_predict(
@@ -150,19 +74,191 @@ def _ridge_predict(
     alpha: float,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Fit one train-standardized ridge model and predict validation rows."""
-    x_mean = train_x.mean(axis=0)
-    x_std = train_x.std(axis=0)
-    x_std[x_std == 0.0] = 1.0
-    standardized_train = (train_x - x_mean) / x_std
-    standardized_validation = (validation_x - x_mean) / x_std
+    standardized_train, standardized_validation, _, _ = _standardized_train_validation(
+        train_x, validation_x
+    )
     y_mean = float(train_y.mean())
     centered_y = train_y - y_mean
+
     gram = standardized_train.T @ standardized_train
+
     coefficients = np.linalg.solve(
         gram + alpha * np.eye(gram.shape[0], dtype=np.float64),
         standardized_train.T @ centered_y,
     )
     return standardized_validation @ coefficients + y_mean, coefficients
+
+
+def _huber_predict(
+    train_x: np.ndarray,
+    train_y: np.ndarray,
+    validation_x: np.ndarray,
+    *,
+    alpha: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Fit a small deterministic Huber ridge model with train-standardized features."""
+    standardized_train, standardized_validation, _, _ = _standardized_train_validation(
+        train_x, validation_x
+    )
+    y_mean = float(train_y.mean())
+    centered_y = train_y - y_mean
+    coefficients = np.zeros(standardized_train.shape[1], dtype=np.float64)
+    scale = max(float(np.std(centered_y)), 1.0e-12)
+    delta = 1.345 * scale
+
+    for _ in range(30):
+        residual = centered_y - standardized_train @ coefficients
+        abs_residual = np.abs(residual)
+        weights = np.ones_like(abs_residual)
+        large = abs_residual > delta
+        weights[large] = delta / np.maximum(abs_residual[large], 1.0e-12)
+        weighted_x = standardized_train * weights[:, None]
+        coefficients = np.linalg.solve(
+            standardized_train.T @ weighted_x + alpha * np.eye(standardized_train.shape[1]),
+            weighted_x.T @ centered_y,
+        )
+    return standardized_validation @ coefficients + y_mean, coefficients
+
+
+def _soft_threshold(value: float, penalty: float) -> float:
+    """Apply scalar soft-thresholding for coordinate-descent ElasticNet."""
+    if value > penalty:
+        return value - penalty
+    if value < -penalty:
+        return value + penalty
+    return 0.0
+
+
+def _elastic_net_predict(
+    train_x: np.ndarray,
+    train_y: np.ndarray,
+    validation_x: np.ndarray,
+    *,
+    alpha: float,
+    l1_ratio: float = 0.1,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Fit a compact ElasticNet head with train-standardized features and fixed L1 mix."""
+    standardized_train, standardized_validation, _, _ = _standardized_train_validation(
+        train_x, validation_x
+    )
+    y_mean = float(train_y.mean())
+    centered_y = train_y - y_mean
+    n_samples = max(len(centered_y), 1)
+    coefficients = np.zeros(standardized_train.shape[1], dtype=np.float64)
+    l1_penalty = alpha * l1_ratio
+    l2_penalty = alpha * (1.0 - l1_ratio)
+    column_norms = np.mean(np.square(standardized_train), axis=0) + l2_penalty
+
+    for _ in range(100):
+        old = coefficients.copy()
+        for feature_index in range(standardized_train.shape[1]):
+            residual = centered_y - standardized_train @ coefficients
+            residual += standardized_train[:, feature_index] * coefficients[feature_index]
+            rho = float(np.dot(standardized_train[:, feature_index], residual) / n_samples)
+            coefficients[feature_index] = _soft_threshold(rho, l1_penalty) / column_norms[feature_index]
+        if np.max(np.abs(coefficients - old)) < 1.0e-8:
+            break
+    return standardized_validation @ coefficients + y_mean, coefficients
+
+
+def _fit_pca_projection(
+    train_x: np.ndarray,
+    validation_x: np.ndarray,
+    *,
+    max_components: int = 8,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Fit train-only PCA for hand-feature baselines and transform train/validation rows."""
+    standardized_train, standardized_validation, _, _ = _standardized_train_validation(
+        train_x, validation_x
+    )
+    component_count = min(max_components, standardized_train.shape[1], max(len(standardized_train) - 1, 1))
+    _, _, vt = np.linalg.svd(standardized_train, full_matrices=False)
+    components = vt[:component_count].T
+    return standardized_train @ components, standardized_validation @ components
+
+
+def _predict_regression_head(
+    model_name: str,
+    train_x: np.ndarray,
+    train_y: np.ndarray,
+    validation_x: np.ndarray,
+    *,
+    alpha: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Dispatch one simple regression head without adding an external ML dependency."""
+    if model_name == "ridge":
+        return _ridge_predict(train_x, train_y, validation_x, alpha=alpha)
+    if model_name == "huber":
+        return _huber_predict(train_x, train_y, validation_x, alpha=alpha)
+    if model_name == "elastic_net":
+        return _elastic_net_predict(train_x, train_y, validation_x, alpha=alpha)
+    raise ValueError(f"Unknown regression head: {model_name}")
+
+
+def _normalise_alpha_grid(alphas: tuple[float, ...] | list[float]) -> tuple[float, ...]:
+    """Validate and de-duplicate a ridge alpha grid while preserving sort order."""
+    unique = tuple(sorted({float(alpha) for alpha in alphas}))
+    if not unique:
+        raise ValueError("At least one ridge alpha is required.")
+    if any(alpha <= 0.0 for alpha in unique):
+        raise ValueError("All ridge alphas must be positive.")
+    return unique
+
+
+def _fallback_alpha(alpha_grid: tuple[float, ...]) -> float:
+    """Return the conventional fixed ridge alpha when it exists, otherwise the middle grid value."""
+    if 1.0 in alpha_grid:
+        return 1.0
+    return alpha_grid[len(alpha_grid) // 2]
+
+
+def _select_ridge_alpha(
+    train_x: np.ndarray,
+    train_y: np.ndarray,
+    train_dates: np.ndarray,
+    alpha_grid: tuple[float, ...],
+) -> tuple[float, list[dict[str, object]]]:
+    """Choose ridge alpha with a tail inner-validation split inside the outer train period."""
+    fallback = _fallback_alpha(alpha_grid)
+    dates = pd.to_datetime(train_dates)
+    unique_dates = pd.Index(dates).sort_values().unique()
+    if len(unique_dates) < 4 or len(train_y) < 6:
+        return fallback, []
+
+    split_index = min(max(int(len(unique_dates) * 0.8), 1), len(unique_dates) - 1)
+    validation_start = unique_dates[split_index]
+    inner_train = dates < validation_start
+    inner_validation = dates >= validation_start
+    if inner_train.sum() < 2 or inner_validation.sum() < 1:
+        return fallback, []
+
+    diagnostics: list[dict[str, object]] = []
+    best_alpha = fallback
+    best_rmse = np.inf
+    for candidate_alpha in alpha_grid:
+        predicted, _ = _ridge_predict(
+            train_x[inner_train],
+            train_y[inner_train],
+            train_x[inner_validation],
+            alpha=candidate_alpha,
+        )
+        metrics = _regression_metrics(train_y[inner_validation], predicted)
+        rmse = float(metrics["rmse"])
+        diagnostics.append(
+            {
+                "alpha": candidate_alpha,
+                "inner_train_count": int(inner_train.sum()),
+                "inner_validation_count": int(inner_validation.sum()),
+                "inner_validation_start": str(pd.Timestamp(validation_start).date()),
+                "inner_validation_rmse": rmse,
+                "inner_validation_r2": float(metrics["r2"]),
+                "inner_validation_pearson_correlation": float(metrics["pearson_correlation"]),
+            }
+        )
+        if rmse < best_rmse:
+            best_rmse = rmse
+            best_alpha = candidate_alpha
+    return best_alpha, diagnostics
 
 
 def _correlation(actual: np.ndarray, predicted: np.ndarray) -> float:
@@ -202,6 +298,91 @@ def _regression_metrics(actual: np.ndarray, predicted: np.ndarray) -> dict[str, 
         "bias": float(np.mean(finite_predicted - finite_actual)),
         "std_ratio": prediction_std / actual_std if actual_std > 0.0 else 0.0,
     }
+
+
+def _roc_auc(actual: np.ndarray, probability: np.ndarray) -> float:
+    """Calculate binary ROC-AUC from ranks, returning 0.5 when the label is degenerate."""
+    positives = actual == 1
+    negatives = actual == 0
+    positive_count = int(positives.sum())
+    negative_count = int(negatives.sum())
+    if positive_count == 0 or negative_count == 0:
+        return 0.5
+    ranks = pd.Series(probability).rank(method="average").to_numpy(dtype=np.float64)
+    positive_rank_sum = float(ranks[positives].sum())
+    return (positive_rank_sum - positive_count * (positive_count + 1) / 2) / (
+        positive_count * negative_count
+    )
+
+
+def _pr_auc(actual: np.ndarray, probability: np.ndarray) -> float:
+    """Calculate average precision for binary labels sorted by predicted probability."""
+    positives = actual == 1
+    positive_count = int(positives.sum())
+    if positive_count == 0:
+        return 0.0
+    order = np.argsort(-probability)
+    sorted_actual = actual[order]
+    cumulative_positive = np.cumsum(sorted_actual)
+    precision = cumulative_positive / (np.arange(len(sorted_actual)) + 1)
+    return float((precision * sorted_actual).sum() / positive_count)
+
+
+def _classification_metrics(actual: np.ndarray, probability: np.ndarray) -> dict[str, float | int]:
+    """Compute binary classification diagnostics for regime-label probes."""
+    finite = np.isfinite(actual) & np.isfinite(probability)
+    finite_actual = actual[finite].astype(np.int64)
+    finite_probability = np.clip(probability[finite], 1.0e-12, 1.0 - 1.0e-12)
+    if not len(finite_actual):
+        raise ValueError("Cannot score classification predictions without finite rows.")
+
+    predicted_label = finite_probability >= 0.5
+    positives = finite_actual == 1
+    negatives = finite_actual == 0
+    positive_accuracy = float((predicted_label[positives] == 1).mean()) if positives.any() else 0.0
+    negative_accuracy = float((predicted_label[negatives] == 0).mean()) if negatives.any() else 0.0
+    return {
+        "scored_count": int(len(finite_actual)),
+        "accuracy": float((predicted_label == finite_actual).mean()),
+        "balanced_accuracy": (positive_accuracy + negative_accuracy) / 2.0,
+        "roc_auc": float(_roc_auc(finite_actual, finite_probability)),
+        "pr_auc": float(_pr_auc(finite_actual, finite_probability)),
+        "brier_score": float(np.mean(np.square(finite_probability - finite_actual))),
+        "log_loss": float(
+            -np.mean(
+                finite_actual * np.log(finite_probability)
+                + (1 - finite_actual) * np.log(1.0 - finite_probability)
+            )
+        ),
+        "class_prevalence": float(finite_actual.mean()),
+    }
+
+
+def _logistic_predict(
+    train_x: np.ndarray,
+    train_y: np.ndarray,
+    validation_x: np.ndarray,
+    *,
+    alpha: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Fit a deterministic L2 logistic head using train-only standardization."""
+    standardized_train, standardized_validation, _, _ = _standardized_train_validation(
+        train_x, validation_x
+    )
+    coefficients = np.zeros(standardized_train.shape[1], dtype=np.float64)
+    intercept = float(np.log(np.clip(train_y.mean(), 1.0e-6, 1.0 - 1.0e-6) / np.clip(1.0 - train_y.mean(), 1.0e-6, 1.0)))
+    learning_rate = 0.2
+    penalty = alpha / max(len(train_y), 1)
+    for _ in range(400):
+        logits = np.clip(intercept + standardized_train @ coefficients, -35.0, 35.0)
+        probability = 1.0 / (1.0 + np.exp(-logits))
+        error = probability - train_y
+        intercept -= learning_rate * float(error.mean())
+        coefficients -= learning_rate * (
+            standardized_train.T @ error / len(train_y) + penalty * coefficients
+        )
+    validation_logits = np.clip(intercept + standardized_validation @ coefficients, -35.0, 35.0)
+    return 1.0 / (1.0 + np.exp(-validation_logits)), coefficients
 
 
 def _target_constraint(target_name: str) -> tuple[float | None, float | None, str | None]:
@@ -292,6 +473,126 @@ def _target_horizon(target_name: str) -> int | None:
     return int(match.group(1)) if match else None
 
 
+def _trailing_proxy_column(raw_target: str) -> str | None:
+    """Map one future target to the matching past-only trailing proxy column."""
+    horizon = _target_horizon(raw_target)
+    if horizon is None:
+        return None
+    if "future_return" in raw_target:
+        return f"baseline__trailing_return_{horizon}d"
+    if "future_realized_vol" in raw_target:
+        return f"baseline__trailing_realized_vol_{horizon}d"
+    if "future_max_drawdown" in raw_target:
+        return f"baseline__trailing_max_drawdown_{horizon}d"
+    if "future_trend_score" in raw_target:
+        return f"baseline__current_trend_score_{horizon}d"
+    return None
+
+
+def _feature_families(
+    target_train: pd.DataFrame,
+    target_validation: pd.DataFrame,
+    *,
+    z_columns: list[str],
+    baseline_feature_columns: list[str],
+) -> list[tuple[str, np.ndarray, np.ndarray]]:
+    """Build Phase 3 feature-family matrices from a fold without leaking validation labels."""
+    families: list[tuple[str, np.ndarray, np.ndarray]] = [
+        (
+            Z_ONLY_FAMILY,
+            target_train[z_columns].to_numpy(dtype=np.float64),
+            target_validation[z_columns].to_numpy(dtype=np.float64),
+        )
+    ]
+    if baseline_feature_columns:
+        hand_train = target_train[baseline_feature_columns].to_numpy(dtype=np.float64)
+        hand_validation = target_validation[baseline_feature_columns].to_numpy(dtype=np.float64)
+        families.append((HAND_FEATURE_FAMILY, hand_train, hand_validation))
+        try:
+            pca_train, pca_validation = _fit_pca_projection(hand_train, hand_validation)
+            families.append((HAND_PCA_FAMILY, pca_train, pca_validation))
+        except ValueError:
+            pass
+        families.append(
+            (
+                HAND_PLUS_Z_FAMILY,
+                target_train[[*baseline_feature_columns, *z_columns]].to_numpy(dtype=np.float64),
+                target_validation[[*baseline_feature_columns, *z_columns]].to_numpy(dtype=np.float64),
+            )
+        )
+    return families
+
+
+def _classification_label_frame(
+    train_values: np.ndarray,
+    validation_values: np.ndarray,
+    raw_target: str,
+) -> list[dict[str, object]]:
+    """Construct train-thresholded binary regime labels for one raw target."""
+    finite_train = train_values[np.isfinite(train_values)]
+    if len(finite_train) < 3:
+        return []
+    labels: list[dict[str, object]] = []
+    horizon = _target_horizon(raw_target)
+    suffix = f"_{horizon}d" if horizon is not None else ""
+
+    if "future_realized_vol" in raw_target:
+        threshold = float(np.quantile(finite_train, CLASSIFICATION_QUANTILE))
+        labels.append(
+            {
+                "classification_label": f"high_vol{suffix}",
+                "threshold": threshold,
+                "positive_rule": f"{raw_target} >= train_q{CLASSIFICATION_QUANTILE}",
+                "train_y": (train_values >= threshold).astype(np.float64),
+                "validation_y": (validation_values >= threshold).astype(np.float64),
+            }
+        )
+    elif "future_max_drawdown" in raw_target:
+        train_magnitude = np.maximum(-finite_train, 0.0)
+        threshold = float(np.quantile(train_magnitude, CLASSIFICATION_QUANTILE))
+        labels.append(
+            {
+                "classification_label": f"severe_drawdown{suffix}",
+                "threshold": threshold,
+                "positive_rule": f"-{raw_target} >= train_q{CLASSIFICATION_QUANTILE}",
+                "train_y": (np.maximum(-train_values, 0.0) >= threshold).astype(np.float64),
+                "validation_y": (np.maximum(-validation_values, 0.0) >= threshold).astype(np.float64),
+            }
+        )
+    elif "future_return" in raw_target:
+        labels.append(
+            {
+                "classification_label": f"positive_return{suffix}",
+                "threshold": 0.0,
+                "positive_rule": f"{raw_target} > 0",
+                "train_y": (train_values > 0.0).astype(np.float64),
+                "validation_y": (validation_values > 0.0).astype(np.float64),
+            }
+        )
+    elif "future_trend_score" in raw_target:
+        strong_threshold = float(np.quantile(finite_train, CLASSIFICATION_QUANTILE))
+        weak_threshold = float(np.quantile(np.abs(finite_train), 1.0 - CLASSIFICATION_QUANTILE))
+        labels.extend(
+            [
+                {
+                    "classification_label": f"strong_trend{suffix}",
+                    "threshold": strong_threshold,
+                    "positive_rule": f"{raw_target} >= train_q{CLASSIFICATION_QUANTILE}",
+                    "train_y": (train_values >= strong_threshold).astype(np.float64),
+                    "validation_y": (validation_values >= strong_threshold).astype(np.float64),
+                },
+                {
+                    "classification_label": f"weak_or_chop{suffix}",
+                    "threshold": weak_threshold,
+                    "positive_rule": f"abs({raw_target}) <= train_q{1.0 - CLASSIFICATION_QUANTILE}",
+                    "train_y": (np.abs(train_values) <= weak_threshold).astype(np.float64),
+                    "validation_y": (np.abs(validation_values) <= weak_threshold).astype(np.float64),
+                },
+            ]
+        )
+    return labels
+
+
 # ============================================================================
 # FROZEN RIDGE PROBES
 # ============================================================================
@@ -301,6 +602,9 @@ def _window_summaries(results: list[dict[str, object]]) -> list[dict[str, object
     """Summarize target-level result rows without mixing target scales."""
     summaries: list[dict[str, object]] = []
     result_frame = pd.DataFrame(results)
+    result_frame = result_frame.loc[result_frame["task_type"].eq("regression")]
+    if result_frame.empty:
+        return summaries
     group_columns = [
         "validation_window_name",
         "target_transform",
@@ -352,6 +656,8 @@ def _append_scored_result(
     score_target_name: str,
     predictor_name: str,
     predictor_kind: str,
+    model_name: str,
+    feature_family: str,
     actual: np.ndarray,
     predicted: np.ndarray,
     baseline_metrics: dict[str, object] | None,
@@ -368,10 +674,13 @@ def _append_scored_result(
     results.append(
         {
             **common,
+            "task_type": "regression",
             "score_space": score_space,
             "score_target_name": score_target_name,
             "predictor_name": predictor_name,
             "predictor_kind": predictor_kind,
+            "model_name": model_name,
+            "feature_family": feature_family,
             **metrics,
         }
     )
@@ -384,17 +693,101 @@ def _append_scored_result(
                 "raw_target": common["raw_target"],
                 "target": common["target"],
                 "target_transform": common["target_transform"],
+                "task_type": "regression",
                 "score_space": score_space,
                 "score_target_name": score_target_name,
                 "horizon_days": common["horizon_days"],
                 "predictor_name": predictor_name,
                 "predictor_kind": predictor_kind,
-                "comparison_baseline": TRAIN_MEAN_BASELINE,
+                "model_name": model_name,
+                "feature_family": feature_family,
+                "comparison_baseline": common["comparison_baseline"],
+                "selected_alpha": common["selected_alpha"],
+                "alpha_selection": common["alpha_selection"],
                 "actual": actual,
                 "prediction": predicted,
                 "invalid_prediction": invalid,
                 "invalid_prediction_reason": invalid_reasons,
                 "inverse_prediction_clipped": inverse_clipped,
+            }
+        )
+    )
+    return metrics
+
+
+def _append_classification_result(
+    *,
+    results: list[dict[str, object]],
+    prediction_rows: list[pd.DataFrame],
+    common: dict[str, object],
+    target_validation: pd.DataFrame,
+    classification_label: str,
+    positive_rule: str,
+    threshold: float,
+    predictor_name: str,
+    predictor_kind: str,
+    model_name: str,
+    feature_family: str,
+    actual: np.ndarray,
+    probability: np.ndarray,
+    baseline_metrics: dict[str, object] | None,
+) -> dict[str, object]:
+    """Score and store one binary regime-label prediction block."""
+    metrics: dict[str, object] = _classification_metrics(actual, probability)
+    if baseline_metrics is None:
+        metrics["brier_ratio_vs_baseline"] = 1.0
+        metrics["log_loss_ratio_vs_baseline"] = 1.0
+    else:
+        baseline_brier = float(baseline_metrics["brier_score"])
+        baseline_log_loss = float(baseline_metrics["log_loss"])
+        metrics["brier_ratio_vs_baseline"] = (
+            float(metrics["brier_score"]) / baseline_brier if baseline_brier > 0.0 else 0.0
+        )
+        metrics["log_loss_ratio_vs_baseline"] = (
+            float(metrics["log_loss"]) / baseline_log_loss if baseline_log_loss > 0.0 else 0.0
+        )
+    results.append(
+        {
+            **common,
+            "task_type": "classification",
+            "classification_label": classification_label,
+            "positive_rule": positive_rule,
+            "threshold": threshold,
+            "score_space": "probability",
+            "score_target_name": classification_label,
+            "predictor_name": predictor_name,
+            "predictor_kind": predictor_kind,
+            "model_name": model_name,
+            "feature_family": feature_family,
+            **metrics,
+        }
+    )
+    prediction_rows.append(
+        pd.DataFrame(
+            {
+                "date": target_validation["date"].to_numpy(),
+                "validation_window_name": common["validation_window_name"],
+                "raw_target": common["raw_target"],
+                "target": classification_label,
+                "target_transform": "binary_label",
+                "task_type": "classification",
+                "score_space": "probability",
+                "score_target_name": classification_label,
+                "horizon_days": common["horizon_days"],
+                "predictor_name": predictor_name,
+                "predictor_kind": predictor_kind,
+                "model_name": model_name,
+                "feature_family": feature_family,
+                "comparison_baseline": common["comparison_baseline"],
+                "selected_alpha": common["selected_alpha"],
+                "alpha_selection": common["alpha_selection"],
+                "actual": actual,
+                "prediction": probability,
+                "invalid_prediction": ~np.isfinite(probability),
+                "invalid_prediction_reason": np.where(
+                    np.isfinite(probability), "", "non_finite_prediction"
+                ),
+                "inverse_prediction_clipped": False,
             }
         )
     )
@@ -407,14 +800,14 @@ def run_frozen_probes(
     *,
     probe_dataset_artifact: Path | None = None,
     output_root: Path = Path("runs/probes"),
-    alpha: float = 1.0,
-    target_transform_mode: str = "phase2",
+    alpha: float | None = None,
+    alphas: tuple[float, ...] | list[float] = DEFAULT_RIDGE_ALPHAS,
 ) -> Path:
     """Run leakage-safe walk-forward ridge probes from source or reusable dataset artifacts."""
-    if alpha <= 0.0:
+    alpha_grid = _normalise_alpha_grid(alphas)
+    if alpha is not None and alpha <= 0.0:
         raise ValueError("Ridge alpha must be positive.")
-    if target_transform_mode not in {"raw", "phase2"}:
-        raise ValueError("target_transform_mode must be 'raw' or 'phase2'.")
+    alpha_selection = "fixed" if alpha is not None else "inner_walk_forward"
 
     if probe_dataset_artifact is not None:
         if embedding_artifact is not None or target_artifact is not None:
@@ -423,6 +816,7 @@ def run_frozen_probes(
         source_database = metadata["source_database_sha256"]
         target_columns = [str(name) for name in metadata["target_columns"]]
         z_columns = [str(name) for name in metadata["z_columns"]]
+        baseline_feature_columns = [str(name) for name in metadata.get("baseline_feature_columns", [])]
         embedding_source = metadata["embedding_artifact"]
         target_source = metadata["target_artifact"]
     else:
@@ -432,10 +826,11 @@ def run_frozen_probes(
         source_database = metadata["source_database_sha256"]
         target_columns = [str(name) for name in metadata["target_columns"]]
         z_columns = [str(name) for name in metadata["z_columns"]]
+        baseline_feature_columns = [str(name) for name in metadata.get("baseline_feature_columns", [])]
         embedding_source = str(embedding_artifact.resolve())
         target_source = str(target_artifact.resolve())
 
-    target_specs = _target_transform_specs(target_columns, mode=target_transform_mode)
+    target_specs = target_transform_specs(target_columns)
     transformed_target_names = [spec.target for spec in target_specs]
 
     validation = probe_dataset.loc[probe_dataset["split"].eq("validation")].copy()
@@ -445,6 +840,7 @@ def run_frozen_probes(
     results: list[dict[str, object]] = []
     prediction_rows: list[pd.DataFrame] = []
     coefficients_by_fold: list[dict[str, object]] = []
+    alpha_selection_by_fold: list[dict[str, object]] = []
     for window_name in windows:
         fold_validation = validation.loc[validation["validation_window_name"].eq(window_name)]
         fold_start = fold_validation["date"].min()
@@ -459,39 +855,24 @@ def run_frozen_probes(
             if target_train.empty or target_validation.empty:
                 continue
 
-            train_x = target_train[z_columns].to_numpy(dtype=np.float64)
             raw_train_y = target_train[spec.raw_target].to_numpy(dtype=np.float64)
-            transformed_train_y = _transform_target_values(raw_train_y, spec)
+            transformed_train_y = transform_target_values(raw_train_y, spec)
             finite_train = np.isfinite(transformed_train_y)
             if not finite_train.any():
                 continue
-            train_x = train_x[finite_train]
+            raw_train_y = raw_train_y[finite_train]
             transformed_train_y = transformed_train_y[finite_train]
             target_train = target_train.loc[finite_train]
+            train_dates = target_train["date"].to_numpy()
 
-            validation_x = target_validation[z_columns].to_numpy(dtype=np.float64)
             raw_actual = target_validation[spec.raw_target].to_numpy(dtype=np.float64)
-            transformed_actual = _transform_target_values(raw_actual, spec)
+            transformed_actual = transform_target_values(raw_actual, spec)
             finite_validation = np.isfinite(raw_actual) & np.isfinite(transformed_actual)
             if not finite_validation.any():
                 continue
-            validation_x = validation_x[finite_validation]
             raw_actual = raw_actual[finite_validation]
             transformed_actual = transformed_actual[finite_validation]
             target_validation = target_validation.loc[finite_validation]
-
-            transformed_predicted, coefficients = _ridge_predict(
-                train_x, transformed_train_y, validation_x, alpha=alpha
-            )
-            transformed_baseline = np.full_like(
-                transformed_actual, transformed_train_y.mean()
-            )
-            raw_predicted, ridge_inverse_clipped = _inverse_transform_predictions(
-                transformed_predicted, spec
-            )
-            raw_baseline, baseline_inverse_clipped = _inverse_transform_predictions(
-                transformed_baseline, spec
-            )
 
             common = {
                 "validation_window_name": window_name,
@@ -506,18 +887,30 @@ def run_frozen_probes(
                 "train_count": int(len(target_train)),
                 "validation_count": int(len(target_validation)),
                 "comparison_baseline": TRAIN_MEAN_BASELINE,
+                "alpha_selection": alpha_selection,
             }
+
+            transformed_baseline = np.full_like(transformed_actual, transformed_train_y.mean())
+            raw_baseline, baseline_inverse_clipped = inverse_transform_predictions(
+                transformed_baseline, spec
+            )
+            proxy_column = _trailing_proxy_column(spec.raw_target)
+            proxy_available = proxy_column in target_validation.columns if proxy_column else False
+            transformed_proxy: np.ndarray | None = None
+            raw_proxy: np.ndarray | None = None
+            if proxy_available and proxy_column is not None:
+                raw_proxy = target_validation[proxy_column].to_numpy(dtype=np.float64)
+                transformed_proxy = transform_target_values(raw_proxy, spec)
 
             # Raw targets are scored once. Transformed targets are scored both in
             # model space and after inverse-mapping back to the original target units.
-            score_blocks: list[tuple[str, str, np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
+            score_blocks: list[tuple[str, str, np.ndarray, np.ndarray, np.ndarray]] = []
             if spec.transform == "raw":
                 score_blocks.append(
                     (
                         "raw",
                         spec.raw_target,
                         raw_actual,
-                        transformed_predicted,
                         transformed_baseline,
                         np.zeros(len(raw_actual), dtype=bool),
                     )
@@ -528,7 +921,6 @@ def run_frozen_probes(
                         "transformed",
                         spec.target,
                         transformed_actual,
-                        transformed_predicted,
                         transformed_baseline,
                         np.zeros(len(transformed_actual), dtype=bool),
                     )
@@ -538,9 +930,8 @@ def run_frozen_probes(
                         "raw",
                         spec.raw_target,
                         raw_actual,
-                        raw_predicted,
                         raw_baseline,
-                        ridge_inverse_clipped,
+                        baseline_inverse_clipped,
                     )
                 )
 
@@ -548,54 +939,199 @@ def run_frozen_probes(
                 score_space,
                 score_target_name,
                 actual,
-                predicted,
                 baseline,
-                ridge_clip_mask,
+                baseline_clip_mask,
             ) in score_blocks:
-                if score_space == "raw" and spec.transform != "raw":
-                    baseline_clip_mask = baseline_inverse_clipped
-                else:
-                    baseline_clip_mask = np.zeros(len(baseline), dtype=bool)
-
                 baseline_metrics = _append_scored_result(
                     results=results,
                     prediction_rows=prediction_rows,
-                    common=common,
+                    common={**common, "selected_alpha": None},
                     target_validation=target_validation,
                     score_space=score_space,
                     score_target_name=score_target_name,
                     predictor_name=TRAIN_MEAN_BASELINE,
                     predictor_kind="baseline",
+                    model_name=TRAIN_MEAN_BASELINE,
+                    feature_family="constant",
                     actual=actual,
                     predicted=baseline,
                     baseline_metrics=None,
-                    inverse_clipped=baseline_clip_mask,
-                )
-                _append_scored_result(
-                    results=results,
-                    prediction_rows=prediction_rows,
-                    common=common,
-                    target_validation=target_validation,
-                    score_space=score_space,
-                    score_target_name=score_target_name,
-                    predictor_name="ridge",
-                    predictor_kind="model",
-                    actual=actual,
-                    predicted=predicted,
-                    baseline_metrics=baseline_metrics,
-                    inverse_clipped=ridge_clip_mask,
+                    inverse_clipped=(
+                        baseline_inverse_clipped
+                        if score_space == "raw" and spec.transform != "raw"
+                        else baseline_clip_mask
+                    ),
                 )
 
-            coefficients_by_fold.append(
-                {
-                    "validation_window_name": window_name,
-                    "raw_target": spec.raw_target,
-                    "target": spec.target,
-                    "target_transform": spec.transform,
-                    "predictor_name": "ridge",
-                    "coefficients": coefficients.tolist(),
-                }
-            )
+                if transformed_proxy is not None and raw_proxy is not None:
+                    proxy_prediction = raw_proxy if score_space == "raw" else transformed_proxy
+                    finite_proxy = np.where(np.isfinite(proxy_prediction), proxy_prediction, baseline)
+                    _append_scored_result(
+                        results=results,
+                        prediction_rows=prediction_rows,
+                        common={**common, "selected_alpha": None},
+                        target_validation=target_validation,
+                        score_space=score_space,
+                        score_target_name=score_target_name,
+                        predictor_name=TRAILING_TARGET_PROXY_BASELINE,
+                        predictor_kind="baseline",
+                        model_name=TRAILING_TARGET_PROXY_BASELINE,
+                        feature_family="trailing_proxy",
+                        actual=actual,
+                        predicted=finite_proxy,
+                        baseline_metrics=baseline_metrics,
+                    )
+
+            for feature_family, train_x, validation_x in _feature_families(
+                target_train,
+                target_validation,
+                z_columns=z_columns,
+                baseline_feature_columns=baseline_feature_columns,
+            ):
+                selected_alpha = float(alpha) if alpha is not None else None
+                alpha_diagnostics: list[dict[str, object]] = []
+                if selected_alpha is None:
+                    selected_alpha, alpha_diagnostics = _select_ridge_alpha(
+                        train_x, transformed_train_y, train_dates, alpha_grid
+                    )
+                alpha_selection_by_fold.append(
+                    {
+                        "validation_window_name": window_name,
+                        "raw_target": spec.raw_target,
+                        "target": spec.target,
+                        "target_transform": spec.transform,
+                        "feature_family": feature_family,
+                        "selected_alpha": selected_alpha,
+                        "selection_method": alpha_selection,
+                        "candidate_diagnostics": alpha_diagnostics,
+                    }
+                )
+                for model_name in REGRESSION_HEADS:
+                    transformed_predicted, coefficients = _predict_regression_head(
+                        model_name,
+                        train_x,
+                        transformed_train_y,
+                        validation_x,
+                        alpha=selected_alpha,
+                    )
+                    raw_predicted, model_inverse_clipped = inverse_transform_predictions(
+                        transformed_predicted, spec
+                    )
+                    for score_space, score_target_name, actual, baseline, _ in score_blocks:
+                        predicted = raw_predicted if score_space == "raw" and spec.transform != "raw" else transformed_predicted
+                        clip_mask = (
+                            model_inverse_clipped
+                            if score_space == "raw" and spec.transform != "raw"
+                            else np.zeros(len(predicted), dtype=bool)
+                        )
+                        baseline_metrics = _score_predictions(
+                            score_target_name,
+                            actual,
+                            baseline,
+                            baseline_metrics=None,
+                        )
+                        predictor_name = f"{model_name}__{feature_family}"
+                        _append_scored_result(
+                            results=results,
+                            prediction_rows=prediction_rows,
+                            common={**common, "selected_alpha": selected_alpha},
+                            target_validation=target_validation,
+                            score_space=score_space,
+                            score_target_name=score_target_name,
+                            predictor_name=predictor_name,
+                            predictor_kind="model",
+                            model_name=model_name,
+                            feature_family=feature_family,
+                            actual=actual,
+                            predicted=predicted,
+                            baseline_metrics=baseline_metrics,
+                            inverse_clipped=clip_mask,
+                        )
+                    coefficients_by_fold.append(
+                        {
+                            "validation_window_name": window_name,
+                            "raw_target": spec.raw_target,
+                            "target": spec.target,
+                            "target_transform": spec.transform,
+                            "predictor_name": f"{model_name}__{feature_family}",
+                            "model_name": model_name,
+                            "feature_family": feature_family,
+                            "selected_alpha": selected_alpha,
+                            "coefficients": coefficients.tolist(),
+                        }
+                    )
+
+            if spec.transform == "raw":
+                for label_spec in _classification_label_frame(raw_train_y, raw_actual, spec.raw_target):
+                    label_train_y = np.asarray(label_spec["train_y"], dtype=np.float64)
+                    label_validation_y = np.asarray(label_spec["validation_y"], dtype=np.float64)
+                    if len(np.unique(label_train_y)) < 2:
+                        continue
+                    prior_probability = np.full_like(label_validation_y, label_train_y.mean())
+                    classification_common = {
+                        **common,
+                        "target": str(label_spec["classification_label"]),
+                        "target_transform": "binary_label",
+                        "selected_alpha": float(alpha) if alpha is not None else _fallback_alpha(alpha_grid),
+                    }
+                    baseline_metrics = _append_classification_result(
+                        results=results,
+                        prediction_rows=prediction_rows,
+                        common=classification_common,
+                        target_validation=target_validation,
+                        classification_label=str(label_spec["classification_label"]),
+                        positive_rule=str(label_spec["positive_rule"]),
+                        threshold=float(label_spec["threshold"]),
+                        predictor_name="class_prior",
+                        predictor_kind="baseline",
+                        model_name="class_prior",
+                        feature_family="constant",
+                        actual=label_validation_y,
+                        probability=prior_probability,
+                        baseline_metrics=None,
+                    )
+                    for feature_family, train_x, validation_x in _feature_families(
+                        target_train,
+                        target_validation,
+                        z_columns=z_columns,
+                        baseline_feature_columns=baseline_feature_columns,
+                    ):
+                        probability, coefficients = _logistic_predict(
+                            train_x,
+                            label_train_y,
+                            validation_x,
+                            alpha=float(classification_common["selected_alpha"]),
+                        )
+                        predictor_name = f"logistic__{feature_family}"
+                        _append_classification_result(
+                            results=results,
+                            prediction_rows=prediction_rows,
+                            common=classification_common,
+                            target_validation=target_validation,
+                            classification_label=str(label_spec["classification_label"]),
+                            positive_rule=str(label_spec["positive_rule"]),
+                            threshold=float(label_spec["threshold"]),
+                            predictor_name=predictor_name,
+                            predictor_kind="model",
+                            model_name="logistic",
+                            feature_family=feature_family,
+                            actual=label_validation_y,
+                            probability=probability,
+                            baseline_metrics=baseline_metrics,
+                        )
+                        coefficients_by_fold.append(
+                            {
+                                "validation_window_name": window_name,
+                                "raw_target": spec.raw_target,
+                                "target": str(label_spec["classification_label"]),
+                                "target_transform": "binary_label",
+                                "predictor_name": predictor_name,
+                                "model_name": "logistic",
+                                "feature_family": feature_family,
+                                "selected_alpha": classification_common["selected_alpha"],
+                                "coefficients": coefficients.tolist(),
+                            }
+                        )
 
     if not prediction_rows:
         raise RuntimeError("No finite probe folds were available.")
@@ -655,9 +1191,10 @@ def run_frozen_probes(
             )
 
     run_id = hashlib.sha256(
-        f"{source_database}|{alpha}|{target_transform_mode}|{PROBE_REPORT_VERSION}".encode(
-            "utf-8"
-        )
+        (
+            f"{source_database}|{alpha_selection}|{alpha}|{','.join(str(value) for value in alpha_grid)}|"
+            f"{','.join(transformed_target_names)}"
+        ).encode("utf-8")
     ).hexdigest()[:16]
     destination, temporary = artifact_destination(output_root, run_id)
     try:
@@ -668,10 +1205,10 @@ def run_frozen_probes(
             temporary / "predictions.parquet", index=False, compression="zstd"
         )
         report = {
-            "format_version": PROBE_REPORT_VERSION,
             "created_at_utc": datetime.now(timezone.utc).isoformat(),
-            "alpha": alpha,
-            "target_transform_mode": target_transform_mode,
+            "fixed_alpha": alpha,
+            "alpha_selection": alpha_selection,
+            "alpha_grid": list(alpha_grid),
             "target_transform_epsilon": TARGET_TRANSFORM_EPSILON,
             "probe_dataset_artifact": (
                 str(probe_dataset_artifact.resolve()) if probe_dataset_artifact else None
@@ -684,10 +1221,26 @@ def run_frozen_probes(
             "transformed_target_columns": transformed_target_names,
             "target_transform_specs": [asdict(spec) for spec in target_specs],
             "z_columns": z_columns,
+            "baseline_feature_columns": baseline_feature_columns,
+            "feature_families": [
+                Z_ONLY_FAMILY,
+                HAND_FEATURE_FAMILY,
+                HAND_PCA_FAMILY,
+                HAND_PLUS_Z_FAMILY,
+            ],
+            "baseline_families": [
+                TRAIN_MEAN_BASELINE,
+                TRAILING_TARGET_PROXY_BASELINE,
+                HAND_FEATURE_FAMILY,
+                HAND_PCA_FAMILY,
+            ],
+            "regression_heads": list(REGRESSION_HEADS),
+            "classification_heads": ["logistic"],
             "results": results,
             "aggregate_out_of_fold": aggregate,
             "window_summaries": _window_summaries(results),
             "coefficients_by_fold": coefficients_by_fold,
+            "alpha_selection_by_fold": alpha_selection_by_fold,
             "recalibration_is_diagnostic_only": True,
             "targets_joined_into_pretraining_artifact": False,
             "phase2_notes": {
@@ -695,6 +1248,13 @@ def run_frozen_probes(
                 "transformed_targets_are_scored_in_model_space": True,
                 "transformed_targets_are_inverse_scored_in_raw_space": True,
                 "inverse_prediction_clip_count_is_diagnostic": True,
+            },
+            "phase3_notes": {
+                "train_mean_baseline_is_retained": True,
+                "trailing_target_proxy_baseline_enabled": True,
+                "hand_market_feature_baselines_enabled": bool(baseline_feature_columns),
+                "classification_labels_use_train_only_thresholds": True,
+                "neural_probe_heads_included": False,
             },
         }
         (temporary / "report.json").write_text(
@@ -720,8 +1280,22 @@ def export_targets_main() -> None:
         "--database", type=Path, default=Path("data/processed/market_data.duckdb")
     )
     parser.add_argument("--output-root", type=Path, default=Path("data/probe_targets"))
+    parser.add_argument(
+        "--name",
+        help="Readable artifact directory name. Defaults to '<database_stem>_targets'.",
+    )
+    parser.add_argument(
+        "--market-symbol",
+        default="ETF_SPY",
+        help="Market proxy symbol used for past-only trailing baseline features.",
+    )
     args = parser.parse_args()
-    export_probe_targets(args.database, output_root=args.output_root)
+    export_probe_targets(
+        args.database,
+        output_root=args.output_root,
+        name=args.name,
+        market_symbol=args.market_symbol,
+    )
 
 
 def build_probe_dataset_main() -> None:
@@ -729,9 +1303,13 @@ def build_probe_dataset_main() -> None:
     parser = argparse.ArgumentParser(description="Build a reusable FI-JEPA probe dataset.")
     parser.add_argument("--embeddings", type=Path, required=True)
     parser.add_argument("--targets", type=Path, required=True)
-    parser.add_argument("--output-root", type=Path, default=Path("runs/probe_datasets"))
+    parser.add_argument("--output-root", type=Path, default=Path("data/probe_targets"))
+    parser.add_argument(
+        "--name",
+        help="Readable artifact directory name. Defaults to '<embedding_artifact>_probe_dataset'.",
+    )
     args = parser.parse_args()
-    build_probe_dataset(args.embeddings, args.targets, output_root=args.output_root)
+    build_probe_dataset(args.embeddings, args.targets, output_root=args.output_root, name=args.name)
 
 
 def run_probes_main() -> None:
@@ -741,13 +1319,17 @@ def run_probes_main() -> None:
     parser.add_argument("--embeddings", type=Path)
     parser.add_argument("--targets", type=Path)
     parser.add_argument("--output-root", type=Path, default=Path("runs/probes"))
-    parser.add_argument("--alpha", type=float, default=1.0)
     parser.add_argument(
-        "--target-transforms",
-        choices=("phase2", "raw"),
-        default="phase2",
-        help="Use phase2 transformed target variants, or raw-only compatibility mode.",
+        "--alpha",
+        type=float,
+        help="Use one fixed ridge alpha instead of inner walk-forward alpha selection.",
     )
+    parser.add_argument(
+        "--alphas",
+        default="0.0001,0.001,0.01,0.1,1,10,100,1000,10000",
+        help="Comma-separated ridge alpha grid used when --alpha is omitted.",
+    )
+
     args = parser.parse_args()
     if args.probe_dataset is None and (args.embeddings is None or args.targets is None):
         parser.error("provide --probe-dataset or both --embeddings and --targets")
@@ -761,5 +1343,5 @@ def run_probes_main() -> None:
         probe_dataset_artifact=args.probe_dataset,
         output_root=args.output_root,
         alpha=args.alpha,
-        target_transform_mode=args.target_transforms,
+        alphas=tuple(float(value) for value in args.alphas.split(",") if value.strip()),
     )

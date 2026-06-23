@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-import hashlib
 import json
 from pathlib import Path
 
@@ -9,13 +8,11 @@ import numpy as np
 import pandas as pd
 
 from fi_jepa.probes.artifacts import (
-    artifact_destination,
     clean_temporary_artifact,
     publish_artifact,
     read_manifest,
+    readable_artifact_destination,
 )
-
-PROBE_DATASET_SCHEMA_VERSION = 1
 
 
 # ============================================================================
@@ -33,10 +30,16 @@ def assemble_probe_dataset(
     embedding_database = embedding_manifest.get("source_database_sha256")
     target_database = target_manifest.get("source_database_sha256")
     if not embedding_database or embedding_database != target_database:
-        raise ValueError("Embedding and probe-target artifacts have different database versions.")
+        raise ValueError("Embedding and probe-target artifacts have different source database hashes.")
 
     embeddings = pd.read_parquet(embedding_artifact / "embeddings.parquet")
     targets = pd.read_parquet(target_artifact / "targets.parquet")
+    baseline_features_path = target_artifact / "baseline_features.parquet"
+    baseline_features = (
+        pd.read_parquet(baseline_features_path)
+        if baseline_features_path.is_file()
+        else pd.DataFrame({"date": targets["date"].drop_duplicates()})
+    )
     forbidden_embedding_columns = [
         name for name in embeddings.columns if name.startswith("future_")
     ]
@@ -47,7 +50,18 @@ def assemble_probe_dataset(
 
     embeddings["date"] = pd.to_datetime(embeddings["date"])
     targets["date"] = pd.to_datetime(targets["date"])
+    baseline_features["date"] = pd.to_datetime(baseline_features["date"])
     target_columns = [str(name) for name in target_manifest["target_columns"]]
+    baseline_feature_columns = [
+        str(name)
+        for name in target_manifest.get("baseline_feature_columns", [])
+        if str(name) in baseline_features.columns
+    ]
+    forbidden_baseline_columns = [
+        name for name in baseline_feature_columns if name.startswith("future_") or name.startswith("z_")
+    ]
+    if forbidden_baseline_columns:
+        raise ValueError(f"Baseline feature artifact contains forbidden columns: {forbidden_baseline_columns}")
     z_columns = sorted(
         (name for name in embeddings.columns if name.startswith("z_")),
         key=lambda name: int(name.removeprefix("z_")),
@@ -61,6 +75,13 @@ def assemble_probe_dataset(
         how="left",
         validate="one_to_one",
     )
+    if baseline_feature_columns:
+        probe_dataset = probe_dataset.merge(
+            baseline_features[["date", *baseline_feature_columns]],
+            on="date",
+            how="left",
+            validate="one_to_one",
+        )
     for target_name in target_columns:
         # Availability masks make missing future horizons explicit and reusable by every head.
         probe_dataset[f"target_available__{target_name}"] = np.isfinite(
@@ -94,6 +115,7 @@ def assemble_probe_dataset(
         "target_availability_columns": [
             f"target_available__{target_name}" for target_name in target_columns
         ],
+        "baseline_feature_columns": baseline_feature_columns,
         "z_columns": z_columns,
         "validation_windows": windows,
     }
@@ -104,29 +126,26 @@ def build_probe_dataset(
     embedding_artifact: Path,
     target_artifact: Path,
     *,
-    output_root: Path = Path("runs/probe_datasets"),
+    output_root: Path = Path("data/probe_targets"),
+    name: str | None = None,
 ) -> Path:
     """Build one immutable joined dataset that can be reused by multiple probe heads."""
     probe_dataset, metadata = assemble_probe_dataset(embedding_artifact, target_artifact)
-    artifact_id = hashlib.sha256(
-        (
-            f"{metadata['embedding_manifest'].get('pca_version')}|"
-            f"{metadata['source_database_sha256']}|{PROBE_DATASET_SCHEMA_VERSION}"
-        ).encode("utf-8")
-    ).hexdigest()[:16]
-    destination, temporary = artifact_destination(output_root, artifact_id)
+    destination, temporary = readable_artifact_destination(
+        output_root, name or f"{embedding_artifact.name}_probe_dataset"
+    )
     try:
         probe_dataset.to_parquet(
             temporary / "probe_dataset.parquet", index=False, compression="zstd"
         )
         manifest = {
-            "format_version": PROBE_DATASET_SCHEMA_VERSION,
             "created_at_utc": datetime.now(timezone.utc).isoformat(),
             "embedding_artifact": str(embedding_artifact.resolve()),
             "target_artifact": str(target_artifact.resolve()),
             "source_database_sha256": metadata["source_database_sha256"],
             "target_columns": metadata["target_columns"],
             "target_availability_columns": metadata["target_availability_columns"],
+            "baseline_feature_columns": metadata["baseline_feature_columns"],
             "z_columns": metadata["z_columns"],
             "validation_windows": metadata["validation_windows"],
             "row_count": int(len(probe_dataset)),
@@ -146,10 +165,6 @@ def build_probe_dataset(
 def load_probe_dataset(probe_dataset_artifact: Path) -> tuple[pd.DataFrame, dict[str, object]]:
     """Load and validate one reusable probe-dataset artifact."""
     manifest = read_manifest(probe_dataset_artifact)
-    if manifest.get("format_version") != PROBE_DATASET_SCHEMA_VERSION:
-        raise ValueError(
-            f"Unsupported probe-dataset format version: {manifest.get('format_version')}"
-        )
     probe_dataset = pd.read_parquet(probe_dataset_artifact / "probe_dataset.parquet")
     probe_dataset["date"] = pd.to_datetime(probe_dataset["date"])
     forbidden = [
