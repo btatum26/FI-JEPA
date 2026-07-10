@@ -293,6 +293,8 @@ def test_probe_targets_stay_separate_and_probes_are_walk_forward(tmp_path: Path)
         "ridge__hand_market_features",
         "ridge__hand_market_pca",
         "ridge__hand_market_features_plus_z",
+        "ridge__target_residualized_z_only",
+        "ridge__feature_residualized_z_only",
         "class_prior",
         "logistic__z_only",
         "logistic__hand_market_features",
@@ -315,8 +317,13 @@ def test_probe_targets_stay_separate_and_probes_are_walk_forward(tmp_path: Path)
     assert 1.0 in report["alpha_grid"]
     assert report["baseline_feature_columns"]
     assert "hand_market_features" in report["feature_families"]
+    assert "target_residualized_z_only" in report["feature_families"]
+    assert "feature_residualized_z_only" in report["feature_families"]
     assert "huber" in report["regression_heads"]
     assert "logistic" in report["classification_heads"]
+    assert report["phase4_notes"]["target_residualized_z_only_enabled"] is True
+    assert report["final_regression_summary"]
+    assert report["pass_fail_gate_counts"]["regression"]
     assert report["targets_joined_into_pretraining_artifact"] is False
     assert report["recalibration_is_diagnostic_only"] is True
     assert report["window_summaries"]
@@ -362,6 +369,14 @@ def test_probe_targets_stay_separate_and_probes_are_walk_forward(tmp_path: Path)
     assert all(result["rmse_ratio_vs_baseline"] >= 0.0 for result in ridge_results)
     assert all(result["selected_alpha"] > 0.0 for result in ridge_results)
     assert all(result["rmse_ratio_vs_baseline"] == 1.0 for result in baseline_results)
+    assert any(
+        result["feature_family"] == "target_residualized_z_only"
+        for result in regression_results
+    )
+    assert any(
+        result["feature_family"] == "feature_residualized_z_only"
+        for result in regression_results
+    )
     assert classification_results
     assert all("roc_auc" in result for result in classification_results)
 

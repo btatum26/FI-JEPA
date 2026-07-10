@@ -129,10 +129,14 @@ For each named validation window and target, the probe runner:
    `hand_market_features`, `hand_market_pca`, and
    `hand_market_features_plus_z` feature families when baseline features are
    available.
-6. Builds train-thresholded binary classification labels for high volatility,
+6. Adds two residualized tests when baseline features are available:
+   `target_residualized_z_only` fits target residuals after removing
+   hand-feature predictions, and `feature_residualized_z_only` probes the part
+   of `z_*` left after linearly removing hand-feature content.
+7. Builds train-thresholded binary classification labels for high volatility,
    severe drawdown, positive return, strong trend, and weak/choppy regimes, then
    scores logistic heads against a class-prior baseline.
-7. Reports distribution, calibration, rank-correlation, invalid-prediction,
+8. Reports distribution, calibration, rank-correlation, invalid-prediction,
    and baseline-relative diagnostics.
 
 Outputs:
@@ -159,6 +163,11 @@ final score.
 Classification rows report accuracy, balanced accuracy, ROC-AUC, PR-AUC, Brier
 score, log loss, and class prevalence. The classification thresholds are fit
 from the outer training period only.
+
+The final summary section reports mean, median, and worst-window R-squared,
+correlation stability, windows beating the strongest simple baseline, and a
+conservative `promising` / `weak` / `failure` gate. The gates are diagnostics,
+not scientific proof.
 
 ## Interpret Latent Coordinates
 
@@ -208,16 +217,20 @@ Future targets are joined only into this analysis artifact.
 - Regression heads are still simple linear heads; no neural probes are included.
 - Classification probes are binary regime labels, not multinomial quantile
   buckets yet.
+- Raw pooled-state representation variants are not included yet. The current
+  reusable probe dataset contains exported `z_*` coordinates only, so raw
+  pooled-state variants require an evaluation export contract change.
 - Probe results measure representation association, not tradability.
 - Good future-volatility probes can still indicate a volatility-dominated
-  representation; residualized and baseline comparisons remain necessary.
+  representation; residualized comparisons are the check for this.
 
 ## Tests
 
 `tests/test_fi_jepa_representation_probes.py` covers train-fit PCA,
 representation diagnostics, target separation, reusable probe datasets,
 source-database hash matching, Phase 2 target transforms, report diagnostics,
-Phase 3 baselines/classification heads, and walk-forward probe fitting.
+Phase 3 baselines/classification heads, Phase 4 residualized probes/gates, and
+walk-forward probe fitting.
 
 ```bash
 uv run pytest -q tests/test_fi_jepa_representation_probes.py

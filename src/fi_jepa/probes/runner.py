@@ -32,6 +32,8 @@ Z_ONLY_FAMILY = "z_only"
 HAND_FEATURE_FAMILY = "hand_market_features"
 HAND_PCA_FAMILY = "hand_market_pca"
 HAND_PLUS_Z_FAMILY = "hand_market_features_plus_z"
+TARGET_RESIDUALIZED_Z_FAMILY = "target_residualized_z_only"
+FEATURE_RESIDUALIZED_Z_FAMILY = "feature_residualized_z_only"
 REGRESSION_HEADS = ("ridge", "huber", "elastic_net")
 CLASSIFICATION_QUANTILE = 0.8
 
@@ -175,6 +177,39 @@ def _fit_pca_projection(
     _, _, vt = np.linalg.svd(standardized_train, full_matrices=False)
     components = vt[:component_count].T
     return standardized_train @ components, standardized_validation @ components
+
+
+def _ridge_residualize(
+    train_control_x: np.ndarray,
+    validation_control_x: np.ndarray,
+    train_values: np.ndarray,
+    validation_values: np.ndarray,
+    *,
+    alpha: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Remove train-fit linear control-feature predictions from one vector or matrix."""
+    train = np.asarray(train_values, dtype=np.float64)
+    validation = np.asarray(validation_values, dtype=np.float64)
+    if train.ndim == 1:
+        predicted_train, _ = _ridge_predict(train_control_x, train, train_control_x, alpha=alpha)
+        predicted_validation, _ = _ridge_predict(
+            train_control_x, train, validation_control_x, alpha=alpha
+        )
+        return train - predicted_train, validation - predicted_validation
+
+    train_residuals: list[np.ndarray] = []
+    validation_residuals: list[np.ndarray] = []
+    for column_index in range(train.shape[1]):
+        train_residual, validation_residual = _ridge_residualize(
+            train_control_x,
+            validation_control_x,
+            train[:, column_index],
+            validation[:, column_index],
+            alpha=alpha,
+        )
+        train_residuals.append(train_residual)
+        validation_residuals.append(validation_residual)
+    return np.column_stack(train_residuals), np.column_stack(validation_residuals)
 
 
 def _predict_regression_head(
@@ -646,6 +681,193 @@ def _window_summaries(results: list[dict[str, object]]) -> list[dict[str, object
     return summaries
 
 
+def _regression_final_summary(results: list[dict[str, object]]) -> list[dict[str, object]]:
+    """Summarize each regression model against the strongest simple same-window baseline."""
+    frame = pd.DataFrame(results)
+    if frame.empty or "task_type" not in frame:
+        return []
+    frame = frame.loc[frame["task_type"].eq("regression")].copy()
+    if frame.empty:
+        return []
+
+    baseline_families = {"constant", "trailing_proxy", HAND_FEATURE_FAMILY, HAND_PCA_FAMILY}
+    baseline_rows = frame.loc[frame["feature_family"].isin(baseline_families)]
+    strongest: dict[tuple[str, str, str], float] = {}
+    for keys, group in baseline_rows.groupby(["validation_window_name", "target", "score_space"]):
+        strongest[(str(keys[0]), str(keys[1]), str(keys[2]))] = float(group["rmse"].min())
+
+    summaries: list[dict[str, object]] = []
+    group_columns = ["target", "score_space", "model_name", "feature_family"]
+    for keys, group in frame.groupby(group_columns, sort=True):
+        target, score_space, model_name, feature_family = (str(value) for value in keys)
+        ratios: list[float] = []
+        beaten_windows = 0
+        for row in group.itertuples(index=False):
+            baseline_rmse = strongest.get(
+                (str(row.validation_window_name), str(row.target), str(row.score_space))
+            )
+            if baseline_rmse is None or baseline_rmse <= 0.0:
+                continue
+            ratio = float(row.rmse) / baseline_rmse
+            ratios.append(ratio)
+            if ratio < 1.0:
+                beaten_windows += 1
+        window_count = int(group["validation_window_name"].nunique())
+        mean_correlation = float(group["pearson_correlation"].mean())
+        median_ratio = float(np.median(ratios)) if ratios else float("nan")
+        invalid_rate = float(
+            group["invalid_prediction_count"].sum() / group["validation_count"].sum()
+        )
+        summaries.append(
+            {
+                "task_type": "regression",
+                "target": target,
+                "target_family": _target_family(target),
+                "horizon_days": _target_horizon(target),
+                "score_space": score_space,
+                "model_name": model_name,
+                "feature_family": feature_family,
+                "window_count": window_count,
+                "mean_r2": float(group["r2"].mean()),
+                "median_r2": float(group["r2"].median()),
+                "worst_window_r2": float(group["r2"].min()),
+                "mean_pearson_correlation": mean_correlation,
+                "mean_spearman_correlation": float(group["spearman_correlation"].mean()),
+                "correlation_stability_positive_windows": int(
+                    (group["pearson_correlation"] > 0.0).sum()
+                ),
+                "windows_beating_strongest_baseline": beaten_windows,
+                "median_rmse_ratio_vs_strongest_baseline": median_ratio,
+                "invalid_prediction_rate": invalid_rate,
+                "gate": _regression_gate(
+                    window_count=window_count,
+                    beaten_windows=beaten_windows,
+                    mean_r2=float(group["r2"].mean()),
+                    median_ratio=median_ratio,
+                    mean_correlation=mean_correlation,
+                    invalid_rate=invalid_rate,
+                ),
+            }
+        )
+    return summaries
+
+
+def _classification_final_summary(results: list[dict[str, object]]) -> list[dict[str, object]]:
+    """Summarize classification heads against the class-prior baseline."""
+    frame = pd.DataFrame(results)
+    if frame.empty or "task_type" not in frame:
+        return []
+    frame = frame.loc[frame["task_type"].eq("classification")].copy()
+    if frame.empty:
+        return []
+
+    prior: dict[tuple[str, str], float] = {}
+    prior_rows = frame.loc[frame["predictor_name"].eq("class_prior")]
+    for keys, group in prior_rows.groupby(["validation_window_name", "classification_label"]):
+        prior[(str(keys[0]), str(keys[1]))] = float(group["brier_score"].iloc[0])
+
+    summaries: list[dict[str, object]] = []
+    group_columns = ["classification_label", "model_name", "feature_family"]
+    for keys, group in frame.groupby(group_columns, sort=True):
+        label, model_name, feature_family = (str(value) for value in keys)
+        ratios: list[float] = []
+        beaten_windows = 0
+        for row in group.itertuples(index=False):
+            baseline_brier = prior.get((str(row.validation_window_name), str(row.classification_label)))
+            if baseline_brier is None or baseline_brier <= 0.0:
+                continue
+            ratio = float(row.brier_score) / baseline_brier
+            ratios.append(ratio)
+            if ratio < 1.0:
+                beaten_windows += 1
+        window_count = int(group["validation_window_name"].nunique())
+        median_ratio = float(np.median(ratios)) if ratios else float("nan")
+        summaries.append(
+            {
+                "task_type": "classification",
+                "classification_label": label,
+                "model_name": model_name,
+                "feature_family": feature_family,
+                "window_count": window_count,
+                "mean_balanced_accuracy": float(group["balanced_accuracy"].mean()),
+                "mean_roc_auc": float(group["roc_auc"].mean()),
+                "mean_pr_auc": float(group["pr_auc"].mean()),
+                "mean_brier_score": float(group["brier_score"].mean()),
+                "windows_beating_class_prior": beaten_windows,
+                "median_brier_ratio_vs_class_prior": median_ratio,
+                "gate": _classification_gate(
+                    window_count=window_count,
+                    beaten_windows=beaten_windows,
+                    mean_roc_auc=float(group["roc_auc"].mean()),
+                    median_ratio=median_ratio,
+                ),
+            }
+        )
+    return summaries
+
+
+def _target_family(target_name: str) -> str:
+    """Collapse target variants into a stable family label for report summaries."""
+    if "future_realized_vol" in target_name:
+        return "future_realized_vol"
+    if "future_max_drawdown" in target_name:
+        return "future_max_drawdown"
+    if "future_return" in target_name:
+        return "future_return"
+    if "future_trend_score" in target_name:
+        return "future_trend_score"
+    return "unknown"
+
+
+def _regression_gate(
+    *,
+    window_count: int,
+    beaten_windows: int,
+    mean_r2: float,
+    median_ratio: float,
+    mean_correlation: float,
+    invalid_rate: float,
+) -> str:
+    """Assign a conservative Phase 4 pass/fail label to one regression summary."""
+    required_windows = min(2, window_count)
+    if (
+        beaten_windows >= required_windows
+        and mean_correlation > 0.0
+        and np.isfinite(median_ratio)
+        and median_ratio < 1.0
+        and invalid_rate <= 0.01
+    ):
+        return "promising"
+    if mean_r2 < -0.1 and beaten_windows == 0:
+        return "failure"
+    return "weak"
+
+
+def _classification_gate(
+    *,
+    window_count: int,
+    beaten_windows: int,
+    mean_roc_auc: float,
+    median_ratio: float,
+) -> str:
+    """Assign a conservative Phase 4 pass/fail label to one classification summary."""
+    required_windows = min(2, window_count)
+    if beaten_windows >= required_windows and mean_roc_auc > 0.55 and median_ratio < 1.0:
+        return "promising"
+    if beaten_windows == 0 and mean_roc_auc <= 0.5:
+        return "failure"
+    return "weak"
+
+
+def _gate_counts(rows: list[dict[str, object]]) -> dict[str, int]:
+    """Count pass/fail gate labels using JSON-native integer values."""
+    counts: dict[str, int] = {}
+    for row in rows:
+        gate = str(row["gate"])
+        counts[gate] = counts.get(gate, 0) + 1
+    return counts
+
+
 def _append_scored_result(
     *,
     results: list[dict[str, object]],
@@ -982,12 +1204,127 @@ def run_frozen_probes(
                         baseline_metrics=baseline_metrics,
                     )
 
-            for feature_family, train_x, validation_x in _feature_families(
+            feature_family_matrices = _feature_families(
                 target_train,
                 target_validation,
                 z_columns=z_columns,
                 baseline_feature_columns=baseline_feature_columns,
-            ):
+            )
+            if baseline_feature_columns:
+                hand_train_x = target_train[baseline_feature_columns].to_numpy(dtype=np.float64)
+                hand_validation_x = target_validation[baseline_feature_columns].to_numpy(dtype=np.float64)
+                z_train_x = target_train[z_columns].to_numpy(dtype=np.float64)
+                z_validation_x = target_validation[z_columns].to_numpy(dtype=np.float64)
+                residual_alpha = _fallback_alpha(alpha_grid)
+                try:
+                    residual_z_train_x, residual_z_validation_x = _ridge_residualize(
+                        hand_train_x,
+                        hand_validation_x,
+                        z_train_x,
+                        z_validation_x,
+                        alpha=residual_alpha,
+                    )
+                    feature_family_matrices.append(
+                        (
+                            FEATURE_RESIDUALIZED_Z_FAMILY,
+                            residual_z_train_x,
+                            residual_z_validation_x,
+                        )
+                    )
+                except ValueError:
+                    pass
+
+                residual_train_y, residual_actual = _ridge_residualize(
+                    hand_train_x,
+                    hand_validation_x,
+                    transformed_train_y,
+                    transformed_actual,
+                    alpha=residual_alpha,
+                )
+                target_residual_name = f"{spec.target}__target_residual"
+                target_residual_transform = f"{spec.transform}_target_residualized"
+                target_residual_baseline = np.full_like(residual_actual, residual_train_y.mean())
+                target_residual_common = {
+                    **common,
+                    "target": target_residual_name,
+                    "target_transform": target_residual_transform,
+                    "selected_alpha": None,
+                }
+                target_residual_baseline_metrics = _append_scored_result(
+                    results=results,
+                    prediction_rows=prediction_rows,
+                    common=target_residual_common,
+                    target_validation=target_validation,
+                    score_space="residual",
+                    score_target_name=target_residual_name,
+                    predictor_name=TRAIN_MEAN_BASELINE,
+                    predictor_kind="baseline",
+                    model_name=TRAIN_MEAN_BASELINE,
+                    feature_family="constant",
+                    actual=residual_actual,
+                    predicted=target_residual_baseline,
+                    baseline_metrics=None,
+                )
+                selected_alpha = float(alpha) if alpha is not None else None
+                alpha_diagnostics: list[dict[str, object]] = []
+                if selected_alpha is None:
+                    selected_alpha, alpha_diagnostics = _select_ridge_alpha(
+                        z_train_x, residual_train_y, train_dates, alpha_grid
+                    )
+                alpha_selection_by_fold.append(
+                    {
+                        "validation_window_name": window_name,
+                        "raw_target": spec.raw_target,
+                        "target": target_residual_name,
+                        "target_transform": target_residual_transform,
+                        "feature_family": TARGET_RESIDUALIZED_Z_FAMILY,
+                        "selected_alpha": selected_alpha,
+                        "selection_method": alpha_selection,
+                        "candidate_diagnostics": alpha_diagnostics,
+                    }
+                )
+                for model_name in REGRESSION_HEADS:
+                    residual_predicted, coefficients = _predict_regression_head(
+                        model_name,
+                        z_train_x,
+                        residual_train_y,
+                        z_validation_x,
+                        alpha=selected_alpha,
+                    )
+                    predictor_name = f"{model_name}__{TARGET_RESIDUALIZED_Z_FAMILY}"
+                    _append_scored_result(
+                        results=results,
+                        prediction_rows=prediction_rows,
+                        common={
+                            **target_residual_common,
+                            "selected_alpha": selected_alpha,
+                        },
+                        target_validation=target_validation,
+                        score_space="residual",
+                        score_target_name=target_residual_name,
+                        predictor_name=predictor_name,
+                        predictor_kind="model",
+                        model_name=model_name,
+                        feature_family=TARGET_RESIDUALIZED_Z_FAMILY,
+                        actual=residual_actual,
+                        predicted=residual_predicted,
+                        baseline_metrics=target_residual_baseline_metrics,
+                    )
+                    coefficients_by_fold.append(
+                        {
+                            "validation_window_name": window_name,
+                            "raw_target": spec.raw_target,
+                            "target": target_residual_name,
+                            "target_transform": target_residual_transform,
+                            "predictor_name": predictor_name,
+                            "model_name": model_name,
+                            "feature_family": TARGET_RESIDUALIZED_Z_FAMILY,
+                            "selected_alpha": selected_alpha,
+                            "coefficients": coefficients.tolist(),
+                        }
+                    )
+
+            for feature_family, train_x, validation_x in feature_family_matrices:
                 selected_alpha = float(alpha) if alpha is not None else None
                 alpha_diagnostics: list[dict[str, object]] = []
                 if selected_alpha is None:
@@ -1184,6 +1521,8 @@ def run_frozen_probes(
                     "horizon_days": _target_horizon(str(frame["raw_target"].iloc[0])),
                     "predictor_name": str(predictor_name),
                     "predictor_kind": str(frame["predictor_kind"].iloc[0]),
+                    "model_name": str(frame["model_name"].iloc[0]),
+                    "feature_family": str(frame["feature_family"].iloc[0]),
                     "comparison_baseline": TRAIN_MEAN_BASELINE,
                     "validation_count": int(len(frame)),
                     **metrics,
@@ -1196,6 +1535,8 @@ def run_frozen_probes(
             f"{','.join(transformed_target_names)}"
         ).encode("utf-8")
     ).hexdigest()[:16]
+    regression_summary = _regression_final_summary(results)
+    classification_summary = _classification_final_summary(results)
     destination, temporary = artifact_destination(output_root, run_id)
     try:
         probe_dataset.to_parquet(
@@ -1227,6 +1568,8 @@ def run_frozen_probes(
                 HAND_FEATURE_FAMILY,
                 HAND_PCA_FAMILY,
                 HAND_PLUS_Z_FAMILY,
+                TARGET_RESIDUALIZED_Z_FAMILY,
+                FEATURE_RESIDUALIZED_Z_FAMILY,
             ],
             "baseline_families": [
                 TRAIN_MEAN_BASELINE,
@@ -1239,6 +1582,12 @@ def run_frozen_probes(
             "results": results,
             "aggregate_out_of_fold": aggregate,
             "window_summaries": _window_summaries(results),
+            "final_regression_summary": regression_summary,
+            "final_classification_summary": classification_summary,
+            "pass_fail_gate_counts": {
+                "regression": _gate_counts(regression_summary),
+                "classification": _gate_counts(classification_summary),
+            },
             "coefficients_by_fold": coefficients_by_fold,
             "alpha_selection_by_fold": alpha_selection_by_fold,
             "recalibration_is_diagnostic_only": True,
@@ -1255,6 +1604,17 @@ def run_frozen_probes(
                 "hand_market_feature_baselines_enabled": bool(baseline_feature_columns),
                 "classification_labels_use_train_only_thresholds": True,
                 "neural_probe_heads_included": False,
+            },
+            "phase4_notes": {
+                "target_residualized_z_only_enabled": bool(baseline_feature_columns),
+                "feature_residualized_z_only_enabled": bool(baseline_feature_columns),
+                "residualization_controls": "past-only baseline features",
+                "residualization_fit_scope": "outer training dates only",
+                "raw_pooled_state_variants_included": False,
+                "raw_pooled_state_variants_note": (
+                    "Current probe dataset contains exported z_* coordinates only; raw pooled-state "
+                    "variants require an evaluation export contract change."
+                ),
             },
         }
         (temporary / "report.json").write_text(

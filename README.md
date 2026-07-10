@@ -317,7 +317,8 @@ uv run build-probe-dataset \
 
 Run walk-forward probes with transformed targets, inner alpha selection, strong
 baseline feature families, linear regression heads, and binary regime
-classification heads:
+classification heads. The report also includes residualized `z` tests against
+hand-built market features and final diagnostic pass/fail gates:
 
 ```bash
 uv run run-fi-jepa-probes \
