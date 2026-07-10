@@ -45,9 +45,10 @@ Generated data and run artifacts are intentionally excluded from Git.
 
 ## Model
 
-One sample is a 252-trading-day market window ending at date `t`. The dataloader
-reconstructs sparse facts into masked tensors and divides time into twelve
-21-day patches.
+With the current YAML defaults, one sample is a 252-trading-day market window
+ending at date `t`. The dataloader reconstructs sparse facts into masked tensors
+and divides time into 42 six-day patches. `configs/dataloader.yaml` and
+`configs/model.yaml` are authoritative for these values.
 
 ```mermaid
 flowchart TD
@@ -55,7 +56,7 @@ flowchart TD
     M[Market features and masks] --> MT[Market patch tokenizer]
     X[Macro features and masks] --> XT[Macro patch tokenizer]
 
-    AT --> AP[Masked mean asset pooling]
+    AT --> AP[Configured asset pooling]
     AP --> FU[Fused temporal patch tokens]
     MT --> FU
     XT --> FU

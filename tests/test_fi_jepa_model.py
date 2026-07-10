@@ -445,7 +445,7 @@ def test_legacy_checkpoint_discards_removed_state_exporter() -> None:
         assert torch.equal(restored.state_dict()[name], expected)
 
 
-def test_encode_pooled_state_is_only_representation_path_and_requires_endpoint_patch() -> None:
+def test_encode_pooled_state_concatenates_components_and_requires_endpoint_patch() -> None:
     model = _model()
     model.eval()
     batch = _batch()
@@ -462,6 +462,54 @@ def test_encode_pooled_state_is_only_representation_path_and_requires_endpoint_p
     mean_state = (encoded * weights).sum(dim=1) / weights.sum(dim=1)
     expected = torch.cat((mean_state, encoded[:, -1]), dim=-1)
 
+    actual_mean, actual_endpoint = model.encode_state_components(batch)
     actual = model.encode_pooled_state(batch)
     assert actual.shape == (2, 16)
+    assert torch.allclose(actual_mean, mean_state)
+    assert torch.allclose(actual_endpoint, encoded[:, -1])
+    assert torch.allclose(actual, torch.cat((actual_mean, actual_endpoint), dim=-1))
     assert torch.allclose(actual, expected)
+
+
+def test_input_ablation_modes_preserve_shape_and_neutralize_only_requested_stream() -> None:
+    model = _model()
+    model.eval()
+    batch = _batch()
+    batch["patch_context_mask"][1, -1] = True
+    tensors = model._validate_batch(batch, require_jepa_targets=False)
+    fusion_inputs: dict[str, torch.Tensor] = {}
+
+    def capture_fusion_input(module: torch.nn.Module, args: tuple[torch.Tensor, ...]) -> None:
+        fusion_inputs[current_mode[0]] = args[0].detach().clone()
+
+    current_mode = ["all_streams"]
+    handle = model.fusion.register_forward_pre_hook(capture_fusion_input)
+    try:
+        outputs = {}
+        for mode in ("all_streams", "without_assets", "without_market", "without_macro"):
+            current_mode[0] = mode
+            outputs[mode] = model._tokenize_and_fuse(tensors, input_mode=mode)
+    finally:
+        handle.remove()
+
+    assert all(output.shape == outputs["all_streams"].shape for output in outputs.values())
+    asset_end = model.config.asset_token_dim
+    market_end = asset_end + model.config.market_token_dim
+    slices = {
+        "without_assets": slice(0, asset_end),
+        "without_market": slice(asset_end, market_end),
+        "without_macro": slice(market_end, None),
+    }
+    full = fusion_inputs["all_streams"]
+    for mode, removed_slice in slices.items():
+        ablated = fusion_inputs[mode]
+        assert full[..., removed_slice].any()
+        assert not ablated[..., removed_slice].any()
+        retained = torch.ones(full.shape[-1], dtype=torch.bool)
+        retained[removed_slice] = False
+        assert torch.equal(ablated[..., retained], full[..., retained])
+
+    assert torch.equal(
+        model.encode_pooled_state(batch),
+        model.encode_pooled_state(batch, input_mode="all_streams"),
+    )

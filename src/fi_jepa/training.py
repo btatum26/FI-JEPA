@@ -1072,6 +1072,9 @@ def train_fi_jepa(
                     checkpoint_format_version=CHECKPOINT_FORMAT_VERSION,
                     model_version=canonical_version_hash(resolved_config["model"]),
                     export_embeddings=training_config.representation_export_embeddings,
+                    representation_variant=(
+                        f"pooled_pca_{training_config.representation_pca_components}"
+                    ),
                 )
                 representation_evaluation_seconds = time.perf_counter() - representation_started
                 

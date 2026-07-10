@@ -23,6 +23,8 @@ from fi_jepa.probes.artifacts import (
 def assemble_probe_dataset(
     embedding_artifact: Path,
     target_artifact: Path,
+    *,
+    representation_variant: str | None = None,
 ) -> tuple[pd.DataFrame, dict[str, object]]:
     """Join frozen embeddings and separate targets into the Phase 1 probe-dataset contract."""
     embedding_manifest = read_manifest(embedding_artifact)
@@ -32,7 +34,23 @@ def assemble_probe_dataset(
     if not embedding_database or embedding_database != target_database:
         raise ValueError("Embedding and probe-target artifacts have different source database hashes.")
 
-    embeddings = pd.read_parquet(embedding_artifact / "embeddings.parquet")
+    selected_variant = representation_variant or str(embedding_manifest["representation_variant"])
+    variant_contracts = embedding_manifest.get("representation_variants", {})
+    if selected_variant in variant_contracts:
+        variant_contract = dict(variant_contracts[selected_variant])
+        embedding_file = variant_contract.get("embedding_file")
+        if not embedding_file:
+            raise ValueError(f"Representation variant {selected_variant!r} was not exported.")
+        representation_source = str(variant_contract["representation_source"])
+        representation_dimension = int(variant_contract["dimension"])
+    elif selected_variant == embedding_manifest["representation_variant"]:
+        embedding_file = "embeddings.parquet"
+        representation_source = str(embedding_manifest["representation_source"])
+        representation_dimension = None
+    else:
+        raise ValueError(f"Representation variant {selected_variant!r} is not present in the artifact.")
+
+    embeddings = pd.read_parquet(embedding_artifact / str(embedding_file))
     targets = pd.read_parquet(target_artifact / "targets.parquet")
     baseline_features_path = target_artifact / "baseline_features.parquet"
     baseline_features = (
@@ -68,6 +86,11 @@ def assemble_probe_dataset(
     )
     if not z_columns:
         raise ValueError("Embedding artifact contains no z_ columns.")
+    if representation_dimension is not None and len(z_columns) != representation_dimension:
+        raise ValueError(
+            f"Representation variant {selected_variant!r} declares {representation_dimension} dimensions "
+            f"but contains {len(z_columns)} z_ columns."
+        )
 
     probe_dataset = embeddings.merge(
         targets[["date", *target_columns]],
@@ -117,6 +140,9 @@ def assemble_probe_dataset(
         ],
         "baseline_feature_columns": baseline_feature_columns,
         "z_columns": z_columns,
+        "representation_variant": selected_variant,
+        "representation_source": representation_source,
+        "representation_dimension": len(z_columns),
         "validation_windows": windows,
     }
     return probe_dataset, metadata
@@ -128,11 +154,20 @@ def build_probe_dataset(
     *,
     output_root: Path = Path("data/probe_targets"),
     name: str | None = None,
+    representation_variant: str | None = None,
 ) -> Path:
     """Build one immutable joined dataset that can be reused by multiple probe heads."""
-    probe_dataset, metadata = assemble_probe_dataset(embedding_artifact, target_artifact)
+    probe_dataset, metadata = assemble_probe_dataset(
+        embedding_artifact, target_artifact, representation_variant=representation_variant
+    )
     destination, temporary = readable_artifact_destination(
-        output_root, name or f"{embedding_artifact.name}_probe_dataset"
+        output_root,
+        name
+        or (
+            f"{embedding_artifact.name}_{metadata['representation_variant']}_probe_dataset"
+            if representation_variant is not None
+            else f"{embedding_artifact.name}_probe_dataset"
+        ),
     )
     try:
         probe_dataset.to_parquet(
@@ -140,6 +175,14 @@ def build_probe_dataset(
         )
         manifest = {
             "created_at_utc": datetime.now(timezone.utc).isoformat(),
+            "checkpoint_id": metadata["embedding_manifest"]["checkpoint_id"],
+            "checkpoint_step": metadata["embedding_manifest"]["checkpoint_step"],
+            "representation_source": metadata["representation_source"],
+            "representation_variant": metadata["representation_variant"],
+            "representation_dimension": metadata["representation_dimension"],
+            "resolved_representation_config": metadata["embedding_manifest"][
+                "resolved_representation_config"
+            ],
             "embedding_artifact": str(embedding_artifact.resolve()),
             "target_artifact": str(target_artifact.resolve()),
             "source_database_sha256": metadata["source_database_sha256"],

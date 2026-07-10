@@ -15,23 +15,26 @@ The source-of-truth modules are:
 - `src/fi_jepa/representation.py` for representation evaluation and export.
 - `src/fi_jepa/probes/` for frozen downstream probes.
 
-## Fixed V1 Contract
+## Current Configured Defaults
+
+The YAML files under `configs/` are authoritative. The values below describe
+the current defaults, not permanent architecture constraints.
 
 | Property | Current value |
 |---|---:|
 | Lookback | 252 trading dates |
-| Patch length | 21 dates |
-| Temporal patches | 12 |
-| Training asset view | Random endpoint-valid `k=256` panel |
+| Patch length | 6 dates |
+| Temporal patches | 42 |
+| Training asset view | Random endpoint-valid `k=128` panel |
 | Validation JEPA view | All endpoint-valid assets |
 | Diagnostic embedding view | Deterministic fixed `k=256` or all-valid |
 | Fused model width | 128 |
 | Context encoder | 2-layer, 4-head Transformer encoder |
 | Target encoder | Frozen EMA copy of context encoder |
 | Predictor | 2-layer, 4-head Transformer decoder |
-| JEPA target count | 3 to 5 eligible patches |
+| JEPA target count | 5 to 15 eligible patches |
 | Representation source | `encode_pooled_state()` |
-| Export dimension | Train-fit PCA, default 8 components |
+| Export dimension | Train-fit PCA, default 16 components |
 
 Feature dimensions are not hard-coded in the model. They are derived from the
 frozen artifact's `feature_manifest.parquet`.
@@ -56,16 +59,17 @@ For one sample, the dataloader returns:
 | Patch context and target masks | `[B, P]` |
 | Gathered target patch IDs | `[B, T]` |
 
-`W=252`, `P=12`, and `L=21`. `A` varies for all-asset validation batches and is
-padded by collation. Values in invalid feature, date, or asset slots are zero;
-masks remain authoritative.
+With the current defaults, `W=252`, `P=42`, and `L=6`. `A` varies for all-asset
+validation batches and is padded by collation. Values in invalid feature, date,
+or asset slots are zero; masks remain authoritative.
 
 ## Tokenization And Fusion
 
 The model tokenizes each stream independently:
 
 1. The asset tokenizer processes each asset patch with observation masks.
-2. Valid asset tokens are mean-pooled inside each temporal patch.
+2. Valid asset tokens are combined by the configured asset-pooling module
+   (currently attention pooling).
 3. Market and macro tokenizers process their date-level patch features.
 4. The pooled asset, market, and macro tokens are concatenated.
 5. A dropout-free fusion projection maps the combined stream to width 128.

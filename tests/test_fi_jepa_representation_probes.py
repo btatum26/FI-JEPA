@@ -14,7 +14,16 @@ import fi_jepa.representation as representation_module
 from fi_jepa.dataloader import FIJepaDataConfig
 from fi_jepa.model_config import FIJepaModelConfig
 from fi_jepa.probes import build_probe_dataset, export_probe_targets, run_frozen_probes
-from fi_jepa.representation import fit_pca_exporter, representation_diagnostics
+from fi_jepa.representation import (
+    INITIAL_REPRESENTATION_VARIANTS,
+    _embedding_frame,
+    build_representation_variants,
+    fit_pca_exporter,
+    representation_distance_summary,
+    representation_diagnostics,
+    run_compact_ablation_suite,
+    windowed_validation_rank_diagnostics,
+)
 
 
 # ============================================================================
@@ -56,6 +65,301 @@ def test_representation_diagnostics_report_rank_geometry_and_zero_norms() -> Non
     assert diagnostics["near_zero_norm_count"] == 1
     assert diagnostics["effective_rank"] == pytest.approx(2.0)
     assert diagnostics["pairwise_cosine"]["pair_count"] == 10
+
+
+def test_windowed_rank_diagnostics_keep_outer_validation_windows_separate() -> None:
+    """Compute one result per named outer window for raw and selected PCA states only."""
+    train_metadata = pd.DataFrame({"date": pd.bdate_range("2023-01-02", periods=12)})
+    validation_metadata = pd.DataFrame(
+        {
+            "date": pd.bdate_range("2024-01-02", periods=6),
+            "validation_window_name": ["first"] * 3 + ["second"] * 3,
+        }
+    )
+    axis = np.arange(12, dtype=np.float64)
+    train_raw = np.column_stack((axis, axis % 3, np.ones(12)))
+    validation_raw = np.column_stack((np.arange(6), np.arange(6) % 2, np.ones(6)))
+    diagnostics = windowed_validation_rank_diagnostics(
+        train_metadata,
+        {"raw_pooled_state": train_raw, "selected_pca_representation": train_raw[:, :2]},
+        validation_metadata,
+        {
+            "raw_pooled_state": validation_raw,
+            "selected_pca_representation": validation_raw[:, :2],
+        },
+    )
+
+    assert set(diagnostics["representations"]) == {
+        "raw_pooled_state",
+        "selected_pca_representation",
+    }
+    for representation in diagnostics["representations"].values():
+        assert [window["validation_window_name"] for window in representation["windows"]] == [
+            "first",
+            "second",
+        ]
+        assert all(window["validation_date_count"] == 3 for window in representation["windows"])
+        assert set(representation["windows"][0]["metrics"]) == {
+            "sample_count",
+            "effective_rank",
+            "top_eigenvalue_share",
+            "top_5_eigenvalue_share",
+            "mean_pairwise_cosine",
+            "median_pairwise_cosine",
+            "mean_vector_norm",
+        }
+
+
+def test_matched_train_windows_have_exact_validation_date_length() -> None:
+    train_metadata = pd.DataFrame({"date": pd.bdate_range("2023-01-02", periods=10)})
+    validation_metadata = pd.DataFrame(
+        {
+            "date": pd.bdate_range("2024-01-02", periods=4),
+            "validation_window_name": ["outer"] * 4,
+        }
+    )
+    train = np.column_stack((np.arange(10, dtype=np.float64), np.ones(10)))
+    validation = np.column_stack((np.arange(4, dtype=np.float64), np.ones(4)))
+    diagnostics = windowed_validation_rank_diagnostics(
+        train_metadata,
+        {"raw_pooled_state": train},
+        validation_metadata,
+        {"raw_pooled_state": validation},
+    )
+
+    window = diagnostics["representations"]["raw_pooled_state"]["windows"][0]
+    assert window["matched_train_window_count"] == 3
+    assert window["matched_train_window_date_counts"] == [4, 4, 4]
+
+
+def test_validation_percentile_uses_weak_empirical_rank() -> None:
+    """Count matched train values less than or equal to the validation value."""
+    train_metadata = pd.DataFrame({"date": pd.bdate_range("2023-01-02", periods=6)})
+    validation_metadata = pd.DataFrame(
+        {
+            "date": pd.bdate_range("2024-01-02", periods=2),
+            "validation_window_name": ["outer", "outer"],
+        }
+    )
+    # Exact two-date windows have mean norms 1, 2, and 3; validation ties the middle value.
+    train = np.asarray([[1.0], [1.0], [2.0], [2.0], [3.0], [3.0]])
+    validation = np.asarray([[2.0], [2.0]])
+    diagnostics = windowed_validation_rank_diagnostics(
+        train_metadata,
+        {"raw_pooled_state": train},
+        validation_metadata,
+        {"raw_pooled_state": validation},
+    )
+
+    comparison = diagnostics["representations"]["raw_pooled_state"]["windows"][0]["metrics"][
+        "mean_vector_norm"
+    ]
+    assert comparison == {
+        "matched_train_median": 2.0,
+        "matched_train_5th_percentile": pytest.approx(1.1),
+        "matched_train_95th_percentile": pytest.approx(2.9),
+        "validation_value": 2.0,
+        "validation_percentile": pytest.approx(200.0 / 3.0),
+    }
+
+
+def test_representation_report_contains_minimal_artifact_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Record the frozen checkpoint, variant, and resolved evaluation settings."""
+    train_metadata = pd.DataFrame({"date": pd.bdate_range("2024-01-01", periods=5)})
+    validation_metadata = pd.DataFrame({"date": pd.bdate_range("2024-02-01", periods=3)})
+    train_base = np.arange(20, dtype=np.float64).reshape(5, 4)
+    validation_base = np.arange(12, dtype=np.float64).reshape(3, 4)
+
+    def fake_loader(config: object, split: str, *, asset_view: str, **kwargs: object) -> tuple[str, str]:
+        return split, asset_view
+
+    def fake_collect(
+        model: object,
+        loader: tuple[str, str],
+        device: object,
+        amp_dtype: object,
+        **kwargs: object,
+    ) -> tuple[pd.DataFrame, dict[str, np.ndarray]]:
+        metadata = train_metadata if loader[0] == "train" else validation_metadata
+        base = train_base if loader[0] == "train" else validation_base
+        states = {
+            "mean_state": base,
+            "endpoint_state": base + 0.25,
+            "pooled_state": np.concatenate([base, base + 0.5], axis=1),
+        }
+        return metadata, states
+
+    class FakeStore:
+        """Expose the immutable identity read by representation evaluation."""
+
+        dataset_version = "dataset-a"
+        manifest = {"source_database": "market.duckdb", "source_database_sha256": "db-hash"}
+
+    monkeypatch.setattr(representation_module, "build_fi_jepa_embedding_dataloader", fake_loader)
+    monkeypatch.setattr(representation_module, "collect_representation_states", fake_collect)
+    output_dir = tmp_path / "evaluation"
+    representation_module.run_representation_evaluation(
+        object(),
+        FakeStore(),
+        FIJepaDataConfig(artifact_path=tmp_path / "artifact"),
+        device=representation_module.torch.device("cpu"),
+        amp_dtype=None,
+        n_components=2,
+        views_per_date=1,
+        output_dir=output_dir,
+        checkpoint_id="checkpoint-a",
+        checkpoint_step=10,
+        checkpoint_format_version=2,
+        model_version="model-a",
+        export_embeddings=False,
+        representation_variant="pooled_pca_2",
+    )
+
+    report = json.loads((output_dir / "diagnostics.json").read_text(encoding="utf-8"))
+    assert {
+        "schema_version",
+        "checkpoint_id",
+        "checkpoint_step",
+        "representation_source",
+        "representation_variant",
+        "resolved_probe_config",
+        "resolved_representation_config",
+        "created_at_utc",
+    }.issubset(report)
+    assert report["checkpoint_id"] == "checkpoint-a"
+    assert report["checkpoint_step"] == 10
+    assert report["representation_variant"] == "pooled_pca_2"
+
+
+def test_initial_representation_variants_use_train_only_pca_and_exact_dimensions() -> None:
+    rng = np.random.default_rng(17)
+    train_mean = rng.normal(size=(80, 128))
+    train_endpoint = rng.normal(size=(80, 128))
+    validation_mean = rng.normal(loc=100.0, size=(12, 128))
+    validation_endpoint = rng.normal(loc=-100.0, size=(12, 128))
+    train_states = {
+        "mean_state": train_mean,
+        "endpoint_state": train_endpoint,
+        "pooled_state": np.concatenate((train_mean, train_endpoint), axis=1),
+    }
+    validation_states = {
+        "mean_state": validation_mean,
+        "endpoint_state": validation_endpoint,
+        "pooled_state": np.concatenate((validation_mean, validation_endpoint), axis=1),
+    }
+
+    outputs, metadata, exporters = build_representation_variants(
+        train_states, validation_states
+    )
+
+    assert tuple(outputs) == INITIAL_REPRESENTATION_VARIANTS
+    assert {name: values[0].shape[1] for name, values in outputs.items()} == {
+        "mean_pca_16": 16,
+        "endpoint_pca_16": 16,
+        "pooled_pca_16": 16,
+        "pooled_pca_32": 32,
+        "pooled_pca_64": 64,
+        "pooled_raw_256": 256,
+    }
+    for variant, exporter in exporters.items():
+        source = str(metadata[variant]["representation_source"])
+        assert np.allclose(exporter.mean, train_states[source].mean(axis=0))
+        assert metadata[variant]["pca_fit_split"] == "train"
+        assert metadata[variant]["explained_variance_ratio"]
+    assert np.array_equal(outputs["pooled_raw_256"][0], train_states["pooled_state"])
+    assert np.array_equal(outputs["pooled_raw_256"][1], validation_states["pooled_state"])
+
+    exported = _embedding_frame(
+        pd.DataFrame({"date": pd.date_range("2024-01-01", periods=80)}),
+        outputs["pooled_pca_16"][0],
+        {
+            "representation_variant": "pooled_pca_16",
+            "representation_source": "pooled_state",
+            "representation_dimension": 16,
+        },
+    )
+    assert not any(column.startswith("future_") for column in exported.columns)
+
+
+def test_representation_distance_retains_magnitude_information() -> None:
+    reference = np.asarray([[1.0, 0.0], [0.0, 2.0]])
+    scaled = reference * 2.0
+
+    summary = representation_distance_summary(reference, scaled)
+
+    assert summary["mean_cosine_similarity"] == pytest.approx(1.0)
+    assert summary["mean_relative_l2_distance"] == pytest.approx(1.0)
+
+
+def test_compact_ablation_suite_uses_exact_counts_modes_and_default_probe_scope(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dates = pd.bdate_range("2024-01-01", periods=6)
+    metadata = pd.DataFrame({"date": dates})
+    reference = np.arange(48, dtype=np.float64).reshape(6, 8) + 1.0
+    states = {
+        "mean_state": reference[:, :4],
+        "endpoint_state": reference[:, 4:],
+        "pooled_state": reference,
+    }
+
+    def fake_loader(
+        config: FIJepaDataConfig, split: str, *, asset_view: str, **kwargs: object
+    ) -> tuple[str, str, int]:
+        return split, asset_view, config.fixed_k_assets
+
+    def fake_collect(
+        model: object,
+        loader: tuple[str, str, int],
+        device: object,
+        amp_dtype: object,
+        *,
+        input_mode: str = "all_streams",
+        **kwargs: object,
+    ) -> tuple[pd.DataFrame, dict[str, np.ndarray]]:
+        _, asset_view, asset_count = loader
+        scale = 1.0 if asset_view == "all_valid" else 1.0 + asset_count / 1_000.0
+        if input_mode != "all_streams":
+            scale += {"without_assets": 0.1, "without_market": 0.2, "without_macro": 0.3}[input_mode]
+        values = reference * scale
+        return metadata.copy(), {
+            "mean_state": values[:, :4],
+            "endpoint_state": values[:, 4:],
+            "pooled_state": values,
+        }
+
+    monkeypatch.setattr(representation_module, "build_fi_jepa_embedding_dataloader", fake_loader)
+    monkeypatch.setattr(representation_module, "collect_representation_states", fake_collect)
+    report, probe_states = run_compact_ablation_suite(
+        object(),
+        object(),
+        FIJepaDataConfig(artifact_path=tmp_path / "artifact"),
+        device=representation_module.torch.device("cpu"),
+        amp_dtype=None,
+        train_metadata=metadata,
+        train_states=states,
+        validation_metadata=metadata,
+        validation_states=states,
+        collect_probe_states=True,
+    )
+
+    assert set(report["asset_count_ablations"]) == {"k_32", "k_128", "k_256", "all_valid"}
+    assert set(report["input_branch_ablations"]) == {
+        "all_streams",
+        "without_assets",
+        "without_market",
+        "without_macro",
+    }
+    assert report["default_asset_probe_variants"] == [
+        "pooled_pca_16",
+        "asset_k_128_pooled_pca_16",
+    ]
+    assert "asset_k_128_pooled_pca_16" in probe_states
+    assert "asset_k_32_pooled_pca_16" not in probe_states
+    assert "asset_k_256_pooled_pca_16" not in probe_states
 
 
 # ============================================================================
@@ -155,7 +459,7 @@ def test_evaluation_cli_parses_batch_size_override(monkeypatch: pytest.MonkeyPat
 
 
 def _write_probe_database(path: Path) -> pd.DatetimeIndex:
-    dates = pd.bdate_range("2024-01-01", periods=12)
+    dates = pd.bdate_range("2022-01-03", periods=380)
     feature_axis = np.linspace(0.0, 1.0, len(dates))
     features = pd.DataFrame(
         {
@@ -210,8 +514,8 @@ def _write_embedding_artifact(
     source_database_sha256: str,
 ) -> Path:
     root.mkdir()
-    split = ["train"] * 5 + ["validation"] * 2 + ["train"] * 3 + ["validation"] * 2
-    windows = [""] * 5 + ["window_one"] * 2 + [""] * 3 + ["window_two"] * 2
+    split = ["train"] * 280 + ["validation"] * 20 + ["train"] * 60 + ["validation"] * 20
+    windows = [""] * 280 + ["window_one"] * 20 + [""] * 60 + ["window_two"] * 20
     embeddings = pd.DataFrame(
         {
             "date": dates,
@@ -234,11 +538,63 @@ def _write_embedding_artifact(
             {
                 "source_database_sha256": source_database_sha256,
                 "pca_version": "pca-a",
+                "checkpoint_id": "checkpoint-a",
+                "checkpoint_step": 10,
+                "representation_source": "encode_pooled_state",
+                "representation_variant": "pooled_pca_16",
+                "resolved_representation_config": {
+                    "pca_components": 16,
+                    "views_per_date": 3,
+                    "export_embeddings": True,
+                },
             }
         ),
         encoding="utf-8",
     )
     return root
+
+
+def test_probe_dataset_selects_one_explicit_exported_variant(tmp_path: Path) -> None:
+    database = tmp_path / "market.duckdb"
+    dates = _write_probe_database(database)
+    target_artifact = export_probe_targets(database, output_root=tmp_path / "probe_targets")
+    target_manifest = json.loads((target_artifact / "manifest.json").read_text(encoding="utf-8"))
+    embedding_artifact = _write_embedding_artifact(
+        tmp_path / "embeddings", dates, target_manifest["source_database_sha256"]
+    )
+    base = pd.read_parquet(embedding_artifact / "embeddings.parquet")
+    variant = base.drop(columns=["z_1", "z_2"]).copy()
+    for index in range(16):
+        variant[f"z_{index + 1}"] = np.linspace(index, index + 1.0, len(variant))
+    variant["representation_variant"] = "mean_pca_16"
+    variant["representation_source"] = "mean_state"
+    variant["representation_dimension"] = 16
+    variant.to_parquet(embedding_artifact / "embeddings_mean_pca_16.parquet", index=False)
+    manifest = json.loads((embedding_artifact / "manifest.json").read_text(encoding="utf-8"))
+    manifest["representation_variants"] = {
+        "mean_pca_16": {
+            "representation_variant": "mean_pca_16",
+            "representation_source": "mean_state",
+            "dimension": 16,
+            "embedding_file": "embeddings_mean_pca_16.parquet",
+        }
+    }
+    (embedding_artifact / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    dataset_artifact = build_probe_dataset(
+        embedding_artifact,
+        target_artifact,
+        output_root=tmp_path / "probe_targets",
+        representation_variant="mean_pca_16",
+    )
+    dataset_manifest = json.loads((dataset_artifact / "manifest.json").read_text(encoding="utf-8"))
+    dataset = pd.read_parquet(dataset_artifact / "probe_dataset.parquet")
+
+    assert dataset_manifest["representation_variant"] == "mean_pca_16"
+    assert dataset_manifest["representation_source"] == "mean_state"
+    assert dataset_manifest["representation_dimension"] == 16
+    assert len([column for column in dataset if column.startswith("z_")]) == 16
+    assert not any(column.startswith("future_") for column in variant.columns)
 
 
 def test_probe_targets_stay_separate_and_probes_are_walk_forward(tmp_path: Path) -> None:
@@ -262,6 +618,11 @@ def test_probe_targets_stay_separate_and_probes_are_walk_forward(tmp_path: Path)
     output = run_frozen_probes(
         probe_dataset_artifact=dataset_artifact,
         output_root=tmp_path / "probe_runs",
+        ridge_alphas=(0.1,),
+        huber_alphas=(0.01,),
+        elastic_net_alphas=(0.001,),
+        elastic_net_l1_ratios=(0.5,),
+        logistic_alphas=(1.0,),
     )
     exported_targets = pd.read_parquet(target_artifact / "targets.parquet")
     probe_dataset = pd.read_parquet(dataset_artifact / "probe_dataset.parquet")
@@ -270,6 +631,7 @@ def test_probe_targets_stay_separate_and_probes_are_walk_forward(tmp_path: Path)
         (dataset_artifact / "manifest.json").read_text(encoding="utf-8")
     )
     report = json.loads((output / "report.json").read_text(encoding="utf-8"))
+    summary = (output / "summary.md").read_text(encoding="utf-8")
 
     assert target_artifact == tmp_path / "probe_targets" / "market_targets"
     assert dataset_artifact == tmp_path / "probe_targets" / "embeddings_probe_dataset"
@@ -293,7 +655,7 @@ def test_probe_targets_stay_separate_and_probes_are_walk_forward(tmp_path: Path)
         "ridge__hand_market_features",
         "ridge__hand_market_pca",
         "ridge__hand_market_features_plus_z",
-        "ridge__target_residualized_z_only",
+        "ridge__hand_market_features_plus_residual_z",
         "ridge__feature_residualized_z_only",
         "class_prior",
         "logistic__z_only",
@@ -312,24 +674,72 @@ def test_probe_targets_stay_separate_and_probes_are_walk_forward(tmp_path: Path)
     assert "format_version" not in target_manifest
     assert "format_version" not in dataset_manifest
     assert "format_version" not in report
+    assert {
+        "schema_version",
+        "checkpoint_id",
+        "checkpoint_step",
+        "representation_source",
+        "representation_variant",
+        "resolved_probe_config",
+        "resolved_representation_config",
+        "created_at_utc",
+    }.issubset(report)
+    assert report["checkpoint_id"] == "checkpoint-a"
+    assert report["checkpoint_step"] == 10
+    assert report["representation_source"] == "encode_pooled_state"
+    assert report["representation_variant"] == "pooled_pca_16"
     assert report["probe_dataset_artifact"] == str(dataset_artifact.resolve())
-    assert report["alpha_selection"] == "inner_walk_forward"
-    assert 1.0 in report["alpha_grid"]
+    assert report["alpha_selection"] == "three_fold_expanding_purged"
+    assert report["resolved_probe_config"]["ridge_alphas"] == [0.1]
+    assert report["resolved_probe_config"]["huber_alphas"] == [0.01]
+    assert report["resolved_probe_config"]["elastic_net_alphas"] == [0.001]
+    assert report["resolved_probe_config"]["elastic_net_l1_ratios"] == [0.5]
+    assert report["resolved_probe_config"]["logistic_alphas"] == [1.0]
+    assert report["resolved_probe_config"]["bootstrap_samples"] == 500
+    assert report["resolved_probe_config"]["bootstrap_block_length"] == "target_horizon"
+    assert report["bootstrap_by_window"]
+    assert report["stability_summary"]
+    assert report["evaluated_target_model_variant_combination_count"] == len(
+        report["stability_summary"]
+    )
+    assert report["multiple_comparison_correction_applied"] is False
+    assert all(
+        row["representation_variant"] == "pooled_pca_16"
+        and row["sample_count"] == 500
+        and row["block_length"] in {21, 63, 126}
+        and row["confidence_intervals_95"]
+        for row in report["bootstrap_by_window"]
+    )
     assert report["baseline_feature_columns"]
     assert "hand_market_features" in report["feature_families"]
-    assert "target_residualized_z_only" in report["feature_families"]
+    assert "hand_market_features_plus_residual_z" in report["feature_families"]
     assert "feature_residualized_z_only" in report["feature_families"]
     assert "huber" in report["regression_heads"]
     assert "logistic" in report["classification_heads"]
-    assert report["phase4_notes"]["target_residualized_z_only_enabled"] is True
+    assert report["phase4_notes"]["hand_plus_residual_z_enabled"] is True
     assert report["final_regression_summary"]
     assert report["pass_fail_gate_counts"]["regression"]
+    assert "oracle_validation_recalibration" not in json.dumps(
+        report["final_regression_summary"]
+    )
+    assert "validation_recalibration" not in json.dumps(report["window_summaries"])
     assert report["targets_joined_into_pretraining_artifact"] is False
-    assert report["recalibration_is_diagnostic_only"] is True
+    assert "recalibration_is_diagnostic_only" not in report
+    assert report["incremental_hand_plus_z_comparisons"]
+    assert "## Run Identity" in summary
+    assert "## Incremental Regression Results" in summary
+    assert "## Classification Results" in summary
+    assert "## Warnings" in summary
     assert report["window_summaries"]
     assert "future_realized_vol_21d__log_realized_vol" in report["transformed_target_columns"]
     assert "future_max_drawdown_21d__log_drawdown_magnitude" in report["transformed_target_columns"]
-    assert report["alpha_selection_by_fold"]
+    assert report["parameter_selection_by_fold"]
+    assert {row["model_name"] for row in report["parameter_selection_by_fold"]} == {
+        "ridge",
+        "huber",
+        "elastic_net",
+        "logistic",
+    }
 
     required_metrics = {
         "rmse",
@@ -347,14 +757,14 @@ def test_probe_targets_stay_separate_and_probes_are_walk_forward(tmp_path: Path)
         "std_ratio",
         "invalid_prediction_count",
         "invalid_prediction_rate",
-        "validation_recalibration",
     }
     regression_results = [
         result for result in report["results"] if result["task_type"] == "regression"
     ]
     for result in regression_results:
         assert required_metrics.issubset(result)
-        assert result["validation_recalibration"]["uses_validation_labels"] is True
+        assert "validation_recalibration" not in result
+        assert "oracle_validation_recalibration" not in result
         assert pd.Timestamp(result["train_end"]) < pd.Timestamp(result["validation_start"])
 
     ridge_results = [
@@ -368,9 +778,22 @@ def test_probe_targets_stay_separate_and_probes_are_walk_forward(tmp_path: Path)
     ]
     assert all(result["rmse_ratio_vs_baseline"] >= 0.0 for result in ridge_results)
     assert all(result["selected_alpha"] > 0.0 for result in ridge_results)
+    model_results = [result for result in report["results"] if result["predictor_kind"] == "model"]
+    assert all(len(result["inner_fold_scores"]) == 3 for result in model_results)
+    assert all(result["inner_validation_score"] is not None for result in model_results)
+    assert all(
+        "selected_l1_ratio" in result
+        for result in model_results
+        if result["model_name"] == "elastic_net"
+    )
+    assert all(
+        "selected_l1_ratio" not in result
+        for result in model_results
+        if result["model_name"] != "elastic_net"
+    )
     assert all(result["rmse_ratio_vs_baseline"] == 1.0 for result in baseline_results)
     assert any(
-        result["feature_family"] == "target_residualized_z_only"
+        result["feature_family"] == "hand_market_features_plus_residual_z"
         for result in regression_results
     )
     assert any(
@@ -379,6 +802,22 @@ def test_probe_targets_stay_separate_and_probes_are_walk_forward(tmp_path: Path)
     )
     assert classification_results
     assert all("roc_auc" in result for result in classification_results)
+    required_incremental_metrics = {
+        "hand_only_rmse",
+        "hand_plus_z_rmse",
+        "delta_rmse",
+        "rmse_ratio_vs_hand",
+        "hand_only_mae",
+        "hand_plus_z_mae",
+        "delta_mae",
+        "hand_only_r2",
+        "hand_plus_z_r2",
+    }
+    assert all(
+        required_incremental_metrics.issubset(comparison)
+        and comparison["score_space"] == "original"
+        for comparison in report["incremental_hand_plus_z_comparisons"]
+    )
 
 
 def test_probes_reject_mismatched_source_database_hashes(tmp_path: Path) -> None:

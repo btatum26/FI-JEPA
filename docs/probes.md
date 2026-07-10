@@ -17,13 +17,14 @@ The workflow uses four immutable artifact types:
 
 ## Representation Source
 
-`evaluate-fi-jepa` uses `FIJepaModel.encode_pooled_state()`:
+`evaluate-fi-jepa` uses `FIJepaModel.encode_pooled_state()` as the canonical
+pooled contract and exports its two source components separately:
 
 1. Encode the complete unmasked context-valid patch sequence.
 2. Require the final endpoint patch to be valid.
 3. Concatenate the masked temporal mean and endpoint encoder states.
-4. Fit PCA only on train pooled states.
-5. Apply the train-fit PCA transform to validation states.
+4. Fit each requested PCA only on its training source states.
+5. Apply the fitted PCA unchanged to validation states.
 
 ## Export Embeddings
 
@@ -46,6 +47,12 @@ diagnostics.json
 pca_exporter.npz
 embeddings.parquet
 validation_k_view_embeddings.parquet
+embeddings_mean_pca_16.parquet
+embeddings_endpoint_pca_16.parquet
+embeddings_pooled_pca_16.parquet
+embeddings_pooled_pca_32.parquet
+embeddings_pooled_pca_64.parquet
+embeddings_pooled_raw_256.parquet
 ```
 
 `embeddings.parquet` contains one all-valid representation row per date. It
@@ -85,7 +92,8 @@ baseline feature columns, and market proxy symbol used for trailing features.
 ```bash
 uv run build-probe-dataset \
   --embeddings runs/evaluation/<evaluation_artifact> \
-  --targets data/probe_targets/market_data_targets
+  --targets data/probe_targets/market_data_targets \
+  --representation-variant pooled_pca_32
 ```
 
 The builder:
@@ -114,8 +122,22 @@ embedding artifacts.
 
 ```bash
 uv run run-fi-jepa-probes \
-  --probe-dataset data/probe_targets/<evaluation_artifact>_probe_dataset
+  --embeddings runs/evaluation/<evaluation_artifact> \
+  --targets data/probe_targets/market_data_targets \
+  --representation-variant pooled_pca_32
 ```
+
+One run evaluates one explicit representation variant. A reusable probe
+dataset records its selected variant and can be passed with `--probe-dataset`
+without selecting it again.
+
+On-demand evaluation also records the compact architecture checks in
+`diagnostics.json`: fixed asset views at 32, 128, and 256 assets against the
+all-valid view, plus `all_streams`, `without_assets`, `without_market`, and
+`without_macro`. Each comparison includes cosine similarity, relative L2
+distance, and effective rank. Only all-valid and fixed-k 128 are retained as
+the default asset-count probe variants; the other asset counts remain distance
+diagnostics unless those results justify additional probe runs.
 
 For each named validation window and target, the probe runner:
 
@@ -146,7 +168,15 @@ runs/probes/<timestamp>_<run_id>/
     probe_dataset.parquet
     predictions.parquet
     report.json
+    summary.md
 ```
+
+`summary.md` is the human-facing review surface. It ranks original-unit
+incremental regression results against hand features, summarizes classification
+AUC and Brier ratios, includes per-window representation diagnostics when the
+embedding artifact provides them, and surfaces boundary, invalid-prediction,
+sign-reversal, oracle-only, and missing-window warnings. Full report and
+prediction artifacts remain authoritative for detailed analysis.
 
 `predictions.parquet` is long-form with one row per date, target or regime
 label, validation window, and predictor. It records `task_type`, `model_name`,
@@ -217,9 +247,6 @@ Future targets are joined only into this analysis artifact.
 - Regression heads are still simple linear heads; no neural probes are included.
 - Classification probes are binary regime labels, not multinomial quantile
   buckets yet.
-- Raw pooled-state representation variants are not included yet. The current
-  reusable probe dataset contains exported `z_*` coordinates only, so raw
-  pooled-state variants require an evaluation export contract change.
 - Probe results measure representation association, not tradability.
 - Good future-volatility probes can still indicate a volatility-dominated
   representation; residualized comparisons are the check for this.

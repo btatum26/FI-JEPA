@@ -26,6 +26,8 @@ from fi_jepa.tokenizer import (
     pack_masked_sequence,
 )
 
+INPUT_ABLATION_MODES = ("all_streams", "without_assets", "without_market", "without_macro")
+
 # ============================================================================
 # CHECKPOINT COMPATIBILITY
 # ============================================================================
@@ -279,6 +281,7 @@ class FIJepaModel(nn.Module):
         tensors: dict[str, torch.Tensor],
         *,
         use_target_branch: bool = False,
+        input_mode: str = "all_streams",
     ) -> torch.Tensor:
         """Create one online or EMA target token per temporal patch.
 
@@ -290,6 +293,9 @@ class FIJepaModel(nn.Module):
         Returns:
             Fused patch tokens shaped ``[B, P, D]``.
         """
+        if input_mode not in INPUT_ABLATION_MODES:
+            raise ValueError(f"Unknown input ablation mode: {input_mode!r}.")
+
         asset_tokenizer = (
             self.target_asset_tokenizer if use_target_branch else self.asset_tokenizer
         )
@@ -330,6 +336,14 @@ class FIJepaModel(nn.Module):
         macro_tokens = macro_tokenizer(
             tensors["macro_patches"], macro_features, macro_days
         )  # [B, P, D_macro].
+
+        # Preserve the fusion input shape while neutralizing only the requested stream.
+        if input_mode == "without_assets":
+            panel_tokens = torch.zeros_like(panel_tokens)  # [B, P, D_asset].
+        elif input_mode == "without_market":
+            market_tokens = torch.zeros_like(market_tokens)  # [B, P, D_market].
+        elif input_mode == "without_macro":
+            macro_tokens = torch.zeros_like(macro_tokens)  # [B, P, D_macro].
 
         # [B, P, D_asset + D_market + D_macro] -> [B, P, D].
         combined_tokens = torch.cat((panel_tokens, market_tokens, macro_tokens), dim=-1)
@@ -408,16 +422,21 @@ class FIJepaModel(nn.Module):
             fused_tokens=fused_tokens,
         )
 
-    def encode_pooled_state(self, batch: dict[str, object]) -> torch.Tensor:
-        """Return the learned encoder state used by all representation evaluation.
+    def encode_state_components(
+        self,
+        batch: dict[str, object],
+        *,
+        input_mode: str = "all_streams",
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the temporal-mean and endpoint encoder states.
 
         The full unmasked context-valid patch sequence is encoded, then a
-        masked temporal mean is concatenated with the final patch at sample
-        endpoint ``t``. Embedding exports require that endpoint patch to be
-        context-valid rather than silently substituting an earlier patch.
+        masked temporal mean and the final patch at sample endpoint ``t`` are
+        returned separately. Embedding exports require that endpoint patch to
+        be context-valid rather than silently substituting an earlier patch.
         """
         tensors = self._validate_batch(batch, require_jepa_targets=False)
-        fused_tokens = self._tokenize_and_fuse(tensors)  # [B, P, D].
+        fused_tokens = self._tokenize_and_fuse(tensors, input_mode=input_mode)  # [B, P, D].
         positioned_tokens = fused_tokens + self.patch_position_embedding.unsqueeze(0)  # [B, P, D].
         patch_context = tensors["patch_context_mask"]
         if not patch_context[:, -1].all():
@@ -428,6 +447,15 @@ class FIJepaModel(nn.Module):
 
         mean_state = masked_mean(full_encoded, patch_context, dimension=1)  # [B, D].
         endpoint_state = full_encoded[:, -1]  # [B, D].
+        return mean_state, endpoint_state
+
+    def encode_pooled_state(
+        self, batch: dict[str, object], *, input_mode: str = "all_streams"
+    ) -> torch.Tensor:
+        """Return the canonical pooled state: temporal mean concatenated with endpoint."""
+        mean_state, endpoint_state = self.encode_state_components(
+            batch, input_mode=input_mode
+        )  # Each [B, D].
         return torch.cat((mean_state, endpoint_state), dim=-1)  # [B, 2D].
 
     @torch.no_grad()

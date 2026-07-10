@@ -17,6 +17,7 @@ from fi_jepa.probes.artifacts import (
     publish_artifact,
 )
 from fi_jepa.probes.dataset import assemble_probe_dataset, build_probe_dataset, load_probe_dataset
+from fi_jepa.probes.summary import build_summary_markdown
 from fi_jepa.probes.targets import export_probe_targets
 from fi_jepa.probes.target_transforms import (
     TARGET_TRANSFORM_EPSILON,
@@ -25,17 +26,23 @@ from fi_jepa.probes.target_transforms import (
     transform_target_values,
 )
 
-DEFAULT_RIDGE_ALPHAS = (0.0001, 0.001, 0.01, 0.1, 1.0, 10.0, 100.0, 1000.0, 10000.0)
+DEFAULT_RIDGE_ALPHAS = (0.0001, 0.001, 0.01, 0.1, 1.0, 10.0, 100.0)
+DEFAULT_HUBER_ALPHAS = (0.0001, 0.001, 0.01, 0.1, 1.0, 10.0)
+DEFAULT_ELASTIC_NET_ALPHAS = (0.0001, 0.001, 0.01, 0.1, 1.0)
+DEFAULT_ELASTIC_NET_L1_RATIOS = (0.1, 0.5, 0.9)
+DEFAULT_LOGISTIC_ALPHAS = (0.0001, 0.001, 0.01, 0.1, 1.0, 10.0)
 TRAIN_MEAN_BASELINE = "train_mean"
 TRAILING_TARGET_PROXY_BASELINE = "trailing_target_proxy"
 Z_ONLY_FAMILY = "z_only"
 HAND_FEATURE_FAMILY = "hand_market_features"
 HAND_PCA_FAMILY = "hand_market_pca"
 HAND_PLUS_Z_FAMILY = "hand_market_features_plus_z"
-TARGET_RESIDUALIZED_Z_FAMILY = "target_residualized_z_only"
+HAND_PLUS_RESIDUAL_Z_FAMILY = "hand_market_features_plus_residual_z"
 FEATURE_RESIDUALIZED_Z_FAMILY = "feature_residualized_z_only"
 REGRESSION_HEADS = ("ridge", "huber", "elastic_net")
 CLASSIFICATION_QUANTILE = 0.8
+DEFAULT_BOOTSTRAP_SAMPLES = 500
+DEFAULT_BOOTSTRAP_SEED = 1729
 
 
 # ============================================================================
@@ -82,11 +89,12 @@ def _ridge_predict(
     y_mean = float(train_y.mean())
     centered_y = train_y - y_mean
 
-    gram = standardized_train.T @ standardized_train
+    n_samples = max(len(centered_y), 1)
+    gram = standardized_train.T @ standardized_train / n_samples
 
     coefficients = np.linalg.solve(
         gram + alpha * np.eye(gram.shape[0], dtype=np.float64),
-        standardized_train.T @ centered_y,
+        standardized_train.T @ centered_y / n_samples,
     )
     return standardized_validation @ coefficients + y_mean, coefficients
 
@@ -115,9 +123,10 @@ def _huber_predict(
         large = abs_residual > delta
         weights[large] = delta / np.maximum(abs_residual[large], 1.0e-12)
         weighted_x = standardized_train * weights[:, None]
+        n_samples = max(len(centered_y), 1)
         coefficients = np.linalg.solve(
-            standardized_train.T @ weighted_x + alpha * np.eye(standardized_train.shape[1]),
-            weighted_x.T @ centered_y,
+            standardized_train.T @ weighted_x / n_samples + alpha * np.eye(standardized_train.shape[1]),
+            weighted_x.T @ centered_y / n_samples,
         )
     return standardized_validation @ coefficients + y_mean, coefficients
 
@@ -212,6 +221,80 @@ def _ridge_residualize(
     return np.column_stack(train_residuals), np.column_stack(validation_residuals)
 
 
+def _incremental_residual_predictions(
+    model_name: str,
+    hand_train_x: np.ndarray,
+    z_train_x: np.ndarray,
+    train_y: np.ndarray,
+    hand_validation_x: np.ndarray,
+    z_validation_x: np.ndarray,
+    *,
+    hand_alpha: float,
+    residual_alpha: float,
+    hand_l1_ratio: float | None = None,
+    residual_l1_ratio: float | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Fit the outer-train hand model and train-residual z model without validation labels.
+
+    Returns the hand-only validation prediction, predicted validation residual,
+    and their reconstructed sum in the model's target space.
+    """
+    hand_train_prediction, _ = _predict_regression_head(
+        model_name,
+        hand_train_x,
+        train_y,
+        hand_train_x,
+        alpha=hand_alpha,
+        l1_ratio=hand_l1_ratio,
+    )
+    hand_validation_prediction, _ = _predict_regression_head(
+        model_name,
+        hand_train_x,
+        train_y,
+        hand_validation_x,
+        alpha=hand_alpha,
+        l1_ratio=hand_l1_ratio,
+    )
+    training_residual = train_y - hand_train_prediction
+    residual_validation_prediction, _ = _predict_regression_head(
+        model_name,
+        z_train_x,
+        training_residual,
+        z_validation_x,
+        alpha=residual_alpha,
+        l1_ratio=residual_l1_ratio,
+    )
+    return (
+        hand_validation_prediction,
+        residual_validation_prediction,
+        hand_validation_prediction + residual_validation_prediction,
+    )
+
+
+def _incremental_comparison_metrics(
+    actual: np.ndarray,
+    hand_prediction: np.ndarray,
+    hand_plus_z_prediction: np.ndarray,
+) -> dict[str, float]:
+    """Compare matched hand-only and incremental predictions in original target units."""
+    hand_metrics = _regression_metrics(actual, hand_prediction)
+    incremental_metrics = _regression_metrics(actual, hand_plus_z_prediction)
+    hand_rmse = float(hand_metrics["rmse"])
+    return {
+        "hand_only_rmse": hand_rmse,
+        "hand_plus_z_rmse": float(incremental_metrics["rmse"]),
+        "delta_rmse": float(incremental_metrics["rmse"]) - hand_rmse,
+        "rmse_ratio_vs_hand": (
+            float(incremental_metrics["rmse"]) / hand_rmse if hand_rmse > 0.0 else 0.0
+        ),
+        "hand_only_mae": float(hand_metrics["mae"]),
+        "hand_plus_z_mae": float(incremental_metrics["mae"]),
+        "delta_mae": float(incremental_metrics["mae"]) - float(hand_metrics["mae"]),
+        "hand_only_r2": float(hand_metrics["r2"]),
+        "hand_plus_z_r2": float(incremental_metrics["r2"]),
+    }
+
+
 def _predict_regression_head(
     model_name: str,
     train_x: np.ndarray,
@@ -219,6 +302,7 @@ def _predict_regression_head(
     validation_x: np.ndarray,
     *,
     alpha: float,
+    l1_ratio: float | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Dispatch one simple regression head without adding an external ML dependency."""
     if model_name == "ridge":
@@ -226,17 +310,19 @@ def _predict_regression_head(
     if model_name == "huber":
         return _huber_predict(train_x, train_y, validation_x, alpha=alpha)
     if model_name == "elastic_net":
-        return _elastic_net_predict(train_x, train_y, validation_x, alpha=alpha)
+        if l1_ratio is None:
+            raise ValueError("Elastic Net requires l1_ratio.")
+        return _elastic_net_predict(train_x, train_y, validation_x, alpha=alpha, l1_ratio=l1_ratio)
     raise ValueError(f"Unknown regression head: {model_name}")
 
 
 def _normalise_alpha_grid(alphas: tuple[float, ...] | list[float]) -> tuple[float, ...]:
-    """Validate and de-duplicate a ridge alpha grid while preserving sort order."""
+    """Validate and de-duplicate a positive regularization grid."""
     unique = tuple(sorted({float(alpha) for alpha in alphas}))
     if not unique:
-        raise ValueError("At least one ridge alpha is required.")
+        raise ValueError("At least one alpha is required.")
     if any(alpha <= 0.0 for alpha in unique):
-        raise ValueError("All ridge alphas must be positive.")
+        raise ValueError("All alphas must be positive.")
     return unique
 
 
@@ -247,53 +333,151 @@ def _fallback_alpha(alpha_grid: tuple[float, ...]) -> float:
     return alpha_grid[len(alpha_grid) // 2]
 
 
-def _select_ridge_alpha(
+def _purged_training_mask(
+    train_dates: np.ndarray,
+    *,
+    validation_start: pd.Timestamp,
+    horizon: int,
+    calendar_dates: np.ndarray,
+) -> np.ndarray:
+    """Keep rows whose h-date future label interval ends before validation starts."""
+    dates = pd.DatetimeIndex(pd.to_datetime(train_dates))
+    calendar = pd.DatetimeIndex(pd.to_datetime(calendar_dates)).sort_values().unique()
+    calendar_positions = {pd.Timestamp(date): index for index, date in enumerate(calendar)}
+    validation_position = calendar_positions[pd.Timestamp(validation_start)]
+    train_positions = np.asarray([calendar_positions[pd.Timestamp(date)] for date in dates])
+    return train_positions + horizon < validation_position
+
+
+def _expanding_time_folds(
+    train_dates: np.ndarray,
+    *,
+    horizon: int,
+    calendar_dates: np.ndarray,
+) -> list[tuple[np.ndarray, np.ndarray, dict[str, object]]]:
+    """Build exactly three expanding chronological folds with target-horizon purging.
+
+    The available training dates are divided into four contiguous blocks. Each fold
+    validates on the next block and trains on the preceding prefix, after excluding
+    rows whose h-date future target interval reaches the validation block.
+    """
+    dates = pd.DatetimeIndex(pd.to_datetime(train_dates))
+    unique_dates = dates.sort_values().unique()
+    calendar = pd.DatetimeIndex(pd.to_datetime(calendar_dates)).sort_values().unique()
+    calendar_positions = {pd.Timestamp(date): index for index, date in enumerate(calendar)}
+    date_positions = np.asarray([calendar_positions[pd.Timestamp(date)] for date in unique_dates])
+    # Leave enough initial history that even the first purged fold retains observations.
+    eligible_starts = np.flatnonzero(date_positions > date_positions[0] + horizon + 19)
+    if not len(eligible_starts):
+        return []
+    first_validation_index = int(eligible_starts[0])
+    validation_blocks = [block for block in np.array_split(unique_dates[first_validation_index:], 3) if len(block)]
+    if len(validation_blocks) != 3:
+        return []
+    folds: list[tuple[np.ndarray, np.ndarray, dict[str, object]]] = []
+    for fold_index in range(3):
+        validation_dates = pd.DatetimeIndex(validation_blocks[fold_index])
+        validation_start = pd.Timestamp(validation_dates[0])
+        validation_mask = dates.isin(validation_dates)
+        # A target observed at position t covers the next h dates, so require t + h < validation start.
+        train_mask = _purged_training_mask(
+            train_dates,
+            validation_start=validation_start,
+            horizon=horizon,
+            calendar_dates=calendar_dates,
+        )
+        if train_mask.sum() < 2 or validation_mask.sum() < 1:
+            return []
+        folds.append(
+            (
+                np.asarray(train_mask),
+                np.asarray(validation_mask),
+                {
+                    "fold": fold_index + 1,
+                    "inner_train_count": int(train_mask.sum()),
+                    "inner_validation_count": int(validation_mask.sum()),
+                    "inner_train_end": str(pd.Timestamp(dates[train_mask].max()).date()),
+                    "inner_validation_start": str(validation_start.date()),
+                    "inner_validation_end": str(pd.Timestamp(validation_dates[-1]).date()),
+                    "purge_horizon_dates": horizon,
+                },
+            )
+        )
+    return folds
+
+
+def _select_model_parameters(
+    model_name: str,
     train_x: np.ndarray,
     train_y: np.ndarray,
     train_dates: np.ndarray,
     alpha_grid: tuple[float, ...],
-) -> tuple[float, list[dict[str, object]]]:
-    """Choose ridge alpha with a tail inner-validation split inside the outer train period."""
+    *,
+    horizon: int,
+    calendar_dates: np.ndarray,
+    l1_ratios: tuple[float, ...] = (),
+) -> dict[str, object]:
+    """Select one head's own parameters by mean loss over three purged time folds."""
     fallback = _fallback_alpha(alpha_grid)
-    dates = pd.to_datetime(train_dates)
-    unique_dates = pd.Index(dates).sort_values().unique()
-    if len(unique_dates) < 4 or len(train_y) < 6:
-        return fallback, []
+    fallback_ratio = l1_ratios[len(l1_ratios) // 2] if l1_ratios else None
+    folds = _expanding_time_folds(train_dates, horizon=horizon, calendar_dates=calendar_dates)
+    if not folds:
+        return {
+            "selection_status": "insufficient_history_fallback",
+            "selected_alpha": fallback,
+            **({"selected_l1_ratio": fallback_ratio} if model_name == "elastic_net" else {}),
+            "inner_validation_score": None,
+            "inner_fold_scores": [],
+            "candidate_diagnostics": [],
+        }
 
-    split_index = min(max(int(len(unique_dates) * 0.8), 1), len(unique_dates) - 1)
-    validation_start = unique_dates[split_index]
-    inner_train = dates < validation_start
-    inner_validation = dates >= validation_start
-    if inner_train.sum() < 2 or inner_validation.sum() < 1:
-        return fallback, []
-
+    candidates = [(candidate, None) for candidate in alpha_grid]
+    if model_name == "elastic_net":
+        candidates = [(candidate, ratio) for candidate in alpha_grid for ratio in l1_ratios]
     diagnostics: list[dict[str, object]] = []
-    best_alpha = fallback
-    best_rmse = np.inf
-    for candidate_alpha in alpha_grid:
-        predicted, _ = _ridge_predict(
-            train_x[inner_train],
-            train_y[inner_train],
-            train_x[inner_validation],
-            alpha=candidate_alpha,
-        )
-        metrics = _regression_metrics(train_y[inner_validation], predicted)
-        rmse = float(metrics["rmse"])
+    best = (fallback, fallback_ratio)
+    best_score = np.inf
+    best_fold_scores: list[dict[str, object]] = []
+    for candidate_alpha, candidate_ratio in candidates:
+        fold_scores: list[dict[str, object]] = []
+        for train_mask, validation_mask, fold_metadata in folds:
+            if model_name == "logistic":
+                predicted, _ = _logistic_predict(
+                    train_x[train_mask], train_y[train_mask], train_x[validation_mask], alpha=candidate_alpha
+                )
+                score = float(_classification_metrics(train_y[validation_mask], predicted)["log_loss"])
+            else:
+                predicted, _ = _predict_regression_head(
+                    model_name,
+                    train_x[train_mask],
+                    train_y[train_mask],
+                    train_x[validation_mask],
+                    alpha=candidate_alpha,
+                    l1_ratio=candidate_ratio,
+                )
+                score = float(_regression_metrics(train_y[validation_mask], predicted)["rmse"])
+            fold_scores.append({**fold_metadata, "score": score})
+        mean_score = float(np.mean([float(fold["score"]) for fold in fold_scores]))
         diagnostics.append(
             {
                 "alpha": candidate_alpha,
-                "inner_train_count": int(inner_train.sum()),
-                "inner_validation_count": int(inner_validation.sum()),
-                "inner_validation_start": str(pd.Timestamp(validation_start).date()),
-                "inner_validation_rmse": rmse,
-                "inner_validation_r2": float(metrics["r2"]),
-                "inner_validation_pearson_correlation": float(metrics["pearson_correlation"]),
+                **({"l1_ratio": candidate_ratio} if candidate_ratio is not None else {}),
+                "mean_validation_score": mean_score,
+                "fold_scores": fold_scores,
             }
         )
-        if rmse < best_rmse:
-            best_rmse = rmse
-            best_alpha = candidate_alpha
-    return best_alpha, diagnostics
+        if mean_score < best_score:
+            best_score = mean_score
+            best = (candidate_alpha, candidate_ratio)
+            best_fold_scores = fold_scores
+    return {
+        "selection_status": "selected",
+        "selected_alpha": best[0],
+        **({"selected_l1_ratio": best[1]} if model_name == "elastic_net" else {}),
+        "inner_validation_score": best_score if np.isfinite(best_score) else None,
+        "inner_fold_scores": best_fold_scores,
+        "candidate_diagnostics": diagnostics,
+    }
 
 
 def _correlation(actual: np.ndarray, predicted: np.ndarray) -> float:
@@ -393,6 +577,136 @@ def _classification_metrics(actual: np.ndarray, probability: np.ndarray) -> dict
     }
 
 
+def _moving_block_bootstrap_indices(
+    observation_count: int,
+    block_length: int,
+    sample_count: int,
+    *,
+    seed: int,
+) -> np.ndarray:
+    """Draw fixed-seed moving-block samples while preserving order inside every block."""
+    if observation_count <= 0 or block_length <= 0 or sample_count <= 0:
+        raise ValueError("Bootstrap observation, block, and sample counts must be positive.")
+    effective_block_length = min(block_length, observation_count)
+    blocks_per_sample = int(np.ceil(observation_count / effective_block_length))
+    maximum_start = observation_count - effective_block_length
+    rng = np.random.default_rng(seed)
+    samples = np.empty((sample_count, observation_count), dtype=np.int64)
+    offsets = np.arange(effective_block_length, dtype=np.int64)
+    for sample_index in range(sample_count):
+        starts = rng.integers(0, maximum_start + 1, size=blocks_per_sample)
+        samples[sample_index] = np.concatenate([start + offsets for start in starts])[:observation_count]
+    return samples
+
+
+def _paired_moving_block_bootstrap(
+    actual: np.ndarray,
+    predicted: np.ndarray,
+    hand_prediction: np.ndarray,
+    *,
+    task_type: str,
+    block_length: int,
+    sample_count: int = DEFAULT_BOOTSTRAP_SAMPLES,
+    seed: int = DEFAULT_BOOTSTRAP_SEED,
+    window_ids: np.ndarray | None = None,
+) -> dict[str, object]:
+    """Bootstrap aligned candidate/hand predictions, without allowing blocks across windows."""
+    actual_values = np.asarray(actual, dtype=np.float64)
+    predicted_values = np.asarray(predicted, dtype=np.float64)
+    hand_values = np.asarray(hand_prediction, dtype=np.float64)
+    if not (actual_values.ndim == predicted_values.ndim == hand_values.ndim == 1):
+        raise ValueError("Paired bootstrap inputs must be one-dimensional.")
+    if not (len(actual_values) == len(predicted_values) == len(hand_values)):
+        raise ValueError("Paired bootstrap inputs must have identical aligned lengths.")
+    if window_ids is None:
+        windows = np.zeros(len(actual_values), dtype=np.int64)
+    else:
+        windows = np.asarray(window_ids)
+        if windows.ndim != 1 or len(windows) != len(actual_values):
+            raise ValueError("Bootstrap window IDs must align with prediction rows.")
+    finite = np.isfinite(actual_values) & np.isfinite(predicted_values) & np.isfinite(hand_values)
+    actual_values = actual_values[finite]
+    predicted_values = predicted_values[finite]
+    hand_values = hand_values[finite]
+    windows = windows[finite]
+    if not len(actual_values):
+        raise ValueError("Paired bootstrap requires at least one finite aligned row.")
+
+    # Resample every validation window independently so a moving block never
+    # crosses an outer-window boundary in the pooled stability interval.
+    segment_positions = [np.flatnonzero(windows == window) for window in pd.unique(windows)]
+    segment_samples = [
+        _moving_block_bootstrap_indices(
+            len(positions), block_length, sample_count, seed=seed + segment_index
+        )
+        for segment_index, positions in enumerate(segment_positions)
+    ]
+    sampled_positions = [
+        np.concatenate(
+            [positions[indices[sample_index]] for positions, indices in zip(segment_positions, segment_samples)]
+        )
+        for sample_index in range(sample_count)
+    ]
+
+    if task_type == "regression":
+        candidate_rmse = float(np.sqrt(np.mean(np.square(actual_values - predicted_values))))
+        hand_rmse = float(np.sqrt(np.mean(np.square(actual_values - hand_values))))
+        point_estimates = {
+            "rmse_difference_vs_hand": candidate_rmse - hand_rmse,
+            "pearson_correlation": _correlation(actual_values, predicted_values),
+        }
+        draws = {
+            "rmse_difference_vs_hand": np.asarray(
+                [
+                    np.sqrt(np.mean(np.square(actual_values[index] - predicted_values[index])))
+                    - np.sqrt(np.mean(np.square(actual_values[index] - hand_values[index])))
+                    for index in sampled_positions
+                ]
+            ),
+            "pearson_correlation": np.asarray(
+                [_correlation(actual_values[index], predicted_values[index]) for index in sampled_positions]
+            ),
+        }
+    elif task_type == "classification":
+        clipped_prediction = np.clip(predicted_values, 1.0e-12, 1.0 - 1.0e-12)
+        clipped_hand = np.clip(hand_values, 1.0e-12, 1.0 - 1.0e-12)
+        point_estimates = {
+            "roc_auc": float(_roc_auc(actual_values.astype(np.int64), clipped_prediction)),
+            "brier_score_difference_vs_hand": float(
+                np.mean(np.square(clipped_prediction - actual_values))
+                - np.mean(np.square(clipped_hand - actual_values))
+            ),
+        }
+        draws = {
+            "roc_auc": np.asarray(
+                [
+                    _roc_auc(actual_values[index].astype(np.int64), clipped_prediction[index])
+                    for index in sampled_positions
+                ]
+            ),
+            "brier_score_difference_vs_hand": np.asarray(
+                [
+                    np.mean(np.square(clipped_prediction[index] - actual_values[index]))
+                    - np.mean(np.square(clipped_hand[index] - actual_values[index]))
+                    for index in sampled_positions
+                ]
+            ),
+        }
+    else:
+        raise ValueError(f"Unsupported bootstrap task type: {task_type!r}")
+
+    return {
+        "sample_count": sample_count,
+        "block_length": block_length,
+        "seed": seed,
+        "point_estimates": point_estimates,
+        "confidence_intervals_95": {
+            name: [float(np.percentile(values, 2.5)), float(np.percentile(values, 97.5))]
+            for name, values in draws.items()
+        },
+    }
+
+
 def _logistic_predict(
     train_x: np.ndarray,
     train_y: np.ndarray,
@@ -407,14 +721,13 @@ def _logistic_predict(
     coefficients = np.zeros(standardized_train.shape[1], dtype=np.float64)
     intercept = float(np.log(np.clip(train_y.mean(), 1.0e-6, 1.0 - 1.0e-6) / np.clip(1.0 - train_y.mean(), 1.0e-6, 1.0)))
     learning_rate = 0.2
-    penalty = alpha / max(len(train_y), 1)
     for _ in range(400):
         logits = np.clip(intercept + standardized_train @ coefficients, -35.0, 35.0)
         probability = 1.0 / (1.0 + np.exp(-logits))
         error = probability - train_y
         intercept -= learning_rate * float(error.mean())
         coefficients -= learning_rate * (
-            standardized_train.T @ error / len(train_y) + penalty * coefficients
+            standardized_train.T @ error / len(train_y) + alpha * coefficients
         )
     validation_logits = np.clip(intercept + standardized_validation @ coefficients, -35.0, 35.0)
     return 1.0 / (1.0 + np.exp(-validation_logits)), coefficients
@@ -439,10 +752,18 @@ def _target_constraint(target_name: str) -> tuple[float | None, float | None, st
 
 
 def _invalid_predictions(
-    target_name: str, predicted: np.ndarray
+    target_name: str,
+    predicted: np.ndarray,
+    *,
+    score_space: str,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Flag non-finite and physically invalid predictions for one target family."""
-    lower, upper, constraint_reason = _target_constraint(target_name)
+    """Flag non-finite predictions and enforce physical bounds only in supported spaces."""
+    if score_space == "original":
+        lower, upper, constraint_reason = _target_constraint(target_name)
+    elif score_space == "probability":
+        lower, upper, constraint_reason = 0.0, 1.0, "probability_outside_zero_one"
+    else:
+        lower, upper, constraint_reason = None, None, None
     invalid = ~np.isfinite(predicted)
     reasons = np.full(len(predicted), "", dtype=object)
     reasons[invalid] = "non_finite_prediction"
@@ -458,32 +779,17 @@ def _invalid_predictions(
     return invalid, reasons
 
 
-def _validation_recalibration(actual: np.ndarray, predicted: np.ndarray) -> dict[str, object]:
-    """Fit diagnostic-only validation labels on predictions to expose scale/intercept failure."""
-    finite = np.isfinite(actual) & np.isfinite(predicted)
-    finite_actual = actual[finite]
-    finite_predicted = predicted[finite]
-    design = np.column_stack([np.ones(len(finite_predicted)), finite_predicted])
-    intercept, slope = np.linalg.lstsq(design, finite_actual, rcond=None)[0]
-    recalibrated = intercept + slope * finite_predicted
-    return {
-        "uses_validation_labels": True,
-        "intercept": float(intercept),
-        "slope": float(slope),
-        "metrics": _regression_metrics(finite_actual, recalibrated),
-    }
-
-
 def _score_predictions(
     target_name: str,
     actual: np.ndarray,
     predicted: np.ndarray,
     *,
+    score_space: str,
     baseline_metrics: dict[str, float | int] | None,
 ) -> dict[str, object]:
-    """Score one predictor and attach invalidity, baseline-ratio, and recalibration diagnostics."""
+    """Score one predictor and attach invalidity and baseline-ratio diagnostics."""
     metrics: dict[str, object] = _regression_metrics(actual, predicted)
-    invalid, _ = _invalid_predictions(target_name, predicted)
+    invalid, _ = _invalid_predictions(target_name, predicted, score_space=score_space)
     metrics["invalid_prediction_count"] = int(invalid.sum())
     metrics["invalid_prediction_rate"] = float(invalid.mean())
     if baseline_metrics is None:
@@ -498,7 +804,6 @@ def _score_predictions(
         metrics["mae_ratio_vs_baseline"] = (
             float(metrics["mae"]) / baseline_mae if baseline_mae > 0.0 else 0.0
         )
-    metrics["validation_recalibration"] = _validation_recalibration(actual, predicted)
     return metrics
 
 
@@ -631,6 +936,188 @@ def _classification_label_frame(
 # ============================================================================
 # FROZEN RIDGE PROBES
 # ============================================================================
+
+
+def _bootstrap_reliability_summary(
+    predictions: pd.DataFrame,
+    *,
+    representation_variant: str,
+    sample_count: int = DEFAULT_BOOTSTRAP_SAMPLES,
+    seed: int = DEFAULT_BOOTSTRAP_SEED,
+) -> tuple[list[dict[str, object]], list[dict[str, object]], int]:
+    """Build per-window paired CIs and cross-window stability for representation probes.
+
+    Every candidate is compared with the same model head trained on hand features.
+    Candidate and hand rows are joined one-to-one by date before any resampling.
+    Hand-only and hand-PCA rows are comparators, not evaluated representation
+    combinations, so they are excluded from the combination count.
+    """
+    model_rows = predictions.loc[
+        predictions["predictor_kind"].eq("model")
+        & ~predictions["feature_family"].isin({HAND_FEATURE_FAMILY, HAND_PCA_FAMILY})
+    ].copy()
+    per_window: list[dict[str, object]] = []
+    aligned_by_combination: dict[tuple[str, ...], list[pd.DataFrame]] = {}
+    group_columns = [
+        "validation_window_name",
+        "raw_target",
+        "target",
+        "task_type",
+        "score_space",
+        "model_name",
+        "feature_family",
+        "predictor_name",
+    ]
+    for keys, candidate in model_rows.groupby(group_columns, sort=True):
+        (
+            window_name,
+            raw_target,
+            target,
+            task_type,
+            score_space,
+            model_name,
+            feature_family,
+            predictor_name,
+        ) = (str(value) for value in keys)
+        hand_predictor_name = f"{model_name}__{HAND_FEATURE_FAMILY}"
+        hand = predictions.loc[
+            predictions["validation_window_name"].eq(window_name)
+            & predictions["target"].eq(target)
+            & predictions["task_type"].eq(task_type)
+            & predictions["score_space"].eq(score_space)
+            & predictions["predictor_name"].eq(hand_predictor_name),
+            ["date", "actual", "prediction"],
+        ]
+        if hand.empty:
+            continue
+        aligned = candidate[["date", "actual", "prediction"]].merge(
+            hand,
+            on="date",
+            how="inner",
+            suffixes=("_candidate", "_hand"),
+            validate="one_to_one",
+        ).sort_values("date")
+        if aligned.empty or not np.allclose(
+            aligned["actual_candidate"], aligned["actual_hand"], equal_nan=True
+        ):
+            raise ValueError(
+                f"Candidate and hand predictions are not target-aligned for {predictor_name!r}."
+            )
+        horizon = _target_horizon(raw_target)
+        if horizon is None:
+            raise ValueError(f"Bootstrap target has no parseable horizon: {raw_target!r}")
+        bootstrap = _paired_moving_block_bootstrap(
+            aligned["actual_candidate"].to_numpy(dtype=np.float64),
+            aligned["prediction_candidate"].to_numpy(dtype=np.float64),
+            aligned["prediction_hand"].to_numpy(dtype=np.float64),
+            task_type=task_type,
+            block_length=horizon,
+            sample_count=sample_count,
+            seed=seed,
+        )
+        identity = {
+            "validation_window_name": window_name,
+            "raw_target": raw_target,
+            "target": target,
+            "task_type": task_type,
+            "score_space": score_space,
+            "model_name": model_name,
+            "feature_family": feature_family,
+            "predictor_name": predictor_name,
+            "representation_variant": representation_variant,
+            "comparison_predictor": hand_predictor_name,
+            "aligned_row_count": int(len(aligned)),
+        }
+        per_window.append({**identity, **bootstrap})
+        combination_key = (
+            raw_target,
+            target,
+            task_type,
+            score_space,
+            model_name,
+            feature_family,
+            predictor_name,
+        )
+        aligned_by_combination.setdefault(combination_key, []).append(
+            aligned.assign(validation_window_name=window_name)
+        )
+
+    stability: list[dict[str, object]] = []
+    for combination_key, windows in sorted(aligned_by_combination.items()):
+        raw_target, target, task_type, score_space, model_name, feature_family, predictor_name = combination_key
+        pooled = pd.concat(windows, ignore_index=True).sort_values(
+            ["validation_window_name", "date"]
+        )
+        horizon = _target_horizon(raw_target)
+        if horizon is None:
+            continue
+        pooled_bootstrap = _paired_moving_block_bootstrap(
+            pooled["actual_candidate"].to_numpy(dtype=np.float64),
+            pooled["prediction_candidate"].to_numpy(dtype=np.float64),
+            pooled["prediction_hand"].to_numpy(dtype=np.float64),
+            task_type=task_type,
+            block_length=horizon,
+            sample_count=sample_count,
+            seed=seed,
+            window_ids=pooled["validation_window_name"].to_numpy(),
+        )
+        matching_windows = [
+            row
+            for row in per_window
+            if all(
+                row[name] == value
+                for name, value in {
+                    "raw_target": raw_target,
+                    "target": target,
+                    "task_type": task_type,
+                    "score_space": score_space,
+                    "model_name": model_name,
+                    "feature_family": feature_family,
+                    "predictor_name": predictor_name,
+                }.items()
+            )
+        ]
+        if task_type == "regression":
+            primary_metric = "rmse_difference_vs_hand"
+            correlation_signs = [
+                {
+                    "validation_window_name": str(row["validation_window_name"]),
+                    "sign": (
+                        "positive"
+                        if float(row["point_estimates"]["pearson_correlation"]) > 0.0
+                        else "negative"
+                        if float(row["point_estimates"]["pearson_correlation"]) < 0.0
+                        else "zero"
+                    ),
+                }
+                for row in matching_windows
+            ]
+        else:
+            primary_metric = "brier_score_difference_vs_hand"
+            correlation_signs = []
+        primary_values = [float(row["point_estimates"][primary_metric]) for row in matching_windows]
+        stability.append(
+            {
+                "raw_target": raw_target,
+                "target": target,
+                "task_type": task_type,
+                "score_space": score_space,
+                "model_name": model_name,
+                "feature_family": feature_family,
+                "predictor_name": predictor_name,
+                "representation_variant": representation_variant,
+                "comparison_predictor": f"{model_name}__{HAND_FEATURE_FAMILY}",
+                "window_count": len(matching_windows),
+                "correlation_signs": correlation_signs,
+                "windows_beating_hand": int(sum(value < 0.0 for value in primary_values)),
+                "primary_metric": primary_metric,
+                "worst_window_metric": float(max(primary_values)),
+                "median_metric": float(np.median(primary_values)),
+                "bootstrap_interval_95": pooled_bootstrap["confidence_intervals_95"][primary_metric],
+                "pooled_bootstrap": pooled_bootstrap,
+            }
+        )
+    return per_window, stability, len(stability)
 
 
 def _window_summaries(results: list[dict[str, object]]) -> list[dict[str, object]]:
@@ -887,7 +1374,11 @@ def _append_scored_result(
 ) -> dict[str, object]:
     """Score and store one predictor/result block."""
     metrics = _score_predictions(
-        score_target_name, actual, predicted, baseline_metrics=baseline_metrics
+        score_target_name,
+        actual,
+        predicted,
+        score_space=score_space,
+        baseline_metrics=baseline_metrics,
     )
     if inverse_clipped is None:
         inverse_clipped = np.zeros(len(predicted), dtype=bool)
@@ -906,7 +1397,9 @@ def _append_scored_result(
             **metrics,
         }
     )
-    invalid, invalid_reasons = _invalid_predictions(score_target_name, predicted)
+    invalid, invalid_reasons = _invalid_predictions(
+        score_target_name, predicted, score_space=score_space
+    )
     prediction_rows.append(
         pd.DataFrame(
             {
@@ -1022,14 +1515,24 @@ def run_frozen_probes(
     *,
     probe_dataset_artifact: Path | None = None,
     output_root: Path = Path("runs/probes"),
-    alpha: float | None = None,
-    alphas: tuple[float, ...] | list[float] = DEFAULT_RIDGE_ALPHAS,
+    ridge_alphas: tuple[float, ...] | list[float] = DEFAULT_RIDGE_ALPHAS,
+    huber_alphas: tuple[float, ...] | list[float] = DEFAULT_HUBER_ALPHAS,
+    elastic_net_alphas: tuple[float, ...] | list[float] = DEFAULT_ELASTIC_NET_ALPHAS,
+    elastic_net_l1_ratios: tuple[float, ...] | list[float] = DEFAULT_ELASTIC_NET_L1_RATIOS,
+    logistic_alphas: tuple[float, ...] | list[float] = DEFAULT_LOGISTIC_ALPHAS,
+    representation_variant: str | None = None,
 ) -> Path:
-    """Run leakage-safe walk-forward ridge probes from source or reusable dataset artifacts."""
-    alpha_grid = _normalise_alpha_grid(alphas)
-    if alpha is not None and alpha <= 0.0:
-        raise ValueError("Ridge alpha must be positive.")
-    alpha_selection = "fixed" if alpha is not None else "inner_walk_forward"
+    """Run frozen probes with model-specific, purged chronological parameter selection."""
+    model_alpha_grids = {
+        "ridge": _normalise_alpha_grid(ridge_alphas),
+        "huber": _normalise_alpha_grid(huber_alphas),
+        "elastic_net": _normalise_alpha_grid(elastic_net_alphas),
+        "logistic": _normalise_alpha_grid(logistic_alphas),
+    }
+    l1_ratios = tuple(sorted({float(value) for value in elastic_net_l1_ratios}))
+    if not l1_ratios or any(value <= 0.0 or value > 1.0 for value in l1_ratios):
+        raise ValueError("Elastic Net l1 ratios must be in (0, 1].")
+    alpha_selection = "three_fold_expanding_purged"
 
     if probe_dataset_artifact is not None:
         if embedding_artifact is not None or target_artifact is not None:
@@ -1041,28 +1544,56 @@ def run_frozen_probes(
         baseline_feature_columns = [str(name) for name in metadata.get("baseline_feature_columns", [])]
         embedding_source = metadata["embedding_artifact"]
         target_source = metadata["target_artifact"]
+        checkpoint_id = metadata["checkpoint_id"]
+        checkpoint_step = metadata["checkpoint_step"]
+        representation_source = metadata["representation_source"]
+        dataset_variant = str(metadata["representation_variant"])
+        if representation_variant is not None and representation_variant != dataset_variant:
+            raise ValueError(
+                f"Probe dataset contains {dataset_variant!r}, not requested variant {representation_variant!r}."
+            )
+        representation_variant = dataset_variant
+        resolved_representation_config = metadata["resolved_representation_config"]
     else:
         if embedding_artifact is None or target_artifact is None:
             raise ValueError("Embedding and target artifacts are both required.")
-        probe_dataset, metadata = assemble_probe_dataset(embedding_artifact, target_artifact)
+        probe_dataset, metadata = assemble_probe_dataset(
+            embedding_artifact, target_artifact, representation_variant=representation_variant
+        )
         source_database = metadata["source_database_sha256"]
         target_columns = [str(name) for name in metadata["target_columns"]]
         z_columns = [str(name) for name in metadata["z_columns"]]
         baseline_feature_columns = [str(name) for name in metadata.get("baseline_feature_columns", [])]
         embedding_source = str(embedding_artifact.resolve())
         target_source = str(target_artifact.resolve())
+        embedding_manifest = metadata["embedding_manifest"]
+        checkpoint_id = embedding_manifest["checkpoint_id"]
+        checkpoint_step = embedding_manifest["checkpoint_step"]
+        representation_source = metadata["representation_source"]
+        representation_variant = metadata["representation_variant"]
+        resolved_representation_config = embedding_manifest["resolved_representation_config"]
+
+    representation_diagnostics: dict[str, object] = {}
+    diagnostics_path = Path(embedding_source) / "diagnostics.json"
+    if diagnostics_path.is_file():
+        representation_report = json.loads(diagnostics_path.read_text(encoding="utf-8"))
+        representation_diagnostics = dict(
+            representation_report.get("validation_rank_diagnostics", {})
+        )
 
     target_specs = target_transform_specs(target_columns)
     transformed_target_names = [spec.target for spec in target_specs]
 
     validation = probe_dataset.loc[probe_dataset["split"].eq("validation")].copy()
     train = probe_dataset.loc[probe_dataset["split"].eq("train")].copy()
+    calendar_dates = probe_dataset["date"].sort_values().unique()
     windows = sorted(str(name) for name in validation["validation_window_name"].unique() if name)
 
     results: list[dict[str, object]] = []
     prediction_rows: list[pd.DataFrame] = []
     coefficients_by_fold: list[dict[str, object]] = []
-    alpha_selection_by_fold: list[dict[str, object]] = []
+    parameter_selection_by_fold: list[dict[str, object]] = []
+    incremental_comparisons: list[dict[str, object]] = []
     for window_name in windows:
         fold_validation = validation.loc[validation["validation_window_name"].eq(window_name)]
         fold_start = fold_validation["date"].min()
@@ -1072,9 +1603,20 @@ def run_frozen_probes(
 
         for spec in target_specs:
             available_column = f"target_available__{spec.raw_target}"
-            target_train = fold_train.loc[fold_train[available_column]]
             target_validation = fold_validation.loc[fold_validation[available_column]]
-            if target_train.empty or target_validation.empty:
+            if target_validation.empty:
+                continue
+            horizon = _target_horizon(spec.raw_target)
+            if horizon is None:
+                raise ValueError(f"Target has no parseable horizon for purging: {spec.raw_target}")
+            outer_purge_mask = _purged_training_mask(
+                fold_train["date"].to_numpy(),
+                validation_start=pd.Timestamp(fold_start),
+                horizon=horizon,
+                calendar_dates=calendar_dates,
+            )
+            target_train = fold_train.loc[fold_train[available_column] & outer_purge_mask]
+            if target_train.empty:
                 continue
 
             raw_train_y = target_train[spec.raw_target].to_numpy(dtype=np.float64)
@@ -1101,7 +1643,8 @@ def run_frozen_probes(
                 "raw_target": spec.raw_target,
                 "target": spec.target,
                 "target_transform": spec.transform,
-                "horizon_days": _target_horizon(spec.raw_target),
+                "horizon_days": horizon,
+                "outer_purge_horizon_dates": horizon,
                 "train_start": str(target_train["date"].min().date()),
                 "train_end": str(target_train["date"].max().date()),
                 "validation_start": str(target_validation["date"].min().date()),
@@ -1130,7 +1673,7 @@ def run_frozen_probes(
             if spec.transform == "raw":
                 score_blocks.append(
                     (
-                        "raw",
+                        "original",
                         spec.raw_target,
                         raw_actual,
                         transformed_baseline,
@@ -1149,7 +1692,7 @@ def run_frozen_probes(
                 )
                 score_blocks.append(
                     (
-                        "raw",
+                        "original",
                         spec.raw_target,
                         raw_actual,
                         raw_baseline,
@@ -1180,13 +1723,15 @@ def run_frozen_probes(
                     baseline_metrics=None,
                     inverse_clipped=(
                         baseline_inverse_clipped
-                        if score_space == "raw" and spec.transform != "raw"
+                        if score_space == "original" and spec.transform != "raw"
                         else baseline_clip_mask
                     ),
                 )
 
                 if transformed_proxy is not None and raw_proxy is not None:
-                    proxy_prediction = raw_proxy if score_space == "raw" else transformed_proxy
+                    proxy_prediction = (
+                        raw_proxy if score_space == "original" else transformed_proxy
+                    )
                     finite_proxy = np.where(np.isfinite(proxy_prediction), proxy_prediction, baseline)
                     _append_scored_result(
                         results=results,
@@ -1215,7 +1760,7 @@ def run_frozen_probes(
                 hand_validation_x = target_validation[baseline_feature_columns].to_numpy(dtype=np.float64)
                 z_train_x = target_train[z_columns].to_numpy(dtype=np.float64)
                 z_validation_x = target_validation[z_columns].to_numpy(dtype=np.float64)
-                residual_alpha = _fallback_alpha(alpha_grid)
+                residual_alpha = _fallback_alpha(model_alpha_grids["ridge"])
                 try:
                     residual_z_train_x, residual_z_validation_x = _ridge_residualize(
                         hand_train_x,
@@ -1234,144 +1779,222 @@ def run_frozen_probes(
                 except ValueError:
                     pass
 
-                residual_train_y, residual_actual = _ridge_residualize(
-                    hand_train_x,
-                    hand_validation_x,
-                    transformed_train_y,
-                    transformed_actual,
-                    alpha=residual_alpha,
-                )
-                target_residual_name = f"{spec.target}__target_residual"
-                target_residual_transform = f"{spec.transform}_target_residualized"
-                target_residual_baseline = np.full_like(residual_actual, residual_train_y.mean())
-                target_residual_common = {
-                    **common,
-                    "target": target_residual_name,
-                    "target_transform": target_residual_transform,
-                    "selected_alpha": None,
-                }
-                target_residual_baseline_metrics = _append_scored_result(
-                    results=results,
-                    prediction_rows=prediction_rows,
-                    common=target_residual_common,
-                    target_validation=target_validation,
-                    score_space="residual",
-                    score_target_name=target_residual_name,
-                    predictor_name=TRAIN_MEAN_BASELINE,
-                    predictor_kind="baseline",
-                    model_name=TRAIN_MEAN_BASELINE,
-                    feature_family="constant",
-                    actual=residual_actual,
-                    predicted=target_residual_baseline,
-                    baseline_metrics=None,
-                )
-                selected_alpha = float(alpha) if alpha is not None else None
-                alpha_diagnostics: list[dict[str, object]] = []
-                if selected_alpha is None:
-                    selected_alpha, alpha_diagnostics = _select_ridge_alpha(
-                        z_train_x, residual_train_y, train_dates, alpha_grid
-                    )
-                alpha_selection_by_fold.append(
-                    {
-                        "validation_window_name": window_name,
-                        "raw_target": spec.raw_target,
-                        "target": target_residual_name,
-                        "target_transform": target_residual_transform,
-                        "feature_family": TARGET_RESIDUALIZED_Z_FAMILY,
-                        "selected_alpha": selected_alpha,
-                        "selection_method": alpha_selection,
-                        "candidate_diagnostics": alpha_diagnostics,
-                    }
-                )
                 for model_name in REGRESSION_HEADS:
-                    residual_predicted, coefficients = _predict_regression_head(
+                    model_l1_ratios = l1_ratios if model_name == "elastic_net" else ()
+                    hand_selection = _select_model_parameters(
+                        model_name,
+                        hand_train_x,
+                        transformed_train_y,
+                        train_dates,
+                        model_alpha_grids[model_name],
+                        horizon=horizon,
+                        calendar_dates=calendar_dates,
+                        l1_ratios=model_l1_ratios,
+                    )
+                    hand_alpha = float(hand_selection["selected_alpha"])
+                    hand_l1_ratio = hand_selection.get("selected_l1_ratio")
+                    hand_train_prediction, _ = _predict_regression_head(
+                        model_name,
+                        hand_train_x,
+                        transformed_train_y,
+                        hand_train_x,
+                        alpha=hand_alpha,
+                        l1_ratio=float(hand_l1_ratio) if hand_l1_ratio is not None else None,
+                    )
+                    residual_train_y = transformed_train_y - hand_train_prediction
+                    residual_selection = _select_model_parameters(
                         model_name,
                         z_train_x,
                         residual_train_y,
-                        z_validation_x,
-                        alpha=selected_alpha,
+                        train_dates,
+                        model_alpha_grids[model_name],
+                        horizon=horizon,
+                        calendar_dates=calendar_dates,
+                        l1_ratios=model_l1_ratios,
                     )
-                    predictor_name = f"{model_name}__{TARGET_RESIDUALIZED_Z_FAMILY}"
+                    residual_alpha = float(residual_selection["selected_alpha"])
+                    residual_l1_ratio = residual_selection.get("selected_l1_ratio")
+                    parameter_selection_by_fold.append(
+                        {
+                            "validation_window_name": window_name,
+                            "raw_target": spec.raw_target,
+                            "target": spec.target,
+                            "target_transform": spec.transform,
+                            "model_name": model_name,
+                            "feature_family": HAND_FEATURE_FAMILY,
+                            "selection_stage": "hand_target_model",
+                            "selection_method": alpha_selection,
+                            **hand_selection,
+                        }
+                    )
+                    parameter_selection_by_fold.append(
+                        {
+                            "validation_window_name": window_name,
+                            "raw_target": spec.raw_target,
+                            "target": spec.target,
+                            "target_transform": spec.transform,
+                            "model_name": model_name,
+                            "feature_family": HAND_PLUS_RESIDUAL_Z_FAMILY,
+                            "selection_stage": "training_residual_model",
+                            "selection_method": alpha_selection,
+                            **residual_selection,
+                        }
+                    )
+                    hand_prediction, residual_prediction, hand_plus_z_prediction = (
+                        _incremental_residual_predictions(
+                            model_name,
+                            hand_train_x,
+                            z_train_x,
+                            transformed_train_y,
+                            hand_validation_x,
+                            z_validation_x,
+                            hand_alpha=hand_alpha,
+                            residual_alpha=residual_alpha,
+                            hand_l1_ratio=(
+                                float(hand_l1_ratio) if hand_l1_ratio is not None else None
+                            ),
+                            residual_l1_ratio=(
+                                float(residual_l1_ratio)
+                                if residual_l1_ratio is not None
+                                else None
+                            ),
+                        )
+                    )
+                    if spec.transform == "raw":
+                        original_hand_prediction = hand_prediction
+                        original_incremental_prediction = hand_plus_z_prediction
+                        incremental_clipped = np.zeros(len(raw_actual), dtype=bool)
+                    else:
+                        original_hand_prediction, _ = inverse_transform_predictions(
+                            hand_prediction, spec
+                        )
+                        original_incremental_prediction, incremental_clipped = (
+                            inverse_transform_predictions(hand_plus_z_prediction, spec)
+                        )
+                    comparison = _incremental_comparison_metrics(
+                        raw_actual,
+                        original_hand_prediction,
+                        original_incremental_prediction,
+                    )
+                    incremental_comparisons.append(
+                        {
+                            "validation_window_name": window_name,
+                            "raw_target": spec.raw_target,
+                            "model_name": model_name,
+                            "score_space": "original",
+                            "hand_feature_family": HAND_FEATURE_FAMILY,
+                            "incremental_feature_family": HAND_PLUS_RESIDUAL_Z_FAMILY,
+                            "training_residual_min": float(residual_train_y.min()),
+                            "training_residual_max": float(residual_train_y.max()),
+                            "reconstruction_max_abs_error": float(
+                                np.max(np.abs(hand_plus_z_prediction - hand_prediction - residual_prediction))
+                            ),
+                            **comparison,
+                        }
+                    )
+                    hand_metrics = _score_predictions(
+                        spec.raw_target,
+                        raw_actual,
+                        original_hand_prediction,
+                        score_space="original",
+                        baseline_metrics=None,
+                    )
+                    predictor_name = f"{model_name}__{HAND_PLUS_RESIDUAL_Z_FAMILY}"
                     _append_scored_result(
                         results=results,
                         prediction_rows=prediction_rows,
                         common={
-                            **target_residual_common,
-                            "selected_alpha": selected_alpha,
+                            **common,
+                            "selected_alpha": residual_alpha,
+                            **(
+                                {"selected_l1_ratio": residual_l1_ratio}
+                                if model_name == "elastic_net"
+                                else {}
+                            ),
+                            "inner_validation_score": residual_selection["inner_validation_score"],
+                            "inner_fold_scores": residual_selection["inner_fold_scores"],
+                            "selection_status": residual_selection["selection_status"],
                         },
                         target_validation=target_validation,
-                        score_space="residual",
-                        score_target_name=target_residual_name,
+                        score_space="original",
+                        score_target_name=spec.raw_target,
                         predictor_name=predictor_name,
                         predictor_kind="model",
                         model_name=model_name,
-                        feature_family=TARGET_RESIDUALIZED_Z_FAMILY,
-                        actual=residual_actual,
-                        predicted=residual_predicted,
-                        baseline_metrics=target_residual_baseline_metrics,
-                    )
-                    coefficients_by_fold.append(
-                        {
-                            "validation_window_name": window_name,
-                            "raw_target": spec.raw_target,
-                            "target": target_residual_name,
-                            "target_transform": target_residual_transform,
-                            "predictor_name": predictor_name,
-                            "model_name": model_name,
-                            "feature_family": TARGET_RESIDUALIZED_Z_FAMILY,
-                            "selected_alpha": selected_alpha,
-                            "coefficients": coefficients.tolist(),
-                        }
+                        feature_family=HAND_PLUS_RESIDUAL_Z_FAMILY,
+                        actual=raw_actual,
+                        predicted=original_incremental_prediction,
+                        baseline_metrics=hand_metrics,
+                        inverse_clipped=incremental_clipped,
                     )
 
             for feature_family, train_x, validation_x in feature_family_matrices:
-                selected_alpha = float(alpha) if alpha is not None else None
-                alpha_diagnostics: list[dict[str, object]] = []
-                if selected_alpha is None:
-                    selected_alpha, alpha_diagnostics = _select_ridge_alpha(
-                        train_x, transformed_train_y, train_dates, alpha_grid
-                    )
-                alpha_selection_by_fold.append(
-                    {
-                        "validation_window_name": window_name,
-                        "raw_target": spec.raw_target,
-                        "target": spec.target,
-                        "target_transform": spec.transform,
-                        "feature_family": feature_family,
-                        "selected_alpha": selected_alpha,
-                        "selection_method": alpha_selection,
-                        "candidate_diagnostics": alpha_diagnostics,
-                    }
-                )
                 for model_name in REGRESSION_HEADS:
+                    selection = _select_model_parameters(
+                        model_name,
+                        train_x,
+                        transformed_train_y,
+                        train_dates,
+                        model_alpha_grids[model_name],
+                        horizon=horizon,
+                        calendar_dates=calendar_dates,
+                        l1_ratios=l1_ratios if model_name == "elastic_net" else (),
+                    )
+                    selected_alpha = float(selection["selected_alpha"])
+                    selected_l1_ratio = selection.get("selected_l1_ratio")
+                    parameter_selection_by_fold.append(
+                        {
+                            "validation_window_name": window_name,
+                            "raw_target": spec.raw_target,
+                            "target": spec.target,
+                            "target_transform": spec.transform,
+                            "model_name": model_name,
+                            "feature_family": feature_family,
+                            "selection_method": alpha_selection,
+                            **selection,
+                        }
+                    )
                     transformed_predicted, coefficients = _predict_regression_head(
                         model_name,
                         train_x,
                         transformed_train_y,
                         validation_x,
                         alpha=selected_alpha,
+                        l1_ratio=float(selected_l1_ratio) if selected_l1_ratio is not None else None,
                     )
                     raw_predicted, model_inverse_clipped = inverse_transform_predictions(
                         transformed_predicted, spec
                     )
                     for score_space, score_target_name, actual, baseline, _ in score_blocks:
-                        predicted = raw_predicted if score_space == "raw" and spec.transform != "raw" else transformed_predicted
+                        predicted = (
+                            raw_predicted
+                            if score_space == "original" and spec.transform != "raw"
+                            else transformed_predicted
+                        )
                         clip_mask = (
                             model_inverse_clipped
-                            if score_space == "raw" and spec.transform != "raw"
+                            if score_space == "original" and spec.transform != "raw"
                             else np.zeros(len(predicted), dtype=bool)
                         )
                         baseline_metrics = _score_predictions(
                             score_target_name,
                             actual,
                             baseline,
+                            score_space=score_space,
                             baseline_metrics=None,
                         )
                         predictor_name = f"{model_name}__{feature_family}"
                         _append_scored_result(
                             results=results,
                             prediction_rows=prediction_rows,
-                            common={**common, "selected_alpha": selected_alpha},
+                            common={
+                                **common,
+                                "selected_alpha": selected_alpha,
+                                **({"selected_l1_ratio": selected_l1_ratio} if model_name == "elastic_net" else {}),
+                                "inner_validation_score": selection["inner_validation_score"],
+                                "inner_fold_scores": selection["inner_fold_scores"],
+                                "selection_status": selection["selection_status"],
+                            },
                             target_validation=target_validation,
                             score_space=score_space,
                             score_target_name=score_target_name,
@@ -1394,6 +2017,7 @@ def run_frozen_probes(
                             "model_name": model_name,
                             "feature_family": feature_family,
                             "selected_alpha": selected_alpha,
+                            **({"selected_l1_ratio": selected_l1_ratio} if model_name == "elastic_net" else {}),
                             "coefficients": coefficients.tolist(),
                         }
                     )
@@ -1409,7 +2033,7 @@ def run_frozen_probes(
                         **common,
                         "target": str(label_spec["classification_label"]),
                         "target_transform": "binary_label",
-                        "selected_alpha": float(alpha) if alpha is not None else _fallback_alpha(alpha_grid),
+                        "selected_alpha": None,
                     }
                     baseline_metrics = _append_classification_result(
                         results=results,
@@ -1433,17 +2057,45 @@ def run_frozen_probes(
                         z_columns=z_columns,
                         baseline_feature_columns=baseline_feature_columns,
                     ):
+                        selection = _select_model_parameters(
+                            "logistic",
+                            train_x,
+                            label_train_y,
+                            train_dates,
+                            model_alpha_grids["logistic"],
+                            horizon=horizon,
+                            calendar_dates=calendar_dates,
+                        )
+                        selected_alpha = float(selection["selected_alpha"])
+                        parameter_selection_by_fold.append(
+                            {
+                                "validation_window_name": window_name,
+                                "raw_target": spec.raw_target,
+                                "target": str(label_spec["classification_label"]),
+                                "target_transform": "binary_label",
+                                "model_name": "logistic",
+                                "feature_family": feature_family,
+                                "selection_method": alpha_selection,
+                                **selection,
+                            }
+                        )
                         probability, coefficients = _logistic_predict(
                             train_x,
                             label_train_y,
                             validation_x,
-                            alpha=float(classification_common["selected_alpha"]),
+                            alpha=selected_alpha,
                         )
                         predictor_name = f"logistic__{feature_family}"
                         _append_classification_result(
                             results=results,
                             prediction_rows=prediction_rows,
-                            common=classification_common,
+                            common={
+                                **classification_common,
+                                "selected_alpha": selected_alpha,
+                                "inner_validation_score": selection["inner_validation_score"],
+                                "inner_fold_scores": selection["inner_fold_scores"],
+                                "selection_status": selection["selection_status"],
+                            },
                             target_validation=target_validation,
                             classification_label=str(label_spec["classification_label"]),
                             positive_rule=str(label_spec["positive_rule"]),
@@ -1465,7 +2117,7 @@ def run_frozen_probes(
                                 "predictor_name": predictor_name,
                                 "model_name": "logistic",
                                 "feature_family": feature_family,
-                                "selected_alpha": classification_common["selected_alpha"],
+                                "selected_alpha": selected_alpha,
                                 "coefficients": coefficients.tolist(),
                             }
                         )
@@ -1491,6 +2143,7 @@ def run_frozen_probes(
             score_target_name,
             baseline_frame["actual"].to_numpy(dtype=np.float64),
             baseline_frame["prediction"].to_numpy(dtype=np.float64),
+            score_space=str(score_space),
             baseline_metrics=None,
         )
         baseline_clip_rate = float(baseline_frame["inverse_prediction_clipped"].mean())
@@ -1503,6 +2156,7 @@ def run_frozen_probes(
                 score_target_name,
                 frame["actual"].to_numpy(dtype=np.float64),
                 frame["prediction"].to_numpy(dtype=np.float64),
+                score_space=str(score_space),
                 baseline_metrics=None if predictor_name == TRAIN_MEAN_BASELINE else baseline_metrics,
             )
             metrics["inverse_prediction_clip_count"] = int(
@@ -1531,12 +2185,19 @@ def run_frozen_probes(
 
     run_id = hashlib.sha256(
         (
-            f"{source_database}|{alpha_selection}|{alpha}|{','.join(str(value) for value in alpha_grid)}|"
-            f"{','.join(transformed_target_names)}"
+            f"{source_database}|{alpha_selection}|{json.dumps(model_alpha_grids, sort_keys=True)}|"
+            f"{','.join(str(value) for value in l1_ratios)}|"
+            f"{','.join(transformed_target_names)}|{representation_variant}"
         ).encode("utf-8")
     ).hexdigest()[:16]
     regression_summary = _regression_final_summary(results)
     classification_summary = _classification_final_summary(results)
+    bootstrap_by_window, stability_summary, evaluated_combination_count = (
+        _bootstrap_reliability_summary(
+            predictions,
+            representation_variant=representation_variant,
+        )
+    )
     destination, temporary = artifact_destination(output_root, run_id)
     try:
         probe_dataset.to_parquet(
@@ -1546,21 +2207,38 @@ def run_frozen_probes(
             temporary / "predictions.parquet", index=False, compression="zstd"
         )
         report = {
+            "schema_version": 1,
             "created_at_utc": datetime.now(timezone.utc).isoformat(),
-            "fixed_alpha": alpha,
+            "checkpoint_id": checkpoint_id,
+            "checkpoint_step": checkpoint_step,
+            "representation_source": representation_source,
+            "representation_variant": representation_variant,
+            "resolved_probe_config": {
+                "alpha_selection": alpha_selection,
+                "ridge_alphas": list(model_alpha_grids["ridge"]),
+                "huber_alphas": list(model_alpha_grids["huber"]),
+                "elastic_net_alphas": list(model_alpha_grids["elastic_net"]),
+                "elastic_net_l1_ratios": list(l1_ratios),
+                "logistic_alphas": list(model_alpha_grids["logistic"]),
+                "inner_fold_count": 3,
+                "horizon_purge_enabled": True,
+                "bootstrap_samples": DEFAULT_BOOTSTRAP_SAMPLES,
+                "bootstrap_seed": DEFAULT_BOOTSTRAP_SEED,
+                "bootstrap_block_length": "target_horizon",
+            },
+            "resolved_representation_config": resolved_representation_config,
             "alpha_selection": alpha_selection,
-            "alpha_grid": list(alpha_grid),
             "target_transform_epsilon": TARGET_TRANSFORM_EPSILON,
             "probe_dataset_artifact": (
                 str(probe_dataset_artifact.resolve()) if probe_dataset_artifact else None
             ),
             "embedding_artifact": embedding_source,
             "target_artifact": target_source,
-            "source_database_sha256": source_database,
             "raw_target_columns": target_columns,
             "target_columns": target_columns,
             "transformed_target_columns": transformed_target_names,
             "target_transform_specs": [asdict(spec) for spec in target_specs],
+            "validation_windows": metadata["validation_windows"],
             "z_columns": z_columns,
             "baseline_feature_columns": baseline_feature_columns,
             "feature_families": [
@@ -1568,7 +2246,7 @@ def run_frozen_probes(
                 HAND_FEATURE_FAMILY,
                 HAND_PCA_FAMILY,
                 HAND_PLUS_Z_FAMILY,
-                TARGET_RESIDUALIZED_Z_FAMILY,
+                HAND_PLUS_RESIDUAL_Z_FAMILY,
                 FEATURE_RESIDUALIZED_Z_FAMILY,
             ],
             "baseline_families": [
@@ -1584,19 +2262,26 @@ def run_frozen_probes(
             "window_summaries": _window_summaries(results),
             "final_regression_summary": regression_summary,
             "final_classification_summary": classification_summary,
+            "bootstrap_by_window": bootstrap_by_window,
+            "stability_summary": stability_summary,
+            "evaluated_target_model_variant_combination_count": evaluated_combination_count,
+            "multiple_comparison_correction_applied": False,
             "pass_fail_gate_counts": {
                 "regression": _gate_counts(regression_summary),
                 "classification": _gate_counts(classification_summary),
             },
             "coefficients_by_fold": coefficients_by_fold,
-            "alpha_selection_by_fold": alpha_selection_by_fold,
-            "recalibration_is_diagnostic_only": True,
+            "parameter_selection_by_fold": parameter_selection_by_fold,
+            "incremental_hand_plus_z_comparisons": incremental_comparisons,
+            "representation_diagnostics": representation_diagnostics,
             "targets_joined_into_pretraining_artifact": False,
             "phase2_notes": {
                 "raw_targets_are_still_scored": True,
                 "transformed_targets_are_scored_in_model_space": True,
-                "transformed_targets_are_inverse_scored_in_raw_space": True,
+                "transformed_targets_are_inverse_scored_in_original_space": True,
                 "inverse_prediction_clip_count_is_diagnostic": True,
+                "incremental_residuals_fit_on_outer_training_rows_only": True,
+                "oracle_validation_recalibration_included": False,
             },
             "phase3_notes": {
                 "train_mean_baseline_is_retained": True,
@@ -1606,19 +2291,22 @@ def run_frozen_probes(
                 "neural_probe_heads_included": False,
             },
             "phase4_notes": {
-                "target_residualized_z_only_enabled": bool(baseline_feature_columns),
+                "hand_plus_residual_z_enabled": bool(baseline_feature_columns),
                 "feature_residualized_z_only_enabled": bool(baseline_feature_columns),
                 "residualization_controls": "past-only baseline features",
                 "residualization_fit_scope": "outer training dates only",
-                "raw_pooled_state_variants_included": False,
+                "raw_pooled_state_variants_included": representation_variant == "pooled_raw_256",
                 "raw_pooled_state_variants_note": (
-                    "Current probe dataset contains exported z_* coordinates only; raw pooled-state "
-                    "variants require an evaluation export contract change."
+                    "The selected representation is stored in z_* columns; pooled_raw_256 preserves "
+                    "the unprojected pooled state."
                 ),
             },
         }
         (temporary / "report.json").write_text(
             json.dumps(report, indent=2), encoding="utf-8"
+        )
+        (temporary / "summary.md").write_text(
+            build_summary_markdown(report), encoding="utf-8"
         )
         publish_artifact(temporary, destination)
     except Exception:
@@ -1665,11 +2353,21 @@ def build_probe_dataset_main() -> None:
     parser.add_argument("--targets", type=Path, required=True)
     parser.add_argument("--output-root", type=Path, default=Path("data/probe_targets"))
     parser.add_argument(
+        "--representation-variant",
+        help="Explicit exported representation variant to place in this probe dataset.",
+    )
+    parser.add_argument(
         "--name",
         help="Readable artifact directory name. Defaults to '<embedding_artifact>_probe_dataset'.",
     )
     args = parser.parse_args()
-    build_probe_dataset(args.embeddings, args.targets, output_root=args.output_root, name=args.name)
+    build_probe_dataset(
+        args.embeddings,
+        args.targets,
+        output_root=args.output_root,
+        name=args.name,
+        representation_variant=args.representation_variant,
+    )
 
 
 def run_probes_main() -> None:
@@ -1680,15 +2378,16 @@ def run_probes_main() -> None:
     parser.add_argument("--targets", type=Path)
     parser.add_argument("--output-root", type=Path, default=Path("runs/probes"))
     parser.add_argument(
-        "--alpha",
-        type=float,
-        help="Use one fixed ridge alpha instead of inner walk-forward alpha selection.",
+        "--representation-variant",
+        help="Run one explicit representation variant from a multi-variant embedding artifact.",
     )
+    parser.add_argument("--ridge-alphas", default=",".join(str(value) for value in DEFAULT_RIDGE_ALPHAS))
+    parser.add_argument("--huber-alphas", default=",".join(str(value) for value in DEFAULT_HUBER_ALPHAS))
+    parser.add_argument("--elastic-net-alphas", default=",".join(str(value) for value in DEFAULT_ELASTIC_NET_ALPHAS))
     parser.add_argument(
-        "--alphas",
-        default="0.0001,0.001,0.01,0.1,1,10,100,1000,10000",
-        help="Comma-separated ridge alpha grid used when --alpha is omitted.",
+        "--elastic-net-l1-ratios", default=",".join(str(value) for value in DEFAULT_ELASTIC_NET_L1_RATIOS)
     )
+    parser.add_argument("--logistic-alphas", default=",".join(str(value) for value in DEFAULT_LOGISTIC_ALPHAS))
 
     args = parser.parse_args()
     if args.probe_dataset is None and (args.embeddings is None or args.targets is None):
@@ -1702,6 +2401,12 @@ def run_probes_main() -> None:
         args.targets,
         probe_dataset_artifact=args.probe_dataset,
         output_root=args.output_root,
-        alpha=args.alpha,
-        alphas=tuple(float(value) for value in args.alphas.split(",") if value.strip()),
+        ridge_alphas=tuple(float(value) for value in args.ridge_alphas.split(",") if value.strip()),
+        huber_alphas=tuple(float(value) for value in args.huber_alphas.split(",") if value.strip()),
+        elastic_net_alphas=tuple(float(value) for value in args.elastic_net_alphas.split(",") if value.strip()),
+        elastic_net_l1_ratios=tuple(
+            float(value) for value in args.elastic_net_l1_ratios.split(",") if value.strip()
+        ),
+        logistic_alphas=tuple(float(value) for value in args.logistic_alphas.split(",") if value.strip()),
+        representation_variant=args.representation_variant,
     )

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -17,11 +17,25 @@ from fi_jepa.dataloader import (
     DensePanelStore,
     build_fi_jepa_embedding_dataloader,
 )
-from fi_jepa.model import ENCODER_BATCH_TENSOR_NAMES, FIJepaModel, load_fi_jepa_model_state
+from fi_jepa.model import (
+    ENCODER_BATCH_TENSOR_NAMES,
+    INPUT_ABLATION_MODES,
+    FIJepaModel,
+    load_fi_jepa_model_state,
+)
 from fi_jepa.model_config import FIJepaModelConfig
 
 EMBEDDING_SCHEMA_VERSION = 1
 PCA_FORMAT_VERSION = 1
+INITIAL_REPRESENTATION_VARIANTS = (
+    "mean_pca_16",
+    "endpoint_pca_16",
+    "pooled_pca_16",
+    "pooled_pca_32",
+    "pooled_pca_64",
+    "pooled_raw_256",
+)
+ASSET_COUNT_ABLATIONS = (32, 128, 256)
 
 
 # ============================================================================
@@ -128,6 +142,87 @@ def fit_pca_exporter(states: np.ndarray, n_components: int) -> PCAExporter:
     )
 
 
+def build_representation_variants(
+    train_states: dict[str, np.ndarray],
+    validation_states: dict[str, np.ndarray],
+    variants: tuple[str, ...] | list[str] = INITIAL_REPRESENTATION_VARIANTS,
+) -> tuple[dict[str, tuple[np.ndarray, np.ndarray]], dict[str, dict[str, object]], dict[str, PCAExporter]]:
+    """Build the explicit initial representation suite with train-only PCA fits.
+
+    Raw state dictionaries must contain ``mean_state``, ``endpoint_state``, and
+    ``pooled_state``. PCA exporters are fit only from the corresponding training
+    matrix, then applied unchanged to validation rows.
+    """
+    requested = tuple(dict.fromkeys(str(name) for name in variants))
+    unknown = sorted(set(requested).difference(INITIAL_REPRESENTATION_VARIANTS))
+    if unknown:
+        raise ValueError(f"Unknown representation variants: {unknown}")
+
+    outputs: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    metadata: dict[str, dict[str, object]] = {}
+    exporters: dict[str, PCAExporter] = {}
+    for variant in requested:
+        source, transform, dimension_text = variant.rsplit("_", 2)
+        dimension = int(dimension_text)
+        source_name = f"{source}_state"
+        train = np.asarray(train_states[source_name], dtype=np.float64)
+        validation = np.asarray(validation_states[source_name], dtype=np.float64)
+        if transform == "raw":
+            if train.shape[1] != dimension:
+                raise ValueError(
+                    f"{variant} requires a {dimension}-dimensional {source_name}; got {train.shape[1]}."
+                )
+            train_output, validation_output = train, validation
+            explained_variance: list[float] | None = None
+            explained_variance_ratio: list[float] | None = None
+        else:
+            exporter = fit_pca_exporter(train, dimension)
+            exporters[variant] = exporter
+            train_output = exporter.transform(train)
+            validation_output = exporter.transform(validation)
+            explained_variance = exporter.explained_variance.tolist()
+            explained_variance_ratio = exporter.explained_variance_ratio.tolist()
+        outputs[variant] = (train_output, validation_output)
+        metadata[variant] = {
+            "representation_variant": variant,
+            "representation_source": source_name,
+            "dimension": dimension,
+            "transform": transform,
+            "explained_variance": explained_variance,
+            "explained_variance_ratio": explained_variance_ratio,
+            "pca_fit_split": "train" if transform == "pca" else None,
+        }
+    return outputs, metadata, exporters
+
+
+def representation_distance_summary(
+    reference: np.ndarray, candidate: np.ndarray
+) -> dict[str, float]:
+    """Compare aligned representation rows using direction and magnitude metrics."""
+    reference_values = np.asarray(reference, dtype=np.float64)
+    candidate_values = np.asarray(candidate, dtype=np.float64)
+    if reference_values.shape != candidate_values.shape or reference_values.ndim != 2:
+        raise ValueError("Representation distance inputs must have the same [samples, dimensions] shape.")
+    reference_norm = np.linalg.norm(reference_values, axis=1)
+    candidate_norm = np.linalg.norm(candidate_values, axis=1)
+    denominator = reference_norm * candidate_norm
+    cosine = np.divide(
+        np.einsum("nd,nd->n", reference_values, candidate_values),
+        denominator,
+        out=np.zeros_like(denominator),
+        where=denominator > 1.0e-12,
+    )
+    relative_l2 = np.linalg.norm(candidate_values - reference_values, axis=1) / np.maximum(
+        reference_norm, 1.0e-12
+    )
+    return {
+        "mean_cosine_similarity": float(cosine.mean()),
+        "median_cosine_similarity": float(np.median(cosine)),
+        "mean_relative_l2_distance": float(relative_l2.mean()),
+        "median_relative_l2_distance": float(np.median(relative_l2)),
+    }
+
+
 # ============================================================================
 # REPRESENTATION DIAGNOSTICS
 # ============================================================================
@@ -228,6 +323,130 @@ def representation_diagnostics(values: np.ndarray) -> dict[str, object]:
     }
 
 
+def _validation_rank_metrics(values: np.ndarray) -> dict[str, float | int]:
+    """Compute only the seven geometry metrics used for validation-rank interpretation."""
+    states = np.asarray(values, dtype=np.float64)
+    if states.ndim != 2 or states.shape[0] == 0:
+        raise ValueError("Rank-diagnostic states must have shape [nonzero samples, dimensions].")
+    if not np.isfinite(states).all():
+        raise ValueError("Rank-diagnostic states must be finite.")
+
+    centered = states - states.mean(axis=0)
+    singular_values = np.linalg.svd(centered, compute_uv=False)
+    eigenvalues = np.square(singular_values) / max(states.shape[0] - 1, 1)
+    eigenvalue_sum = float(eigenvalues.sum())
+    if eigenvalue_sum > 0.0:
+        probabilities = eigenvalues[eigenvalues > 0.0] / eigenvalue_sum
+        effective_rank = float(np.exp(-(probabilities * np.log(probabilities)).sum()))
+        top_eigenvalue_share = float(eigenvalues[0] / eigenvalue_sum)
+        top_5_eigenvalue_share = float(eigenvalues[:5].sum() / eigenvalue_sum)
+    else:
+        effective_rank = 0.0
+        top_eigenvalue_share = 0.0
+        top_5_eigenvalue_share = 0.0
+    pairwise = _pairwise_cosine_summary(states)
+    return {
+        "sample_count": int(states.shape[0]),
+        "effective_rank": effective_rank,
+        "top_eigenvalue_share": top_eigenvalue_share,
+        "top_5_eigenvalue_share": top_5_eigenvalue_share,
+        "mean_pairwise_cosine": pairwise["similarity_mean"],
+        "median_pairwise_cosine": pairwise["similarity_median"],
+        "mean_vector_norm": float(np.linalg.norm(states, axis=1).mean()),
+    }
+
+
+def windowed_validation_rank_diagnostics(
+    train_metadata: pd.DataFrame,
+    train_representations: dict[str, np.ndarray],
+    validation_metadata: pd.DataFrame,
+    validation_representations: dict[str, np.ndarray],
+) -> dict[str, object]:
+    """Compare each outer validation window with exact-date-length contiguous train windows.
+
+    The caller supplies only the raw pooled state and selected PCA representation.
+    Training windows are non-overlapping exact-length blocks plus an exact-length
+    trailing block when the split leaves a remainder. The validation percentile
+    is the empirical percentage of matched training values less than or equal to
+    the validation value.
+    """
+    representation_names = tuple(train_representations)
+    if representation_names != tuple(validation_representations):
+        raise ValueError("Train and validation diagnostic representations must have identical names.")
+    if len(train_metadata) == 0 or len(validation_metadata) == 0:
+        raise ValueError("Windowed diagnostics require non-empty train and validation metadata.")
+    for name in representation_names:
+        if len(train_representations[name]) != len(train_metadata):
+            raise ValueError(f"Train metadata and {name!r} rows do not align.")
+        if len(validation_representations[name]) != len(validation_metadata):
+            raise ValueError(f"Validation metadata and {name!r} rows do not align.")
+
+    train_dates = pd.to_datetime(train_metadata["date"], errors="raise")
+    validation_dates = pd.to_datetime(validation_metadata["date"], errors="raise")
+    unique_train_dates = np.asarray(sorted(train_dates.unique()))
+    window_labels = (
+        validation_metadata["validation_window_name"].fillna("").astype(str)
+        if "validation_window_name" in validation_metadata
+        else pd.Series("validation", index=validation_metadata.index, dtype=object)
+    )
+    window_labels = window_labels.mask(window_labels.eq(""), "validation")
+
+    report: dict[str, object] = {
+        "matched_train_window_method": (
+            "historical_contiguous_exact_date_length_nonoverlapping_plus_trailing"
+        ),
+        "validation_percentile_definition": "100 * mean(matched_train_value <= validation_value)",
+        "representations": {name: {"windows": []} for name in representation_names},
+    }
+    for window_name in sorted(window_labels.unique()):
+        validation_mask = window_labels.eq(window_name).to_numpy()
+        validation_date_count = int(validation_dates[validation_mask].nunique())
+        validation_start = validation_dates[validation_mask].min()
+        eligible_train_dates = unique_train_dates[unique_train_dates < validation_start.to_datetime64()]
+        if validation_date_count > len(eligible_train_dates):
+            raise ValueError(
+                f"Validation window {window_name!r} has {validation_date_count} dates, "
+                f"but has only {len(eligible_train_dates)} historical training dates."
+            )
+
+        starts = list(range(0, len(eligible_train_dates) - validation_date_count + 1, validation_date_count))
+        trailing_start = len(eligible_train_dates) - validation_date_count
+        if starts[-1] != trailing_start:
+            starts.append(trailing_start)
+        train_masks = [
+            train_dates.isin(eligible_train_dates[start : start + validation_date_count]).to_numpy()
+            for start in starts
+        ]
+
+        for representation_name in representation_names:
+            train_values = np.asarray(train_representations[representation_name], dtype=np.float64)
+            validation_values = np.asarray(validation_representations[representation_name], dtype=np.float64)
+            validation_metrics = _validation_rank_metrics(validation_values[validation_mask])
+            matched_metrics = [_validation_rank_metrics(train_values[mask]) for mask in train_masks]
+            comparisons: dict[str, dict[str, float | int]] = {}
+            for metric_name, validation_value in validation_metrics.items():
+                distribution = np.asarray([metrics[metric_name] for metrics in matched_metrics], dtype=np.float64)
+                comparisons[metric_name] = {
+                    "matched_train_median": float(np.median(distribution)),
+                    "matched_train_5th_percentile": float(np.percentile(distribution, 5)),
+                    "matched_train_95th_percentile": float(np.percentile(distribution, 95)),
+                    "validation_value": validation_value,
+                    "validation_percentile": float(100.0 * np.mean(distribution <= float(validation_value))),
+                }
+            report["representations"][representation_name]["windows"].append(
+                {
+                    "validation_window_name": str(window_name),
+                    "validation_date_count": validation_date_count,
+                    "matched_train_window_count": len(train_masks),
+                    "matched_train_window_date_counts": [
+                        int(train_dates[mask].nunique()) for mask in train_masks
+                    ],
+                    "metrics": comparisons,
+                }
+            )
+    return report
+
+
 def _cosine_stability(reference: np.ndarray, view: np.ndarray) -> dict[str, object]:
     """Compare aligned all-valid and fixed-K states for the same sample dates."""
     if reference.shape != view.shape:
@@ -271,19 +490,21 @@ def _move_batch(batch: dict[str, object], device: torch.device) -> dict[str, obj
     }
 
 
-def collect_pooled_states(
+def collect_representation_states(
     model: FIJepaModel,
     loader: torch.utils.data.DataLoader,
     device: torch.device,
     amp_dtype: torch.dtype | None,
     *,
     description: str = "Representations",
-) -> tuple[pd.DataFrame, np.ndarray]:
-    """Encode one deterministic loader into metadata and raw pooled states."""
+    input_mode: str = "all_streams",
+) -> tuple[pd.DataFrame, dict[str, np.ndarray]]:
+    """Encode one deterministic loader into metadata and source-separated states."""
     was_training = model.training
     model.eval()
     metadata: list[dict[str, object]] = []
-    states: list[np.ndarray] = []
+    mean_states: list[np.ndarray] = []
+    endpoint_states: list[np.ndarray] = []
     with torch.inference_mode():
         for cpu_batch in tqdm(
             loader,
@@ -300,8 +521,11 @@ def collect_pooled_states(
                 else nullcontext()
             )
             with autocast:
-                pooled = model.encode_pooled_state(batch)
-            states.append(pooled.float().cpu().numpy().astype(np.float64))
+                mean_state, endpoint_state = model.encode_state_components(
+                    batch, input_mode=input_mode
+                )  # Each [B, D].
+            mean_states.append(mean_state.float().cpu().numpy().astype(np.float64))
+            endpoint_states.append(endpoint_state.float().cpu().numpy().astype(np.float64))
             dates = cpu_batch["sample_date"]
             splits = cpu_batch["split_label"]
             windows = cpu_batch.get("validation_window_name", [""] * len(dates))
@@ -323,9 +547,158 @@ def collect_pooled_states(
                 )
     if was_training:
         model.train()
-    if not states:
-        raise RuntimeError("Embedding loader produced no pooled states.")
-    return pd.DataFrame(metadata), np.concatenate(states, axis=0)
+    if not mean_states:
+        raise RuntimeError("Embedding loader produced no representation states.")
+    mean = np.concatenate(mean_states, axis=0)
+    endpoint = np.concatenate(endpoint_states, axis=0)
+    return pd.DataFrame(metadata), {
+        "mean_state": mean,
+        "endpoint_state": endpoint,
+        "pooled_state": np.concatenate((mean, endpoint), axis=1),
+    }
+
+
+def run_compact_ablation_suite(
+    model: FIJepaModel,
+    store: DensePanelStore,
+    data_config: FIJepaDataConfig,
+    *,
+    device: torch.device,
+    amp_dtype: torch.dtype | None,
+    train_metadata: pd.DataFrame,
+    train_states: dict[str, np.ndarray],
+    validation_metadata: pd.DataFrame,
+    validation_states: dict[str, np.ndarray],
+    collect_probe_states: bool,
+) -> tuple[dict[str, object], dict[str, tuple[np.ndarray, np.ndarray, str]]]:
+    """Evaluate the exact compact asset-count and input-stream ablations.
+
+    Every candidate is aligned by date to the all-valid reference. Only the
+    fixed-K 128 state is retained for asset-count probes; the other K values are
+    distance diagnostics unless later results justify probing them.
+    """
+    reference = validation_states["pooled_state"]
+    asset_reports: dict[str, dict[str, object]] = {
+        "all_valid": {
+            "asset_view": "all_valid",
+            **representation_distance_summary(reference, reference),
+            "effective_rank": representation_diagnostics(reference)["effective_rank"],
+            "probe_variant": "pooled_pca_16",
+            "probe_performance_change": 0.0,
+        }
+    }
+    probe_states: dict[str, tuple[np.ndarray, np.ndarray, str]] = {}
+    for asset_count in ASSET_COUNT_ABLATIONS:
+        ablation_config = replace(data_config, fixed_k_assets=asset_count)
+        validation_loader = build_fi_jepa_embedding_dataloader(
+            ablation_config,
+            "validation",
+            asset_view="fixed_k",
+            store=store,
+            view_index=0,
+            num_workers=0,
+        )
+        metadata, states = collect_representation_states(
+            model,
+            validation_loader,
+            device,
+            amp_dtype,
+            description=f"Ablation: validation fixed-k {asset_count}",
+        )
+        if metadata["date"].tolist() != validation_metadata["date"].tolist():
+            raise AssertionError(f"Fixed-K {asset_count} and all-valid validation dates do not align.")
+        candidate = states["pooled_state"]
+        probe_variant = f"asset_k_{asset_count}_pooled_pca_16" if asset_count == 128 else None
+        asset_reports[f"k_{asset_count}"] = {
+            "asset_view": "fixed_k",
+            "asset_count": asset_count,
+            **representation_distance_summary(reference, candidate),
+            "effective_rank": representation_diagnostics(candidate)["effective_rank"],
+            "probe_variant": probe_variant,
+            "probe_performance_change": None,
+        }
+        if collect_probe_states and asset_count == 128:
+            train_loader = build_fi_jepa_embedding_dataloader(
+                ablation_config,
+                "train",
+                asset_view="fixed_k",
+                store=store,
+                view_index=0,
+                num_workers=0,
+            )
+            ablation_train_metadata, ablation_train_states = collect_representation_states(
+                model,
+                train_loader,
+                device,
+                amp_dtype,
+                description="Ablation: train fixed-k 128",
+            )
+            if ablation_train_metadata["date"].tolist() != train_metadata["date"].tolist():
+                raise AssertionError("Fixed-K 128 and all-valid training dates do not align.")
+            probe_states[probe_variant] = (
+                ablation_train_states["pooled_state"],
+                candidate,
+                "pooled_state_asset_k_128",
+            )
+
+    input_reports: dict[str, dict[str, object]] = {}
+    all_valid_loader = build_fi_jepa_embedding_dataloader(
+        data_config,
+        "validation",
+        asset_view="all_valid",
+        store=store,
+        num_workers=0,
+    )
+    for input_mode in INPUT_ABLATION_MODES:
+        if input_mode == "all_streams":
+            candidate = reference
+        else:
+            metadata, states = collect_representation_states(
+                model,
+                all_valid_loader,
+                device,
+                amp_dtype,
+                description=f"Ablation: validation {input_mode}",
+                input_mode=input_mode,
+            )
+            if metadata["date"].tolist() != validation_metadata["date"].tolist():
+                raise AssertionError(f"{input_mode} and all-stream validation dates do not align.")
+            candidate = states["pooled_state"]
+        probe_variant = "pooled_pca_16" if input_mode == "all_streams" else f"{input_mode}_pooled_pca_16"
+        input_reports[input_mode] = {
+            **representation_distance_summary(reference, candidate),
+            "effective_rank": representation_diagnostics(candidate)["effective_rank"],
+            "probe_variant": probe_variant,
+            "probe_performance_change": 0.0 if input_mode == "all_streams" else None,
+        }
+        if collect_probe_states and input_mode != "all_streams":
+            train_loader = build_fi_jepa_embedding_dataloader(
+                data_config,
+                "train",
+                asset_view="all_valid",
+                store=store,
+                num_workers=0,
+            )
+            ablation_train_metadata, ablation_train_states = collect_representation_states(
+                model,
+                train_loader,
+                device,
+                amp_dtype,
+                description=f"Ablation: train {input_mode}",
+                input_mode=input_mode,
+            )
+            if ablation_train_metadata["date"].tolist() != train_metadata["date"].tolist():
+                raise AssertionError(f"{input_mode} and all-stream training dates do not align.")
+            probe_states[probe_variant] = (
+                ablation_train_states["pooled_state"],
+                candidate,
+                f"pooled_state_{input_mode}",
+            )
+    return {
+        "asset_count_ablations": asset_reports,
+        "input_branch_ablations": input_reports,
+        "default_asset_probe_variants": ["pooled_pca_16", "asset_k_128_pooled_pca_16"],
+    }, probe_states
 
 
 def _embedding_frame(
@@ -372,7 +745,10 @@ def run_representation_evaluation(
     checkpoint_format_version: int,
     model_version: str,
     export_embeddings: bool,
+    representation_variant: str,
     checkpoint_sha256: str | None = None,
+    representation_variants: tuple[str, ...] | list[str] | None = None,
+    run_compact_ablations: bool = False,
 ) -> dict[str, object]:
     """Run the complete raw-state, PCA-export, and deterministic K-view suite."""
     if views_per_date <= 0:
@@ -393,23 +769,63 @@ def run_representation_evaluation(
         store=store,
         num_workers=0,
     )
-    train_metadata, train_raw = collect_pooled_states(
+    train_metadata, train_states = collect_representation_states(
         model,
         train_loader,
         device,
         amp_dtype,
         description="Representations: train all-valid",
     )
-    validation_metadata, validation_raw = collect_pooled_states(
+    validation_metadata, validation_states = collect_representation_states(
         model,
         validation_loader,
         device,
         amp_dtype,
         description="Representations: validation all-valid",
     )
+    train_raw = train_states["pooled_state"]
+    validation_raw = validation_states["pooled_state"]
     pca = fit_pca_exporter(train_raw, n_components)
     train_z = pca.transform(train_raw)
     validation_z = pca.transform(validation_raw)
+    variant_outputs: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    variant_metadata: dict[str, dict[str, object]] = {}
+    variant_exporters: dict[str, PCAExporter] = {}
+    if representation_variants is not None:
+        variant_outputs, variant_metadata, variant_exporters = build_representation_variants(
+            train_states, validation_states, representation_variants
+        )
+
+    ablation_report: dict[str, object] = {}
+    if run_compact_ablations:
+        ablation_report, ablation_probe_states = run_compact_ablation_suite(
+            model,
+            store,
+            data_config,
+            device=device,
+            amp_dtype=amp_dtype,
+            train_metadata=train_metadata,
+            train_states=train_states,
+            validation_metadata=validation_metadata,
+            validation_states=validation_states,
+            collect_probe_states=export_embeddings,
+        )
+        for variant, (ablation_train, ablation_validation, source) in ablation_probe_states.items():
+            exporter = fit_pca_exporter(ablation_train, 16)
+            variant_exporters[variant] = exporter
+            variant_outputs[variant] = (
+                exporter.transform(ablation_train),
+                exporter.transform(ablation_validation),
+            )
+            variant_metadata[variant] = {
+                "representation_variant": variant,
+                "representation_source": source,
+                "dimension": 16,
+                "transform": "pca",
+                "explained_variance": exporter.explained_variance.tolist(),
+                "explained_variance_ratio": exporter.explained_variance_ratio.tolist(),
+                "pca_fit_split": "train",
+            }
 
     raw_view_states: list[np.ndarray] = []
     pca_view_states: list[np.ndarray] = []
@@ -425,7 +841,7 @@ def run_representation_evaluation(
             view_index=view_index,
             num_workers=0,
         )
-        metadata, raw = collect_pooled_states(
+        metadata, states = collect_representation_states(
             model,
             loader,
             device,
@@ -434,6 +850,7 @@ def run_representation_evaluation(
         )
         if metadata["date"].tolist() != validation_metadata["date"].tolist():
             raise AssertionError("Fixed-K and all-valid validation dates do not align.")
+        raw = states["pooled_state"]
         z = pca.transform(raw)
         raw_view_states.append(raw)
         pca_view_states.append(z)
@@ -449,14 +866,46 @@ def run_representation_evaluation(
         np.tile(validation_z, (views_per_date, 1)),
         np.concatenate(pca_view_states, axis=0),
     )
+    created_at_utc = datetime.now(timezone.utc).isoformat()
+    resolved_representation_config = {
+        "pca_components": n_components,
+        "views_per_date": views_per_date,
+        "export_embeddings": export_embeddings,
+        "representation_variants": list(variant_metadata) or [representation_variant],
+        "compact_ablations": run_compact_ablations,
+        "asset_count_ablations": [*ASSET_COUNT_ABLATIONS, "all_valid"] if run_compact_ablations else [],
+        "input_branch_ablations": list(INPUT_ABLATION_MODES) if run_compact_ablations else [],
+    }
+    validation_rank_diagnostics = windowed_validation_rank_diagnostics(
+        train_metadata,
+        {
+            "raw_pooled_state": train_raw,
+            "selected_pca_representation": train_z,
+        },
+        validation_metadata,
+        {
+            "raw_pooled_state": validation_raw,
+            "selected_pca_representation": validation_z,
+        },
+    )
+    validation_rank_diagnostics["representations"]["raw_pooled_state"].update(
+        {"representation_source": "pooled_state", "representation_variant": "pooled_raw_256"}
+    )
+    validation_rank_diagnostics["representations"]["selected_pca_representation"].update(
+        {"representation_source": "pooled_state", "representation_variant": representation_variant}
+    )
     report: dict[str, object] = {
-        "format_version": 1,
+        "schema_version": 1,
+        "created_at_utc": created_at_utc,
         "checkpoint_id": checkpoint_id,
         "checkpoint_step": checkpoint_step,
         "checkpoint_format_version": checkpoint_format_version,
         "dataset_version": store.dataset_version,
         "model_version": model_version,
         "representation_source": "encode_pooled_state",
+        "representation_variant": representation_variant,
+        "resolved_probe_config": {},
+        "resolved_representation_config": resolved_representation_config,
         "collapse_source_of_truth": "raw_pooled_state",
         "pca_axis_warning": (
             "PCA coordinates are checkpoint-specific; sign canonicalization does not make "
@@ -469,6 +918,9 @@ def run_representation_evaluation(
             "explained_variance": pca.explained_variance.tolist(),
             "explained_variance_ratio": pca.explained_variance_ratio.tolist(),
         },
+        "representation_variants": variant_metadata,
+        "compact_ablations": ablation_report,
+        "validation_rank_diagnostics": validation_rank_diagnostics,
         "representations": {
             "raw_pooled_state": {
                 "train": representation_diagnostics(train_raw),
@@ -488,6 +940,8 @@ def run_representation_evaluation(
         json.dumps(report, indent=2, allow_nan=False), encoding="utf-8"
     )
     pca.save(output_dir / "pca_exporter.npz")
+    for variant, exporter in variant_exporters.items():
+        exporter.save(output_dir / f"pca_exporter_{variant}.npz")
 
     versions = {
         "embedding_schema_version": EMBEDDING_SCHEMA_VERSION,
@@ -507,6 +961,27 @@ def run_representation_evaluation(
             ignore_index=True,
         )
         embeddings.to_parquet(output_dir / "embeddings.parquet", index=False, compression="zstd")
+        for variant, (variant_train, variant_validation) in variant_outputs.items():
+            details = variant_metadata[variant]
+            variant_versions = {
+                **versions,
+                "pca_version": (
+                    variant_exporters[variant].version if variant in variant_exporters else None
+                ),
+                "representation_variant": variant,
+                "representation_source": details["representation_source"],
+                "representation_dimension": details["dimension"],
+            }
+            variant_frame = pd.concat(
+                [
+                    _embedding_frame(train_metadata, variant_train, variant_versions),
+                    _embedding_frame(validation_metadata, variant_validation, variant_versions),
+                ],
+                ignore_index=True,
+            )
+            variant_frame.to_parquet(
+                output_dir / f"embeddings_{variant}.parquet", index=False, compression="zstd"
+            )
         fixed_views = pd.concat(view_frames, ignore_index=True)
         for name, value in versions.items():
             fixed_views[name] = value
@@ -517,8 +992,8 @@ def run_representation_evaluation(
         )
 
     manifest = {
-        "format_version": 1,
-        "created_at_utc": datetime.now(timezone.utc).isoformat(),
+        "schema_version": 1,
+        "created_at_utc": created_at_utc,
         "checkpoint_id": checkpoint_id,
         "checkpoint_sha256": checkpoint_sha256,
         "checkpoint_step": checkpoint_step,
@@ -529,6 +1004,16 @@ def run_representation_evaluation(
         "source_database_sha256": store.manifest.get("source_database_sha256"),
         "pca_version": pca.version,
         "representation_source": "encode_pooled_state",
+        "representation_variant": representation_variant,
+        "resolved_representation_config": resolved_representation_config,
+        "representation_variants": {
+            variant: {
+                **details,
+                "embedding_file": f"embeddings_{variant}.parquet" if export_embeddings else None,
+                "pca_file": f"pca_exporter_{variant}.npz" if variant in variant_exporters else None,
+            }
+            for variant, details in variant_metadata.items()
+        },
         "targets_included": False,
         "embeddings_exported": export_embeddings,
     }
@@ -598,7 +1083,10 @@ def evaluate_checkpoint(
         checkpoint_format_version=int(checkpoint["format_version"]),
         model_version=model_version,
         export_embeddings=export_embeddings,
+        representation_variant=f"pooled_pca_{components}",
         checkpoint_sha256=checkpoint_sha,
+        representation_variants=INITIAL_REPRESENTATION_VARIANTS,
+        run_compact_ablations=True,
     )
     print(f"Built representation evaluation: {output_dir}")
     return output_dir
