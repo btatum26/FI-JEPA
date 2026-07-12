@@ -159,10 +159,45 @@ def test_each_probe_head_selects_from_its_own_parameter_grid() -> None:
     assert elastic_net["selected_alpha"] == 1.0
     assert elastic_net["selected_l1_ratio"] == 0.9
     assert logistic["selected_alpha"] == 10.0
+    standard_keys = {
+        "selected_alpha",
+        "inner_validation_score",
+        "selected_inner_fold_scores",
+        "selected_at_grid_boundary",
+    }
+    assert set(ridge) == standard_keys
+    assert set(elastic_net) == standard_keys | {"selected_l1_ratio"}
     for selection in (ridge, huber, elastic_net, logistic):
-        assert selection["selection_status"] == "selected"
         assert selection["inner_validation_score"] is not None
-        assert len(selection["inner_fold_scores"]) == 3
+        assert len(selection["selected_inner_fold_scores"]) == 3
+        assert selection["selected_at_grid_boundary"] is True
+        assert "candidate_diagnostics" not in selection
+        assert "selection_status" not in selection
+
+
+def test_parameter_grid_candidates_are_only_retained_for_debug_reports() -> None:
+    rng = np.random.default_rng(17)
+    dates = pd.bdate_range("2017-01-01", periods=360).to_numpy()
+    x = rng.normal(size=(320, 3))
+    y = x[:, 0] + rng.normal(scale=0.2, size=320)
+
+    selection = _select_model_parameters(
+        "ridge",
+        x,
+        y,
+        dates[:320],
+        (0.01, 0.1, 1.0),
+        horizon=21,
+        calendar_dates=dates,
+        include_debug_diagnostics=True,
+    )
+
+    assert selection["selection_status"] == "selected"
+    assert len(selection["candidate_diagnostics"]) == 3
+    assert all(
+        len(candidate["fold_scores"]) == 3
+        for candidate in selection["candidate_diagnostics"]
+    )
 
 
 def test_ridge_penalty_is_stable_when_samples_are_duplicated() -> None:
@@ -190,6 +225,8 @@ def test_insufficient_inner_history_is_reported_as_fallback() -> None:
         "ridge", x, x[:, 0], dates, (0.1, 1.0), horizon=21, calendar_dates=dates
     )
 
-    assert selection["selection_status"] == "insufficient_history_fallback"
     assert selection["inner_validation_score"] is None
-    assert selection["inner_fold_scores"] == []
+    assert selection["selected_inner_fold_scores"] == []
+    assert selection["selected_at_grid_boundary"] is True
+    assert "candidate_diagnostics" not in selection
+    assert "selection_status" not in selection

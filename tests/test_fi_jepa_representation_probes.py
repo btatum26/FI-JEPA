@@ -740,6 +740,11 @@ def test_probe_targets_stay_separate_and_probes_are_walk_forward(tmp_path: Path)
         "elastic_net",
         "logistic",
     }
+    assert "coefficients_by_fold" not in report
+    assert all(
+        "candidate_diagnostics" not in row and "selection_status" not in row
+        for row in report["parameter_selection_by_fold"]
+    )
 
     required_metrics = {
         "rmse",
@@ -779,8 +784,9 @@ def test_probe_targets_stay_separate_and_probes_are_walk_forward(tmp_path: Path)
     assert all(result["rmse_ratio_vs_baseline"] >= 0.0 for result in ridge_results)
     assert all(result["selected_alpha"] > 0.0 for result in ridge_results)
     model_results = [result for result in report["results"] if result["predictor_kind"] == "model"]
-    assert all(len(result["inner_fold_scores"]) == 3 for result in model_results)
+    assert all(len(result["selected_inner_fold_scores"]) == 3 for result in model_results)
     assert all(result["inner_validation_score"] is not None for result in model_results)
+    assert all(isinstance(result["selected_at_grid_boundary"], bool) for result in model_results)
     assert all(
         "selected_l1_ratio" in result
         for result in model_results

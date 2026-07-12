@@ -127,6 +127,9 @@ uv run run-fi-jepa-probes \
   --representation-variant pooled_pca_32
 ```
 
+The standard `report.json` retains only the selected parameter and its inner-fold scores. Use
+`--include-debug-diagnostics` only when full grid-candidate scores and fitted coefficients are needed.
+
 One run evaluates one explicit representation variant. A reusable probe
 dataset records its selected variant and can be passed with `--probe-dataset`
 without selecting it again.

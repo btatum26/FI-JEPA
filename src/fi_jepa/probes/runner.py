@@ -416,19 +416,27 @@ def _select_model_parameters(
     horizon: int,
     calendar_dates: np.ndarray,
     l1_ratios: tuple[float, ...] = (),
+    include_debug_diagnostics: bool = False,
 ) -> dict[str, object]:
-    """Select one head's own parameters by mean loss over three purged time folds."""
+    """Select one head's parameters and retain full grid diagnostics only on request."""
     fallback = _fallback_alpha(alpha_grid)
     fallback_ratio = l1_ratios[len(l1_ratios) // 2] if l1_ratios else None
     folds = _expanding_time_folds(train_dates, horizon=horizon, calendar_dates=calendar_dates)
     if not folds:
         return {
-            "selection_status": "insufficient_history_fallback",
             "selected_alpha": fallback,
             **({"selected_l1_ratio": fallback_ratio} if model_name == "elastic_net" else {}),
             "inner_validation_score": None,
-            "inner_fold_scores": [],
-            "candidate_diagnostics": [],
+            "selected_inner_fold_scores": [],
+            "selected_at_grid_boundary": fallback in {alpha_grid[0], alpha_grid[-1]},
+            **(
+                {
+                    "selection_status": "insufficient_history_fallback",
+                    "candidate_diagnostics": [],
+                }
+                if include_debug_diagnostics
+                else {}
+            ),
         }
 
     candidates = [(candidate, None) for candidate in alpha_grid]
@@ -458,25 +466,36 @@ def _select_model_parameters(
                 score = float(_regression_metrics(train_y[validation_mask], predicted)["rmse"])
             fold_scores.append({**fold_metadata, "score": score})
         mean_score = float(np.mean([float(fold["score"]) for fold in fold_scores]))
-        diagnostics.append(
-            {
-                "alpha": candidate_alpha,
-                **({"l1_ratio": candidate_ratio} if candidate_ratio is not None else {}),
-                "mean_validation_score": mean_score,
-                "fold_scores": fold_scores,
-            }
-        )
+        if include_debug_diagnostics:
+            diagnostics.append(
+                {
+                    "alpha": candidate_alpha,
+                    **({"l1_ratio": candidate_ratio} if candidate_ratio is not None else {}),
+                    "mean_validation_score": mean_score,
+                    "fold_scores": fold_scores,
+                }
+            )
         if mean_score < best_score:
             best_score = mean_score
             best = (candidate_alpha, candidate_ratio)
             best_fold_scores = fold_scores
     return {
-        "selection_status": "selected",
         "selected_alpha": best[0],
         **({"selected_l1_ratio": best[1]} if model_name == "elastic_net" else {}),
         "inner_validation_score": best_score if np.isfinite(best_score) else None,
-        "inner_fold_scores": best_fold_scores,
-        "candidate_diagnostics": diagnostics,
+        "selected_inner_fold_scores": best_fold_scores,
+        "selected_at_grid_boundary": (
+            best[0] in {alpha_grid[0], alpha_grid[-1]}
+            or (model_name == "elastic_net" and best[1] in {l1_ratios[0], l1_ratios[-1]})
+        ),
+        **(
+            {
+                "selection_status": "selected",
+                "candidate_diagnostics": diagnostics,
+            }
+            if include_debug_diagnostics
+            else {}
+        ),
     }
 
 
@@ -1521,8 +1540,9 @@ def run_frozen_probes(
     elastic_net_l1_ratios: tuple[float, ...] | list[float] = DEFAULT_ELASTIC_NET_L1_RATIOS,
     logistic_alphas: tuple[float, ...] | list[float] = DEFAULT_LOGISTIC_ALPHAS,
     representation_variant: str | None = None,
+    include_debug_diagnostics: bool = False,
 ) -> Path:
-    """Run frozen probes with model-specific, purged chronological parameter selection."""
+    """Run frozen probes, omitting large grid and coefficient diagnostics by default."""
     model_alpha_grids = {
         "ridge": _normalise_alpha_grid(ridge_alphas),
         "huber": _normalise_alpha_grid(huber_alphas),
@@ -1790,6 +1810,7 @@ def run_frozen_probes(
                         horizon=horizon,
                         calendar_dates=calendar_dates,
                         l1_ratios=model_l1_ratios,
+                        include_debug_diagnostics=include_debug_diagnostics,
                     )
                     hand_alpha = float(hand_selection["selected_alpha"])
                     hand_l1_ratio = hand_selection.get("selected_l1_ratio")
@@ -1811,6 +1832,7 @@ def run_frozen_probes(
                         horizon=horizon,
                         calendar_dates=calendar_dates,
                         l1_ratios=model_l1_ratios,
+                        include_debug_diagnostics=include_debug_diagnostics,
                     )
                     residual_alpha = float(residual_selection["selected_alpha"])
                     residual_l1_ratio = residual_selection.get("selected_l1_ratio")
@@ -1912,8 +1934,12 @@ def run_frozen_probes(
                                 else {}
                             ),
                             "inner_validation_score": residual_selection["inner_validation_score"],
-                            "inner_fold_scores": residual_selection["inner_fold_scores"],
-                            "selection_status": residual_selection["selection_status"],
+                            "selected_inner_fold_scores": residual_selection[
+                                "selected_inner_fold_scores"
+                            ],
+                            "selected_at_grid_boundary": residual_selection[
+                                "selected_at_grid_boundary"
+                            ],
                         },
                         target_validation=target_validation,
                         score_space="original",
@@ -1939,6 +1965,7 @@ def run_frozen_probes(
                         horizon=horizon,
                         calendar_dates=calendar_dates,
                         l1_ratios=l1_ratios if model_name == "elastic_net" else (),
+                        include_debug_diagnostics=include_debug_diagnostics,
                     )
                     selected_alpha = float(selection["selected_alpha"])
                     selected_l1_ratio = selection.get("selected_l1_ratio")
@@ -1992,8 +2019,12 @@ def run_frozen_probes(
                                 "selected_alpha": selected_alpha,
                                 **({"selected_l1_ratio": selected_l1_ratio} if model_name == "elastic_net" else {}),
                                 "inner_validation_score": selection["inner_validation_score"],
-                                "inner_fold_scores": selection["inner_fold_scores"],
-                                "selection_status": selection["selection_status"],
+                                "selected_inner_fold_scores": selection[
+                                    "selected_inner_fold_scores"
+                                ],
+                                "selected_at_grid_boundary": selection[
+                                    "selected_at_grid_boundary"
+                                ],
                             },
                             target_validation=target_validation,
                             score_space=score_space,
@@ -2007,20 +2038,25 @@ def run_frozen_probes(
                             baseline_metrics=baseline_metrics,
                             inverse_clipped=clip_mask,
                         )
-                    coefficients_by_fold.append(
-                        {
-                            "validation_window_name": window_name,
-                            "raw_target": spec.raw_target,
-                            "target": spec.target,
-                            "target_transform": spec.transform,
-                            "predictor_name": f"{model_name}__{feature_family}",
-                            "model_name": model_name,
-                            "feature_family": feature_family,
-                            "selected_alpha": selected_alpha,
-                            **({"selected_l1_ratio": selected_l1_ratio} if model_name == "elastic_net" else {}),
-                            "coefficients": coefficients.tolist(),
-                        }
-                    )
+                    if include_debug_diagnostics:
+                        coefficients_by_fold.append(
+                            {
+                                "validation_window_name": window_name,
+                                "raw_target": spec.raw_target,
+                                "target": spec.target,
+                                "target_transform": spec.transform,
+                                "predictor_name": f"{model_name}__{feature_family}",
+                                "model_name": model_name,
+                                "feature_family": feature_family,
+                                "selected_alpha": selected_alpha,
+                                **(
+                                    {"selected_l1_ratio": selected_l1_ratio}
+                                    if model_name == "elastic_net"
+                                    else {}
+                                ),
+                                "coefficients": coefficients.tolist(),
+                            }
+                        )
 
             if spec.transform == "raw":
                 for label_spec in _classification_label_frame(raw_train_y, raw_actual, spec.raw_target):
@@ -2065,6 +2101,7 @@ def run_frozen_probes(
                             model_alpha_grids["logistic"],
                             horizon=horizon,
                             calendar_dates=calendar_dates,
+                            include_debug_diagnostics=include_debug_diagnostics,
                         )
                         selected_alpha = float(selection["selected_alpha"])
                         parameter_selection_by_fold.append(
@@ -2093,8 +2130,12 @@ def run_frozen_probes(
                                 **classification_common,
                                 "selected_alpha": selected_alpha,
                                 "inner_validation_score": selection["inner_validation_score"],
-                                "inner_fold_scores": selection["inner_fold_scores"],
-                                "selection_status": selection["selection_status"],
+                                "selected_inner_fold_scores": selection[
+                                    "selected_inner_fold_scores"
+                                ],
+                                "selected_at_grid_boundary": selection[
+                                    "selected_at_grid_boundary"
+                                ],
                             },
                             target_validation=target_validation,
                             classification_label=str(label_spec["classification_label"]),
@@ -2108,19 +2149,20 @@ def run_frozen_probes(
                             probability=probability,
                             baseline_metrics=baseline_metrics,
                         )
-                        coefficients_by_fold.append(
-                            {
-                                "validation_window_name": window_name,
-                                "raw_target": spec.raw_target,
-                                "target": str(label_spec["classification_label"]),
-                                "target_transform": "binary_label",
-                                "predictor_name": predictor_name,
-                                "model_name": "logistic",
-                                "feature_family": feature_family,
-                                "selected_alpha": selected_alpha,
-                                "coefficients": coefficients.tolist(),
-                            }
-                        )
+                        if include_debug_diagnostics:
+                            coefficients_by_fold.append(
+                                {
+                                    "validation_window_name": window_name,
+                                    "raw_target": spec.raw_target,
+                                    "target": str(label_spec["classification_label"]),
+                                    "target_transform": "binary_label",
+                                    "predictor_name": predictor_name,
+                                    "model_name": "logistic",
+                                    "feature_family": feature_family,
+                                    "selected_alpha": selected_alpha,
+                                    "coefficients": coefficients.tolist(),
+                                }
+                            )
 
     if not prediction_rows:
         raise RuntimeError("No finite probe folds were available.")
@@ -2225,6 +2267,7 @@ def run_frozen_probes(
                 "bootstrap_samples": DEFAULT_BOOTSTRAP_SAMPLES,
                 "bootstrap_seed": DEFAULT_BOOTSTRAP_SEED,
                 "bootstrap_block_length": "target_horizon",
+                "include_debug_diagnostics": include_debug_diagnostics,
             },
             "resolved_representation_config": resolved_representation_config,
             "alpha_selection": alpha_selection,
@@ -2270,7 +2313,6 @@ def run_frozen_probes(
                 "regression": _gate_counts(regression_summary),
                 "classification": _gate_counts(classification_summary),
             },
-            "coefficients_by_fold": coefficients_by_fold,
             "parameter_selection_by_fold": parameter_selection_by_fold,
             "incremental_hand_plus_z_comparisons": incremental_comparisons,
             "representation_diagnostics": representation_diagnostics,
@@ -2302,6 +2344,8 @@ def run_frozen_probes(
                 ),
             },
         }
+        if include_debug_diagnostics:
+            report["coefficients_by_fold"] = coefficients_by_fold
         (temporary / "report.json").write_text(
             json.dumps(report, indent=2), encoding="utf-8"
         )
@@ -2388,6 +2432,11 @@ def run_probes_main() -> None:
         "--elastic-net-l1-ratios", default=",".join(str(value) for value in DEFAULT_ELASTIC_NET_L1_RATIOS)
     )
     parser.add_argument("--logistic-alphas", default=",".join(str(value) for value in DEFAULT_LOGISTIC_ALPHAS))
+    parser.add_argument(
+        "--include-debug-diagnostics",
+        action="store_true",
+        help="Include full parameter-grid candidates and coefficients in report.json.",
+    )
 
     args = parser.parse_args()
     if args.probe_dataset is None and (args.embeddings is None or args.targets is None):
@@ -2409,4 +2458,5 @@ def run_probes_main() -> None:
         ),
         logistic_alphas=tuple(float(value) for value in args.logistic_alphas.split(",") if value.strip()),
         representation_variant=args.representation_variant,
+        include_debug_diagnostics=args.include_debug_diagnostics,
     )
